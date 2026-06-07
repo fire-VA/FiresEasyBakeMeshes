@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{6E5C6655-2D34-4D66-BBB0-BE94BB3C5351}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <AppDesignerFolder>Properties</AppDesignerFolder>
+    <RootNamespace>FiresEasyBakeMeshes</RootNamespace>
+    <AssemblyName>FiresEasyBakeMeshes</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <LangVersion>latest</LangVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <ErrorReport>prompt</ErrorReport>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>..\..\..\customspawnsmod\lib\0Harmony.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="assembly_valheim, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_valheim.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="assembly_utils">
+      <HintPath>..\..\assembly_valheim\lib\assembly_utils.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="BepInEx">
+      <HintPath>..\..\..\customspawnsmod\lib\BepInEx.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <!-- FiresUnifiedCore — hosts PrewarmCoroutine (FiresCore.Async.PrewarmCoroutine).
+         Loaded at runtime via BepInDependency on Plugin.cs. -->
+    <Reference Include="FiresUnifiedCore">
+      <HintPath>..\..\FiresUnifiedCore\FiresUnifiedCore\bin\Debug\FiresUnifiedCore.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Plugin.cs" />
+    <Compile Include="EasyBakeLog.cs" />
+    <Compile Include="EasyBake\InvulnerableClassifier.cs" />
+    <Compile Include="EasyBake\ZoneTracker.cs" />
+    <Compile Include="EasyBake\MeshBaker.cs" />
+    <Compile Include="EasyBake\MeshCacheStore.cs" />
+    <Compile Include="EasyBake\ZoneKeepalive.cs" />
+    <Compile Include="EasyBake\DestroyTimeSlicer.cs" />
+    <Compile Include="EasyBake\SectorInstanceMirror.cs" />
+    <Compile Include="EasyBake\StaticPieceZSyncSkip.cs" />
+    <Compile Include="EasyBake\Probe.cs" />
+    <Compile Include="Patches\ClutterSystemPatches.cs" />
+    <Compile Include="Patches\SectorMirrorPatches.cs" />
+    <Compile Include="Patches\LightFlickerPatches.cs" />
+    <Compile Include="Patches\ZSFXPatches.cs" />
+    <Compile Include="Patches\ZNetScenePatches.cs" />
+    <Compile Include="Patches\WearNTearPatches.cs" />
+    <Compile Include="Patches\VanillaTimingRacePatches.cs" />
+    <Compile Include="Patches\CreateDestroyObjectsPatches.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+  </ItemGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <!-- Post-build deploy to the active r2modman 'BlueHills' test profile. Gated on
+       Exists so a missing/renamed profile (other machines, CI) just skips and never
+       fails the build. Copies the built DLL + PDB into the r2modman-managed mod
+       folder. EasyBake hard-deps FiresUnifiedCore (already deployed there); it's a
+       code-only mod (no bundles/assets) so the DLL is a complete install. -->
+  <PropertyGroup>
+    <BlueHillsPluginDir>C:\Users\travi\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\BlueHills\BepInEx\plugins\FiresEasyBakeMeshes\</BlueHillsPluginDir>
+  </PropertyGroup>
+  <Target Name="DeployToBlueHills" AfterTargets="Build" Condition="Exists('$(BlueHillsPluginDir)')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BlueHillsPluginDir)" OverwriteReadOnlyFiles="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(BlueHillsPluginDir)" OverwriteReadOnlyFiles="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Message Importance="high" Text="Deployed $(TargetFileName) (+pdb) -> $(BlueHillsPluginDir)" />
+  </Target>
+</Project>

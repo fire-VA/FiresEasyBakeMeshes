@@ -1,6 +1,6 @@
 {
     "name":  "FiresEasyBakeMeshes",
-    "version_number":  "1.0.0",
+    "version_number":  "1.0.3",
     "website_url":  "https://github.com/fire-VA/FiresEasyBakeMeshes",
     "description":  "Part of the Fires mod family for Valheim.",
     "dependencies":  [

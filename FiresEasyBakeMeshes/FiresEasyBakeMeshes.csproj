@@ -73,6 +73,8 @@
   <ItemGroup>
     <Compile Include="Plugin.cs" />
     <Compile Include="EasyBakeLog.cs" />
+    <Compile Include="Utilities\FiresEasyBakeBanner.cs" />
+    <Compile Include="Utilities\BakeSummary.cs" />
     <Compile Include="EasyBake\InvulnerableClassifier.cs" />
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
@@ -90,6 +92,7 @@
     <Compile Include="Patches\WearNTearPatches.cs" />
     <Compile Include="Patches\VanillaTimingRacePatches.cs" />
     <Compile Include="Patches\CreateDestroyObjectsPatches.cs" />
+    <Compile Include="Patches\InfinityHammerCompatPatches.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />

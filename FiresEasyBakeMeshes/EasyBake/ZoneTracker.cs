@@ -18,6 +18,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             // can reattach instead of rebaking.
             public bool ZoneActive = true;
             public MeshBaker.BakeResult Bake;
+            // Set when this zone's bake came from the on-disk cache. After the
+            // zone settles, a one-shot reconciliation checks that every cached
+            // contributor still has a live piece — pieces removed while this
+            // client was offline (or before the removal-detection fix shipped)
+            // otherwise ghost-render out of the stale combined mesh forever.
+            public bool NeedsCacheValidation;
         }
 
         private static readonly Dictionary<Vector2i, ZoneState> _zones = new Dictionary<Vector2i, ZoneState>();
@@ -52,10 +58,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value
                     && MeshCacheStore.TryGetPreloaded(coord, out var cachedData))
                 {
+                    var swCache = System.Diagnostics.Stopwatch.StartNew();
                     state.Bake = MeshCacheStore.ConstructFromCache(cachedData);
+                    swCache.Stop();
                     if (state.Bake != null)
                     {
                         state.Baked = true;
+                        state.NeedsCacheValidation = true;
                         // Only pin via keepalive if the cached bake actually
                         // contains combined mesh batches. Empty bakes (no
                         // batches survived the bake-time filtering) provide
@@ -63,9 +72,12 @@ namespace FiresEasyBakeMeshes.EasyBake
                         // and per-tick FindSectorObjects work.
                         if (state.Bake.Batches != null && state.Bake.Batches.Count > 0)
                             ZoneKeepalive.MarkActive(coord);
-                        EasyBakeLog.Info(
-                            $"[Cache] Zone ({coord.x},{coord.y}) constructed from preload: " +
-                            $"{state.Bake.Batches.Count} batches, {state.Bake.ContributorIdentities?.Count ?? 0} cached identities.");
+                        BakeSummary.RecordCacheConstruct(
+                            state.Bake.Batches?.Count ?? 0, swCache.ElapsedMilliseconds);
+                        if (FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
+                            EasyBakeLog.Info(
+                                $"[Cache] Zone ({coord.x},{coord.y}) constructed from preload: " +
+                                $"{state.Bake.Batches.Count} batches, {state.Bake.ContributorIdentities?.Count ?? 0} cached identities.");
                     }
                 }
             }
@@ -115,15 +127,98 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (state.Pieces.Remove(wnt))
                 {
                     state.LastChangeUnscaledTime = Time.unscaledTime;
-                    // Deliberately NOT marking dirty here. Piece destruction
-                    // happens both for admin removes (real change) AND for
-                    // ZoneSystem unloads (just the player walking away — the
-                    // pieces will come back at the same positions next visit).
-                    // Without a way to distinguish, marking dirty would force a
-                    // rebake every zone-crossing, defeating the cache.
-                    // Tradeoff: admin-removed pieces leave ghost geometry in the
-                    // cached mesh until that zone is forcibly rebaked.
+                    // Deliberately NOT marking dirty here — GameObject destruction
+                    // fires for both real removes AND zone unloads (the pieces come
+                    // back at the same positions next visit), and marking dirty on
+                    // unload would force a rebake every zone-crossing. REAL removals
+                    // are handled by OnZdoDestroyed below: a genuine remove destroys
+                    // the piece's ZDO, a zone unload never does (persistent ZDOs
+                    // survive) — that's the distinguisher this path lacks.
                     return;
+                }
+            }
+        }
+
+        // Real-removal detection, driven by ZNetScene.OnZDODestroyed (fires on
+        // every client when a ZDO is genuinely destroyed: vanilla remove,
+        // Infinity Hammer pick, World Edit undo — never on zone unload). If the
+        // destroyed ZDO fed a live combined mesh, queue a settle-delayed rebake
+        // so its geometry drops out. Before this, removed pieces ghost-rendered
+        // in the bake until a manual rebake — player-visible as "the piece is
+        // gone but its image is still there" when IH picks up a baked piece.
+        public static void OnZdoDestroyed(ZDO zdo)
+        {
+            if (zdo == null) return;
+            Vector3 pos = zdo.GetPosition();
+            if (!_zones.TryGetValue(ZoneSystem.GetZone(pos), out var state)) return;
+            if (!state.Baked || state.Bake == null) return;
+            var ids = state.Bake.ContributorIdentities;
+            if (ids == null || ids.Count == 0) return;
+
+            var identity = new MeshBaker.PieceIdentity
+            {
+                PrefabHash = zdo.GetPrefab(),
+                X = Mathf.RoundToInt(pos.x * 100f),
+                Y = Mathf.RoundToInt(pos.y * 100f),
+                Z = Mathf.RoundToInt(pos.z * 100f),
+            };
+            if (!ids.Remove(identity)) return;   // not part of the combined mesh
+
+            state.Dirty = true;
+            state.LastChangeUnscaledTime = Time.unscaledTime;
+            if (FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
+                EasyBakeLog.Info($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): batched piece removed for real — rebake queued.");
+        }
+
+        // Infinity Hammer builds its placement ghost by Instantiate()ing the
+        // LIVE hovered piece. If this zone is baked, the source's renderers/
+        // LODGroups are disabled and the clone inherits that — an invisible
+        // ghost (only IH's gizmo shows). Re-enable on the CLONE exactly what
+        // the bake disabled on the SOURCE, paired by traversal order (the
+        // clone mirrors the source hierarchy; IH strips only non-visual
+        // components). Fail-open: any shape mismatch leaves the clone as-is.
+        public static void ReenableCloneVisuals(ZNetView sourceView, GameObject clone)
+        {
+            if (sourceView == null || clone == null) return;
+            if (!_zones.TryGetValue(ZoneSystem.GetZone(sourceView.transform.position), out var state)) return;
+            var bake = state.Bake;
+            if (bake == null) return;
+            int disabledR = bake.DisabledRenderers != null ? bake.DisabledRenderers.Count : 0;
+            int disabledL = bake.DisabledLodGroups != null ? bake.DisabledLodGroups.Count : 0;
+            if (disabledR == 0 && disabledL == 0) return;
+
+            if (disabledR > 0)
+            {
+                var src = sourceView.GetComponentsInChildren<Renderer>(true);
+                var dst = clone.GetComponentsInChildren<Renderer>(true);
+                if (src.Length == dst.Length && src.Length > 0)
+                {
+                    var map = new Dictionary<Renderer, bool>(disabledR);
+                    for (int i = 0; i < bake.DisabledRenderers.Count; i++)
+                    {
+                        var s = bake.DisabledRenderers[i];
+                        if (s.Renderer != null) map[s.Renderer] = s.PriorEnabled;
+                    }
+                    for (int i = 0; i < src.Length; i++)
+                        if (src[i] != null && dst[i] != null && map.TryGetValue(src[i], out bool prior))
+                            dst[i].enabled = prior;
+                }
+            }
+            if (disabledL > 0)
+            {
+                var src = sourceView.GetComponentsInChildren<LODGroup>(true);
+                var dst = clone.GetComponentsInChildren<LODGroup>(true);
+                if (src.Length == dst.Length && src.Length > 0)
+                {
+                    var map = new Dictionary<LODGroup, bool>(disabledL);
+                    for (int i = 0; i < bake.DisabledLodGroups.Count; i++)
+                    {
+                        var s = bake.DisabledLodGroups[i];
+                        if (s.Group != null) map[s.Group] = s.PriorEnabled;
+                    }
+                    for (int i = 0; i < src.Length; i++)
+                        if (src[i] != null && dst[i] != null && map.TryGetValue(src[i], out bool prior))
+                            dst[i].enabled = prior;
                 }
             }
         }
@@ -184,8 +279,50 @@ namespace FiresEasyBakeMeshes.EasyBake
             foreach (var state in _zones.Values)
             {
                 if (!state.ZoneActive) continue;
+                // A dirty zone that dropped below the bake threshold can never
+                // rebake — tear it down (restores the remaining live renderers,
+                // drops the removed pieces' ghost geometry) and delete its cache
+                // file so next session doesn't resurrect the stale mesh.
+                if (state.Baked && state.Dirty && state.Pieces.Count < minPerZone)
+                {
+                    if (now - state.LastChangeUnscaledTime < settleDelay) continue;
+                    TearDown(state);
+                    if (FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value)
+                    {
+                        long uidDrop = MeshCacheStore.TryGetWorldUid();
+                        if (uidDrop != 0L) MeshCacheStore.Delete(uidDrop, state.Coord);
+                    }
+                    continue;
+                }
                 if (state.Pieces.Count < minPerZone) continue;
                 if (now - state.LastChangeUnscaledTime < settleDelay) continue;
+
+                // One-shot stale-cache reconciliation for reattached zones: any
+                // cached contributor with no live piece was removed while this
+                // client was offline (or before removal-detection shipped) and is
+                // ghost-rendering out of the stale combined mesh — rebake now.
+                if (state.Baked && !state.Dirty && state.NeedsCacheValidation)
+                {
+                    state.NeedsCacheValidation = false;
+                    var ids = state.Bake != null ? state.Bake.ContributorIdentities : null;
+                    if (ids != null && ids.Count > 0)
+                    {
+                        int live = 0;
+                        foreach (var piece in state.Pieces)
+                        {
+                            if (piece == null) continue;
+                            if (ids.Contains(MeshBaker.PieceIdentity.From(piece.gameObject, piece.transform.position))) live++;
+                        }
+                        if (live < ids.Count)
+                        {
+                            state.Dirty = true;
+                            if (FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
+                                EasyBakeLog.Info($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): cached mesh has "
+                                    + $"{ids.Count - live} contributor(s) with no live piece — rebaking to drop ghost geometry.");
+                        }
+                    }
+                }
+
                 if (state.Baked && !state.Dirty) continue;
 
                 if (state.Baked && state.Dirty) TearDown(state);
@@ -203,11 +340,20 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 // Persist the freshly-baked result so the next session can
                 // skip CombineMeshes entirely. Save is fail-soft (logs + moves
-                // on) — disk I/O issues mustn't break gameplay.
+                // on) — disk I/O issues mustn't break gameplay. A rebake that
+                // produced 0 batches must DELETE the old file instead (Save
+                // early-outs on empty bakes and would leave the stale mesh to
+                // resurrect ghost geometry next session).
                 if (FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value)
                 {
                     long uid = MeshCacheStore.TryGetWorldUid();
-                    if (uid != 0L) MeshCacheStore.Save(uid, state.Coord, state.Bake);
+                    if (uid != 0L)
+                    {
+                        if (state.Bake != null && state.Bake.Batches != null && state.Bake.Batches.Count > 0)
+                            MeshCacheStore.Save(uid, state.Coord, state.Bake);
+                        else
+                            MeshCacheStore.Delete(uid, state.Coord);
+                    }
                 }
             }
 
@@ -243,6 +389,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             foreach (var s in _zones.Values) TearDown(s);
             _zones.Clear();
+            _transparentByName.Clear();
             InvulnerableClassifier.Reset();
             ZoneKeepalive.Reset();
             DestroyTimeSlicer.Reset();
@@ -291,7 +438,47 @@ namespace FiresEasyBakeMeshes.EasyBake
             // mesh can't reproduce.
             if (HasComponentAnywhere<Door>(go))            return true;
             if (HasComponentAnywhere<Container>(go))       return true;
+            // Category C — transparent geometry. Combining transparent pieces
+            // into a static batch breaks per-piece depth sorting: each glass
+            // pane must sort against the world individually, but a merged mesh
+            // sorts once for the whole batch (panes draw through walls / in
+            // the wrong order). Gate: any material in the transparent queue
+            // (>= 2500), plus FiresGlass windows by name as belt-and-braces
+            // against shader/queue changes. Excluded pieces simply stay live.
+            if (FiresEasyBakeMeshesPlugin.BatchingExcludeTransparent != null
+                && FiresEasyBakeMeshesPlugin.BatchingExcludeTransparent.Value
+                && IsTransparentPiece(go)) return true;
             return false;
+        }
+
+        // Per-prefab-name verdict cache — the renderer/material walk runs once
+        // per prefab kind, not per piece instance per zone scan.
+        private static readonly Dictionary<string, bool> _transparentByName
+            = new Dictionary<string, bool>(System.StringComparer.Ordinal);
+
+        private static bool IsTransparentPiece(GameObject go)
+        {
+            string key = go.name;
+            int paren = key.IndexOf('(');
+            if (paren > 0) key = key.Substring(0, paren).Trim();
+            if (_transparentByName.TryGetValue(key, out bool cached)) return cached;
+
+            bool result = key.StartsWith("FiresGlass", System.StringComparison.Ordinal);
+            if (!result)
+            {
+                var renderers = go.GetComponentsInChildren<MeshRenderer>(includeInactive: true);
+                for (int i = 0; i < renderers.Length && !result; i++)
+                {
+                    var mats = renderers[i] != null ? renderers[i].sharedMaterials : null;
+                    if (mats == null) continue;
+                    for (int mi = 0; mi < mats.Length; mi++)
+                    {
+                        if (mats[mi] != null && mats[mi].renderQueue >= 2500) { result = true; break; }
+                    }
+                }
+            }
+            _transparentByName[key] = result;
+            return result;
         }
 
         private static bool HasComponentAnywhere<T>(GameObject go) where T : Component

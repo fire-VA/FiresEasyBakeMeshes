@@ -418,6 +418,24 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
+        // Drops a zone's cache file AND its preloaded copy. Called when a
+        // rebake produced no batches or a dirty zone tore down below the bake
+        // threshold — leaving the old file would resurrect the removed pieces'
+        // ghost geometry next session.
+        public static void Delete(long worldUid, Vector2i coord)
+        {
+            try
+            {
+                _preloaded.TryRemove(coord, out _);
+                var path = GetZonePath(worldUid, coord);
+                if (path != null && File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                EasyBakeLog.Warn($"[Cache] Delete failed for zone ({coord.x},{coord.y}): {ex.Message}");
+            }
+        }
+
         private static string GetZonePath(long worldUid, Vector2i coord)
         {
             if (_cacheRoot == null) return null;

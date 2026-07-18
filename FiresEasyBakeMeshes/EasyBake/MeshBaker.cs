@@ -246,7 +246,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
 
             sw.Stop();
-            if (result.Batches.Count > 0 || FiresEasyBakeMeshesPlugin.BatchingVerbose.Value)
+            BakeSummary.RecordFreshBake(result.Batches.Count, sw.ElapsedMilliseconds);
+            if ((result.Batches.Count > 0 && FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
+                || FiresEasyBakeMeshesPlugin.BatchingVerbose.Value)
             {
                 EasyBakeLog.Info(
                     $"[Bake] Zone ({coord.x},{coord.y}): {pieces.Count} invulnerable pieces, " +

@@ -123,6 +123,11 @@ namespace FiresEasyBakeMeshes.Patches
                                                   ? FiresEasyBakeMeshesPlugin.PrewarmFrameBudgetMs.Value
                                                   : 8f,
                 SlowInstantiateThresholdMs  = FiresEasyBakeMeshesPlugin.PrewarmSlowInstantiateThresholdMs.Value,
+                MaxTransformCount           = FiresEasyBakeMeshesPlugin.PrewarmMaxTransformCount.Value,
+                // Slow/oversize prefabs persist here so a 29s mega-prefab
+                // (ConsMassiveTower) freezes at most ONE login ever, not every one.
+                PersistSlowSkipPath         = System.IO.Path.Combine(
+                                                  BepInEx.Paths.ConfigPath, "FiresEasyBakeMeshes", "prewarm_slow_skips.txt"),
                 Verbose                     = FiresEasyBakeMeshesPlugin.PrewarmVerbose.Value,
                 SkipNameContains            = FiresEasyBakeMeshesPlugin.PrewarmSkipNameContains.Value ?? string.Empty,
                 SkipStatefulComponents      = true,

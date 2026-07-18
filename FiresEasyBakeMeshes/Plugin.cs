@@ -1,6 +1,8 @@
 using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
+using System.Collections;
+using UnityEngine;
 
 namespace FiresEasyBakeMeshes
 {
@@ -10,9 +12,10 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.0.3";
 
         public static ConfigEntry<bool> PluginEnabled;
+        public static ConfigEntry<bool> VerboseZoneLogging;
 
         public static ConfigEntry<bool>  BatchingEnabled;
         public static ConfigEntry<bool>  BatchingRunOnServer;
@@ -20,6 +23,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<int>   BatchingMinPiecesPerBatch;
         public static ConfigEntry<float> BatchingSettleDelaySeconds;
         public static ConfigEntry<bool>  BatchingVerbose;
+        public static ConfigEntry<bool>  BatchingExcludeTransparent;
 
         public static ConfigEntry<bool>   PrewarmEnabled;
         public static ConfigEntry<bool>   PrewarmRunOnServer;
@@ -27,6 +31,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<bool>   PrewarmVerbose;
         public static ConfigEntry<string> PrewarmSkipNameContains;
         public static ConfigEntry<float>  PrewarmSlowInstantiateThresholdMs;
+        public static ConfigEntry<int>    PrewarmMaxTransformCount;
         public static ConfigEntry<float>  PrewarmFrameBudgetMs;
         public static ConfigEntry<float>  MaterialRegistryFrameBudgetMs;
 
@@ -75,12 +80,20 @@ namespace FiresEasyBakeMeshes
         {
             EasyBakeLog.Bind(Logger);
 
+            try { FiresEasyBakeBanner.PrintBig(); }
+            catch (System.Exception ex) { Logger.LogWarning($"Big banner failed: {ex.Message}"); }
+
             // Detect FiresDebugginTools so EasyBake's own hot paths self-time into
             // the shared FrameTimer only when the profiler is there to drain it.
             EasyBake.Probe.Detect();
 
             PluginEnabled = Config.Bind("General", "PluginEnabled", true,
                 "Master kill switch. When off no Harmony patches are applied at all.");
+
+            VerboseZoneLogging = Config.Bind("General", "Verbose Zone Logging", false,
+                "Log the per-zone cache-hit and fresh-bake lines (one line per zone,\n" +
+                "~25-30 at login on a megabase). Off by default — the debounced\n" +
+                "ZONES BAKED summary box carries the totals either way.");
 
             BatchingEnabled = Config.Bind("Batching", "Enabled", true,
                 "Workstream E.2 v1: at zone load, combine all invulnerable-piece meshes\n" +
@@ -115,6 +128,13 @@ namespace FiresEasyBakeMeshes
 
             BatchingVerbose = Config.Bind("Batching", "VerboseLogging", false,
                 "Log per-zone classification and bake details.");
+
+            BatchingExcludeTransparent = Config.Bind("Batching", "ExcludeTransparentPieces", true,
+                "Skip pieces with transparent-queue materials (renderQueue >= 2500) and\n" +
+                "FiresGlass windows. Combining transparent geometry into a static batch\n" +
+                "breaks per-piece depth sorting — stained glass sorts against the world\n" +
+                "per pane, a merged mesh sorts once for the whole batch. Excluded pieces\n" +
+                "stay live and render normally.");
 
             PrewarmEnabled = Config.Bind("Prewarm", "Enabled", true,
                 "Workstream B: at ZNetScene.Awake, instantiate every prefab in m_prefabs\n" +
@@ -162,13 +182,25 @@ namespace FiresEasyBakeMeshes
             PrewarmSlowInstantiateThresholdMs = Config.Bind("Prewarm", "SlowInstantiateThresholdMs", 5000f,
                 new ConfigDescription(
                     "If a single prefab's Instantiate takes longer than this many ms,\n" +
-                    "log a warning naming the prefab AND remember it for THIS session so\n" +
-                    "subsequent batches skip it instead of paying the same multi-second\n" +
-                    "stall a second time. The remembered list is in-memory only — it does\n" +
-                    "NOT auto-add to SkipNameContains. After seeing a name flagged here,\n" +
-                    "decide whether to permanently exclude it via the config above. 0 to\n" +
-                    "disable the runtime detector entirely.",
+                    "log a warning naming the prefab AND persist it to\n" +
+                    "config/FiresEasyBakeMeshes/prewarm_slow_skips.txt, so every future\n" +
+                    "session skips it before instantiating (delete a line from that file\n" +
+                    "to give a prefab another chance, e.g. after removing the mod that\n" +
+                    "made it slow). 0 to disable the runtime detector entirely.",
                     new AcceptableValueRange<float>(0f, 60000f)));
+
+            PrewarmMaxTransformCount = Config.Bind("Prewarm", "MaxTransformCount", 800,
+                new ConfigDescription(
+                    "Skip any prefab whose transform hierarchy exceeds this many nodes,\n" +
+                    "WITHOUT instantiating it. A single Instantiate is atomic on the main\n" +
+                    "thread — the frame budget cannot split it — and combined-build\n" +
+                    "mega-prefabs (e.g. ConsMassiveTower, ~29s) freeze the whole client\n" +
+                    "on their first-ever warm-up, which the slow-instantiate detector\n" +
+                    "above can only prevent from the SECOND session on. The node count is\n" +
+                    "a cheap capped traversal; skipped prefabs warm on first real spawn\n" +
+                    "instead. Normal pieces are tens of nodes; only combined builds reach\n" +
+                    "the hundreds. 0 to disable the gate.",
+                    new AcceptableValueRange<int>(0, 100000)));
 
             MaterialRegistryFrameBudgetMs = Config.Bind("Cache", "MaterialRegistryFrameBudgetMs", 4f,
                 new ConfigDescription(
@@ -432,6 +464,32 @@ namespace FiresEasyBakeMeshes
                 EasyBakeLog.Info(
                     $"{PluginName} v{PluginVersion} loaded but PluginEnabled=false — no patches applied. " +
                     "Flip PluginEnabled to true in the config manager to enable live (no restart needed).");
+
+            // Compact "loaded" banner — oven with heat squiggles. Deferred to
+            // world-load time (when ZNetScene is up) so it bookends the load;
+            // the BIG "loading" banner already fired at the top of Awake.
+            StartCoroutine(EmitCompactBannerWhenZNetReady());
+        }
+
+        // Waits for ZNetScene + its prefab table to be live (same readiness
+        // signal the other Fires mods use), then emits the compact loaded
+        // banner. Failure is non-fatal — falls back to a plain "loaded" log
+        // line so the load event is still recorded in the file log.
+        private IEnumerator EmitCompactBannerWhenZNetReady()
+        {
+            while (ZNetScene.instance == null
+                   || ZNetScene.instance.m_prefabs == null
+                   || ZNetScene.instance.m_prefabs.Count == 0)
+            {
+                yield return null;
+            }
+            yield return new WaitForEndOfFrame();
+
+            try { FiresEasyBakeBanner.Print(); }
+            catch (System.Exception ex)
+            {
+                EasyBakeLog.Info($"{PluginName} v{PluginVersion} loaded. (banner failed: {ex.Message})");
+            }
         }
 
         // Idempotent. Walks every [HarmonyPatch] class in this assembly and
@@ -515,6 +573,12 @@ namespace FiresEasyBakeMeshes
                 long uid = EasyBake.MeshCacheStore.TryGetWorldUid();
                 if (uid != 0L) EasyBake.MeshCacheStore.KickPreload(uid);
             }
+
+            // Debounced ZONES BAKED mini-box: emits once ~5s after the last
+            // cache-construct / fresh-bake event. Runs before the batching
+            // gate so the final box still lands if batching is toggled off
+            // right after login.
+            BakeSummary.Update();
 
             if (!BatchingActive()) return;
             long tZone = EasyBake.Probe.Start();

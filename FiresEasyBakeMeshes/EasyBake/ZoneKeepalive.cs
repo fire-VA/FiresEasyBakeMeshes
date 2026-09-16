@@ -37,16 +37,16 @@ namespace FiresEasyBakeMeshes.EasyBake
             public float LastActiveTime;
         }
 
-        private static readonly Dictionary<Vector2i, Entry> _entries = new Dictionary<Vector2i, Entry>();
+        private static readonly Dictionary<Vector2s, Entry> _entries = new Dictionary<Vector2s, Entry>();
         private static readonly List<ZDO> _scratch = new List<ZDO>();
-        private static readonly List<Vector2i> _refreshScratch = new List<Vector2i>();
-        private static readonly List<Vector2i> _pruneScratch = new List<Vector2i>();
+        private static readonly List<Vector2s> _refreshScratch = new List<Vector2s>();
+        private static readonly List<Vector2s> _pruneScratch = new List<Vector2s>();
 
         public static int Count => _entries.Count;
 
-        public static bool IsKeptAlive(Vector2i coord) => _entries.ContainsKey(coord);
+        public static bool IsKeptAlive(Vector2s coord) => _entries.ContainsKey(coord);
 
-        public static void MarkActive(Vector2i coord)
+        public static void MarkActive(Vector2s coord)
         {
             _entries[coord] = new Entry { LastActiveTime = Time.unscaledTime };
         }
@@ -59,7 +59,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // outside vanilla's coverage but are still within our keepalive radius.
         //
         // Pass `vanillaCoveredRadius = -1` to disable dedup (always inject).
-        public static void AppendKeepaliveZDOs(List<ZDO> nearList, Vector2i playerCenter, int vanillaCoveredRadius)
+        public static void AppendKeepaliveZDOs(List<ZDO> nearList, Vector2s playerCenter, int vanillaCoveredRadius)
         {
             if (_entries.Count == 0) return;
             var zdoMan = ZDOMan.instance;
@@ -77,13 +77,15 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (dist <= vanillaCoveredRadius) continue;
                 }
                 _scratch.Clear();
-                zdoMan.FindSectorObjects(coord, 0, 0, _scratch);
+                // (0, 0) = this sector only, no near/far expansion - the 1.0 signature takes a
+                    // SimulationDistance where the old one took two int radii.
+                    zdoMan.FindSectorObjects(coord, new SimulationDistance(0, 0), _scratch);
                 for (int i = 0; i < _scratch.Count; i++)
                     nearList.Add(_scratch[i]);
             }
         }
 
-        public static void Update(Vector2i playerCenter, int activeArea)
+        public static void Update(Vector2s playerCenter, int activeArea)
         {
             if (_entries.Count == 0) return;
             float now = Time.unscaledTime;

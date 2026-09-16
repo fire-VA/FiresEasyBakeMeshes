@@ -24,10 +24,11 @@ namespace FiresEasyBakeMeshes.Patches
     // new to instantiate. We can detect "nothing changed" cheaply and skip
     // the original method.
     //
-    // The skip is gated on three cheap signals (ALL must indicate "no change"):
+    // The skip is gated on four cheap signals (ALL must indicate "no change"):
     //   - Player's center sector unchanged since last vanilla pass.
     //   - ZoneSystem.m_zones.Count unchanged (no zone loaded or unloaded).
     //   - ZNetScene.m_instances.Count unchanged (no instantiation or destruction).
+    //   - ZDOMan.NrOfObjects() unchanged (no ZDO created / received / destroyed).
     //
     // The instance-count signal is the load-screen safety net. Center and zone
     // count can both plateau while CreateObjects is still draining tens of
@@ -35,10 +36,20 @@ namespace FiresEasyBakeMeshes.Patches
     // zones report loaded, but the per-zone ZDO drain hasn't finished. Without
     // the instance-count check we throttle the drain and stall the spawn-in.
     //
-    // Plus a TTL: even when all three signals match, fall through to vanilla
-    // every MaxSeconds so server-pushed ZDOs whose containing sector is
-    // already drained (a creature spawn, a remote player dropping an item)
-    // eventually get instantiated client-side.
+    // The ZDO-count signal is what makes another player's freshly-built piece
+    // (or a creature spawn, or a dropped item) appear promptly. When a peer
+    // builds, the server streams the new ZDO to us via ZDOMan.RPC_ZDOData ->
+    // CreateNewZDO -> m_objectsByID.Add — so NrOfObjects() ticks up the frame we
+    // RECEIVE it, BEFORE it's instantiated. Center / zone / instance counts all
+    // stay flat until CreateObjects actually builds the GameObject, so without
+    // this signal the new piece waits out the TTL below (up to MaxSeconds) before
+    // we run a pass that instantiates it — the "pieces built by another player
+    // take a long time to render" symptom. With it, we run the very next tick.
+    // A truly static parked scene has a stable ZDO set, so the skip still engages.
+    //
+    // TTL backstop: even when all four signals match, fall through to vanilla
+    // every MaxSeconds. With the ZDO-count signal this is now a pure safety net
+    // rather than the primary path for inbound objects.
     //
     // Interaction with VAGhetto's ServerAuthorityPatches.CreateDestroyObjects_Prefix:
     //   - On dedicated server it runs vanilla's logic itself (returns false).
@@ -58,9 +69,10 @@ namespace FiresEasyBakeMeshes.Patches
     [HarmonyPatch(typeof(ZNetScene), "CreateDestroyObjects")]
     public static class ZNetScene_CreateDestroyObjects_Patch
     {
-        private static Vector2i _lastCenter = new Vector2i(int.MinValue, int.MinValue);
+        private static Vector2s _lastCenter = new Vector2s(short.MinValue, short.MinValue);
         private static int _lastZoneCount = -1;
         private static int _lastInstanceCount = -1;
+        private static int _lastZdoCount = -1;
         private static float _lastVanillaTime = -1000f;
 
         private static FieldInfo s_zonesField;
@@ -70,10 +82,20 @@ namespace FiresEasyBakeMeshes.Patches
 
         private static int _skippedSinceReport;
         private static float _lastReportTime;
+        private static bool s_standDownLogged;
 
         [HarmonyPrefix]
-        public static bool Prefix(ZNetScene __instance)
+        public static bool Prefix(ZNetScene __instance, bool __runOriginal)
         {
+            if (!__runOriginal)
+            {
+                if (!s_standDownLogged)
+                {
+                    s_standDownLogged = true;
+                    EasyBakeLog.Info("[CDS] Another mod already replaces ZNetScene.CreateDestroyObjects; the create/destroy skip stands down.");
+                }
+                return false;
+            }
             if (!FiresEasyBakeMeshesPlugin.PluginEnabled.Value) return true;
             if (!FiresEasyBakeMeshesPlugin.CreateDestroySkipEnabled.Value) return true;
 
@@ -94,11 +116,20 @@ namespace FiresEasyBakeMeshes.Patches
             if (zs == null) return true;
 
             Vector3 refPos = ZNet.instance.GetReferencePosition();
-            Vector2i center = ZoneSystem.GetZone(refPos);
+            Vector2s center = ZoneSystem.GetZone(refPos);
             int zoneCount = GetZoneCount(zs);
             if (zoneCount < 0) return true; // reflection failed — fall through
             int instanceCount = GetInstanceCount(__instance);
             if (instanceCount < 0) return true; // reflection failed — fall through
+
+            // Total known-ZDO count. Ticks up the instant we RECEIVE an inbound
+            // ZDO (another player's build piece, a creature spawn, a dropped item)
+            // over the network — before it's ever instantiated — so we run a pass
+            // and build it next tick instead of waiting out the TTL. Public O(1)
+            // accessor (m_objectsByID.Count); no reflection needed.
+            var zdoMan = ZDOMan.instance;
+            if (zdoMan == null) return true; // between scenes — fall through
+            int zdoCount = zdoMan.NrOfObjects();
 
             float now = Time.unscaledTime;
             float maxSkipSeconds = FiresEasyBakeMeshesPlugin.CreateDestroySkipMaxSeconds.Value;
@@ -106,7 +137,8 @@ namespace FiresEasyBakeMeshes.Patches
             bool stateChanged = center.x != _lastCenter.x
                              || center.y != _lastCenter.y
                              || zoneCount != _lastZoneCount
-                             || instanceCount != _lastInstanceCount;
+                             || instanceCount != _lastInstanceCount
+                             || zdoCount != _lastZdoCount;
 
             if (!stateChanged && !ttlExpired && _lastZoneCount >= 0)
             {
@@ -117,7 +149,7 @@ namespace FiresEasyBakeMeshes.Patches
                     EasyBakeLog.Info(
                         $"[CDS] Skipped {_skippedSinceReport} CreateDestroyObjects ticks " +
                         $"in last {now - _lastReportTime:F1}s " +
-                        $"(center={center.x},{center.y}, zones={zoneCount}, instances={instanceCount}).");
+                        $"(center={center.x},{center.y}, zones={zoneCount}, instances={instanceCount}, zdos={zdoCount}).");
                     _skippedSinceReport = 0;
                     _lastReportTime = now;
                 }
@@ -127,6 +159,7 @@ namespace FiresEasyBakeMeshes.Patches
             _lastCenter = center;
             _lastZoneCount = zoneCount;
             _lastInstanceCount = instanceCount;
+            _lastZdoCount = zdoCount;
             _lastVanillaTime = now;
             return true;
         }
@@ -171,9 +204,10 @@ namespace FiresEasyBakeMeshes.Patches
 
         public static void ResetState()
         {
-            _lastCenter = new Vector2i(int.MinValue, int.MinValue);
+            _lastCenter = new Vector2s(short.MinValue, short.MinValue);
             _lastZoneCount = -1;
             _lastInstanceCount = -1;
+            _lastZdoCount = -1;
             _lastVanillaTime = -1000f;
             _skippedSinceReport = 0;
             _lastReportTime = 0f;

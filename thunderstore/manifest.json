@@ -1,9 +1,10 @@
 {
-    "name":  "FiresEasyBakeMeshes",
-    "version_number":  "1.0.3",
-    "website_url":  "https://github.com/fire-VA/FiresEasyBakeMeshes",
-    "description":  "Part of the Fires mod family for Valheim.",
-    "dependencies":  [
-                         "denikson-BepInExPack_Valheim-5.4.2202"
-                     ]
+    "name": "FiresEasyBakeMeshes",
+    "version_number": "1.2.15",
+    "website_url": "https://github.com/fire-VA/FiresEasyBakeMeshes",
+    "description": "Big builds at normal frame rates: bakes a zone's structural pieces into combined meshes and GPU instances, and on multiplayer clients stops creating the objects a bake already draws.",
+    "dependencies": [
+        "denikson-BepInExPack_Valheim-5.4.2202",
+        "VerdantsAscent-FiresUnifiedCore-0.2.8"
+    ]
 }

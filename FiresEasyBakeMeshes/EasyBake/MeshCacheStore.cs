@@ -55,21 +55,34 @@ namespace FiresEasyBakeMeshes.EasyBake
         //   2 — Door + Container added to HasBakeUnsafeComponent. v1 caches
         //       contain frozen door/chest geometry; reject them so they
         //       rebake cleanly on next login.
+        //   3 — batches are grouped by full renderer settings rather than material
+        //       alone, and each zone also stores a far-tier (LOD1) batch list. v2
+        //       caches have neither; reject them so they rebake.
+        //   4 — GPU-instanced prefab groups added alongside the combined batches.
+        //       A v3 cache suppressed those pieces without recording what draws
+        //       them, so reject it and rebake.
+        //   5 — each contributor's position, rotation and scale, which stand-in colliders need to replace pieces
+        //       that are never created.
+        //   6 — damageable pieces join instanced groups; a v5 zone would keep drawing them itself until it rebaked.
+        //   7 — each identity carries a rotation key, so copies stacked on one spot turned for looks stay distinct.
+        //   8 — tinted grausten merges into combined batches, and item and armor stands are never baked.
         private const uint MAGIC = 0x434D4245;
-        private const int VERSION = 2;
+        private const int VERSION = 11;
 
         private static string _cacheRoot;
         private static readonly Dictionary<string, Material> _materialsByName = new Dictionary<string, Material>();
+        private static readonly HashSet<int> _indexedPrefabs = new HashSet<int>();
         private static bool _materialsBuilt;
 
         // Preload state. _preloaded is filled by the background worker as each
         // zone finishes parsing. _preloadKicked guards against multiple kickoffs.
-        private static readonly ConcurrentDictionary<Vector2i, CachedZoneData> _preloaded
-            = new ConcurrentDictionary<Vector2i, CachedZoneData>();
+        private static readonly ConcurrentDictionary<Vector2s, CachedZoneData> _preloaded
+            = new ConcurrentDictionary<Vector2s, CachedZoneData>();
         private static volatile bool _preloadKicked;
         private static volatile bool _preloadFinished;
         private static volatile int _preloadZonesLoaded;
         private static volatile int _preloadZonesFailed;
+        private static volatile int _preloadGeneration;
         private static long _preloadWorldUid;
 
         // Intermediate off-thread representation of one cached zone. Holds
@@ -77,9 +90,24 @@ namespace FiresEasyBakeMeshes.EasyBake
         // turns this into a MeshBaker.BakeResult on the main thread.
         internal class CachedZoneData
         {
-            public Vector2i Coord;
+            public Vector2s Coord;
             public HashSet<MeshBaker.PieceIdentity> ContributorIdentities;
+            public Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform> PieceTransforms;
             public List<CachedBatchData> Batches;
+            public List<CachedBatchData> FarBatches;
+            public List<CachedInstanceGroupData> InstanceGroups;
+        }
+
+        internal class CachedInstanceGroupData
+        {
+            public int PrefabHash;
+            public Matrix4x4[] Matrices;
+            // Quantised piece positions, parallel to Matrices, so a restored group can
+            // still drop an individual piece without rebaking the zone.
+            public int[] PositionsX;
+            public int[] PositionsY;
+            public int[] PositionsZ;
+            public int[] PositionsR;
         }
 
         internal class CachedBatchData
@@ -165,20 +193,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (prefab == null) continue;
                 prefabCount++;
 
-                var renderers = prefab.GetComponentsInChildren<MeshRenderer>(includeInactive: true);
-                for (int r = 0; r < renderers.Length; r++)
-                {
-                    var mats = renderers[r].sharedMaterials;
-                    for (int m = 0; m < mats.Length; m++)
-                    {
-                        var mat = mats[m];
-                        if (mat == null) continue;
-                        var name = mat.name;
-                        if (string.IsNullOrEmpty(name)) continue;
-                        if (!_materialsByName.ContainsKey(name))
-                            _materialsByName[name] = mat;
-                    }
-                }
+                IndexRendererMaterials(prefab);
 
                 if (!runSynchronously && sw.ElapsedTicks >= budgetTicks)
                 {
@@ -198,6 +213,49 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (string.IsNullOrEmpty(name)) return null;
             _materialsByName.TryGetValue(name, out var mat);
             return mat;
+        }
+
+        private static void IndexRendererMaterials(GameObject root)
+        {
+            var renderers = root.GetComponentsInChildren<MeshRenderer>(includeInactive: true);
+            for (int r = 0; r < renderers.Length; r++)
+            {
+                var mats = renderers[r].sharedMaterials;
+                for (int m = 0; m < mats.Length; m++)
+                    RegisterMaterial(mats[m]);
+            }
+        }
+
+        private static void RegisterMaterial(Material mat)
+        {
+            if (mat == null || string.IsNullOrEmpty(mat.name)) return;
+            if (!_materialsByName.ContainsKey(mat.name))
+                _materialsByName[mat.name] = mat;
+        }
+
+        // A cached zone's materials come from the prefabs of the pieces that fed it, so indexing those few prefabs
+        // resolves the zone without waiting for the whole-scene registry, which is skipped on a world's first session
+        // and still building early in later ones.
+        private static void IndexContributorPrefabs(CachedZoneData data)
+        {
+            var scene = ZNetScene.instance;
+            if (scene == null || data.ContributorIdentities == null) return;
+            foreach (var identity in data.ContributorIdentities)
+            {
+                if (_indexedPrefabs.Contains(identity.PrefabHash)) continue;
+                var prefab = scene.GetPrefab(identity.PrefabHash);
+                if (prefab == null) continue;
+                _indexedPrefabs.Add(identity.PrefabHash);
+                IndexRendererMaterials(prefab);
+            }
+        }
+
+        private static string FirstMissingMaterial(List<CachedBatchData> batches)
+        {
+            if (batches == null) return null;
+            for (int i = 0; i < batches.Count; i++)
+                if (FindMaterial(batches[i].MaterialName) == null) return batches[i].MaterialName;
+            return null;
         }
 
         // Vanilla ZNet.GetWorldUID() does `return ZNet.m_world.m_uid;` with no
@@ -223,10 +281,19 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // --- Preload (background) ----------------------------------------------
 
+        // Runs once per world. A relog into the same world keeps what is already in memory, which Save keeps current;
+        // joining a different world drops the previous world's zones and reads the new world's cache.
         public static void KickPreload(long worldUid)
         {
-            if (_preloadKicked) return;
             if (worldUid == 0L || _cacheRoot == null) return;
+            if (_preloadKicked && worldUid == _preloadWorldUid) return;
+            if (_preloadKicked && !_preloadFinished) return;
+
+            _preloadGeneration++;
+            _preloaded.Clear();
+            _preloadZonesLoaded = 0;
+            _preloadZonesFailed = 0;
+            _preloadFinished = false;
             _preloadKicked = true;
             _preloadWorldUid = worldUid;
 
@@ -239,12 +306,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
 
             // Background Task. No Unity API allowed in here.
-            Task.Run(() => PreloadWorker(worldUid, dir));
+            int generation = _preloadGeneration;
+            Task.Run(() => PreloadWorker(worldUid, dir, generation));
             EasyBakeLog.Info($"[Cache] Preload started for world {worldUid:x16}.");
         }
 
-        private static void PreloadWorker(long worldUid, string dir)
+        private static void PreloadWorker(long worldUid, string dir, int generation)
         {
+            int unreadableRemoved = 0;
             try
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -258,8 +327,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 for (int i = 0; i < files.Length; i++)
                 {
+                    if (generation != _preloadGeneration) return;
                     var file = files[i];
-                    Vector2i coord;
+                    Vector2s coord;
                     if (!TryParseCoord(Path.GetFileNameWithoutExtension(file), out coord))
                     {
                         _preloadZonesFailed++;
@@ -282,6 +352,14 @@ namespace FiresEasyBakeMeshes.EasyBake
                             }
                         }
                     }
+                    catch (Exception ex) when (ex is InvalidDataException || ex is EndOfStreamException)
+                    {
+                        // Wrong format, version, coordinates or world, or truncated: it can never load, so remove it
+                        // rather than fail it again every login. The zone bakes fresh and saves a readable file.
+                        _preloadZonesFailed++;
+                        try { File.Delete(file); unreadableRemoved++; }
+                        catch (Exception deleteEx) { EasyBakeLog.Warn($"[Cache] Could not remove unreadable {Path.GetFileName(file)}: {deleteEx.Message}"); }
+                    }
                     catch (Exception ex)
                     {
                         _preloadZonesFailed++;
@@ -292,16 +370,17 @@ namespace FiresEasyBakeMeshes.EasyBake
                 sw.Stop();
                 EasyBakeLog.Info(
                     $"[Cache] Preload finished in {sw.Elapsed.TotalSeconds:F2}s: " +
-                    $"{_preloadZonesLoaded} zones loaded, {_preloadZonesFailed} failed.");
+                    $"{_preloadZonesLoaded} zones loaded, {_preloadZonesFailed} failed" +
+                    (unreadableRemoved > 0 ? $"; removed {unreadableRemoved} unreadable cache file(s), those zones bake fresh." : "."));
             }
             finally
             {
-                _preloadFinished = true;
+                if (generation == _preloadGeneration) _preloadFinished = true;
             }
         }
 
-        // Filename like "zone_-17_11.bin" → Vector2i(-17, 11).
-        private static bool TryParseCoord(string fileNameNoExt, out Vector2i coord)
+        // Filename like "zone_-17_11.bin" → Vector2s(-17, 11).
+        private static bool TryParseCoord(string fileNameNoExt, out Vector2s coord)
         {
             coord = default;
             if (!fileNameNoExt.StartsWith("zone_")) return false;
@@ -309,11 +388,11 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (parts.Length != 2) return false;
             if (!int.TryParse(parts[0], out var x)) return false;
             if (!int.TryParse(parts[1], out var y)) return false;
-            coord = new Vector2i(x, y);
+            coord = new Vector2s(x, y);
             return true;
         }
 
-        public static bool TryGetPreloaded(Vector2i coord, out CachedZoneData data)
+        public static bool TryGetPreloaded(Vector2s coord, out CachedZoneData data)
         {
             return _preloaded.TryGetValue(coord, out data);
         }
@@ -328,9 +407,21 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (data == null) return null;
             if (data.Batches == null || data.Batches.Count == 0) return null;
 
+            // Every piece in ContributorIdentities gets hidden on the strength of this cache, so a batch that cannot
+            // be rebuilt would leave its pieces invisible. Rebuild all of them or none, and bake fresh otherwise.
+            IndexContributorPrefabs(data);
+            string missing = FirstMissingMaterial(data.Batches) ?? FirstMissingMaterial(data.FarBatches);
+            if (missing != null)
+            {
+                _preloaded.TryRemove(data.Coord, out _);
+                EasyBakeLog.Warn($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): cached material '{missing}' is not loaded; baking the zone fresh instead.");
+                return null;
+            }
+
             var result = new MeshBaker.BakeResult
             {
                 ContributorIdentities = data.ContributorIdentities,
+                PieceTransforms = data.PieceTransforms ?? new Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform>(),
             };
 
             var parent = new GameObject($"[EasyBake/Zone_{data.Coord.x}_{data.Coord.y}/cached]");
@@ -338,14 +429,65 @@ namespace FiresEasyBakeMeshes.EasyBake
             parent.isStatic = true;
             result.Parent = parent;
 
-            int batchesBuilt = 0, batchesSkipped = 0;
-            for (int i = 0; i < data.Batches.Count; i++)
-            {
-                var b = data.Batches[i];
-                var mat = FindMaterial(b.MaterialName);
-                if (mat == null) { batchesSkipped++; continue; }
+            ConstructTier(data, data.Batches, parent, result.Batches, farTier: false);
+            ConstructTier(data, data.FarBatches, parent, result.FarBatches, farTier: true);
 
-                var mesh = new Mesh { name = $"EasyBakeCached_{data.Coord.x}_{data.Coord.y}_{b.MaterialName}" };
+            // Instanced groups must resolve completely. Their pieces get suppressed on
+            // the strength of this cache's ContributorIdentities, so a group we cannot
+            // rebuild would hide pieces with nothing drawing them. Reject the whole
+            // cached zone instead and let it bake fresh.
+            if (data.InstanceGroups != null)
+            {
+                for (int i = 0; i < data.InstanceGroups.Count; i++)
+                {
+                    var cachedGroup = data.InstanceGroups[i];
+                    InstanceDefinition definition;
+                    if (!InstanceDefinitionCache.TryGet(cachedGroup.PrefabHash, out definition))
+                    {
+                        EasyBakeLog.Warn(
+                            $"[Cache] Zone ({data.Coord.x},{data.Coord.y}): instanced prefab {cachedGroup.PrefabHash} " +
+                            "no longer resolves — discarding cache so the zone rebakes.");
+                        UnityEngine.Object.Destroy(parent);
+                        return null;
+                    }
+
+                    var group = new ZoneInstanceGroup { PrefabHash = cachedGroup.PrefabHash, Definition = definition };
+                    for (int m = 0; m < cachedGroup.Matrices.Length; m++)
+                    {
+                        group.AddCached(cachedGroup.Matrices[m], new MeshBaker.PieceIdentity
+                        {
+                            PrefabHash = cachedGroup.PrefabHash,
+                            X = cachedGroup.PositionsX[m],
+                            Y = cachedGroup.PositionsY[m],
+                            Z = cachedGroup.PositionsZ[m],
+                            R = cachedGroup.PositionsR[m],
+                        });
+                    }
+                    group.RecomputeBounds();
+                    result.InstanceGroups.Add(group);
+                }
+            }
+
+            if (!result.HasRenderableContent)
+            {
+                UnityEngine.Object.Destroy(parent);
+                return null;
+            }
+            return result;
+        }
+
+        private static void ConstructTier(CachedZoneData data, List<CachedBatchData> cached, GameObject parent,
+            List<MeshBaker.BatchInstance> into, bool farTier)
+        {
+            if (cached == null) return;
+            for (int i = 0; i < cached.Count; i++)
+            {
+                var b = cached[i];
+                var mat = FindMaterial(b.MaterialName);
+                if (mat == null) continue;
+
+                string batchName = b.MaterialName + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
+                var mesh = new Mesh { name = $"EasyBakeCached_{data.Coord.x}_{data.Coord.y}_{batchName}" };
                 if (b.IndexFormatUInt32) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
                 mesh.SetVertices(b.Vertices);
                 if (b.Normals  != null) mesh.SetNormals(b.Normals);
@@ -354,7 +496,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 mesh.SetIndices(b.Indices, MeshTopology.Triangles, 0);
                 mesh.RecalculateBounds();
 
-                var go = new GameObject($"Batch_{b.MaterialName}");
+                var go = new GameObject($"Batch_{batchName}");
                 go.transform.parent = parent.transform;
                 go.transform.position = Vector3.zero;
                 go.isStatic = true;
@@ -367,28 +509,18 @@ namespace FiresEasyBakeMeshes.EasyBake
                 mr.lightProbeUsage        = (UnityEngine.Rendering.LightProbeUsage)b.LightProbeUsage;
                 mr.reflectionProbeUsage   = (UnityEngine.Rendering.ReflectionProbeUsage)b.ReflectionProbeUsage;
                 mr.motionVectorGenerationMode = (MotionVectorGenerationMode)b.MotionVectorMode;
+                if (farTier) go.SetActive(false);
 
-                result.Batches.Add(new MeshBaker.BatchInstance { Combined = go, Mesh = mesh });
-                batchesBuilt++;
+                into.Add(new MeshBaker.BatchInstance { Combined = go, Mesh = mesh });
             }
-
-            if (batchesSkipped > 0)
-                EasyBakeLog.Warn($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): built {batchesBuilt} batches, skipped {batchesSkipped} (material lookup failed).");
-
-            if (batchesBuilt == 0)
-            {
-                UnityEngine.Object.Destroy(parent);
-                return null;
-            }
-            return result;
         }
 
         // --- Save (main thread; runs after a successful Bake) ------------------
 
-        public static void Save(long worldUid, Vector2i coord, MeshBaker.BakeResult bake)
+        public static void Save(long worldUid, Vector2s coord, MeshBaker.BakeResult bake)
         {
             if (_cacheRoot == null || worldUid == 0L) return;
-            if (bake == null || bake.Batches == null || bake.Batches.Count == 0) return;
+            if (bake == null || !bake.HasRenderableContent) return;
 
             var path = GetZonePath(worldUid, coord);
             if (path == null) return;
@@ -404,11 +536,16 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 // Also refresh the preload entry so an immediate revisit of
                 // this zone (without restarting the game) sees the new bake.
+                RegisterLiveMaterials(bake.Batches);
+                RegisterLiveMaterials(bake.FarBatches);
                 var refreshed = new CachedZoneData
                 {
                     Coord = coord,
                     ContributorIdentities = bake.ContributorIdentities,
-                    Batches = ExtractBatchDataFromLive(bake),
+                    PieceTransforms = bake.PieceTransforms,
+                    Batches = ExtractBatchDataFromLive(bake.Batches),
+                    FarBatches = ExtractBatchDataFromLive(bake.FarBatches),
+                    InstanceGroups = ExtractInstanceGroupDataFromLive(bake.InstanceGroups),
                 };
                 _preloaded[coord] = refreshed;
             }
@@ -422,7 +559,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // rebake produced no batches or a dirty zone tore down below the bake
         // threshold — leaving the old file would resurrect the removed pieces'
         // ghost geometry next session.
-        public static void Delete(long worldUid, Vector2i coord)
+        public static void Delete(long worldUid, Vector2s coord)
         {
             try
             {
@@ -436,7 +573,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
-        private static string GetZonePath(long worldUid, Vector2i coord)
+        private static string GetZonePath(long worldUid, Vector2s coord)
         {
             if (_cacheRoot == null) return null;
             return Path.Combine(_cacheRoot, worldUid.ToString("x16"), $"zone_{coord.x}_{coord.y}.bin");
@@ -446,12 +583,55 @@ namespace FiresEasyBakeMeshes.EasyBake
         // intermediate form so a future TryGetPreloaded hit doesn't have to
         // re-read from disk. Reading mesh.vertices etc. on main thread is fine
         // (the mesh is readable since we just built it via CombineMeshes).
-        private static List<CachedBatchData> ExtractBatchDataFromLive(MeshBaker.BakeResult bake)
+        private static List<CachedInstanceGroupData> ExtractInstanceGroupDataFromLive(List<ZoneInstanceGroup> groups)
         {
-            var list = new List<CachedBatchData>(bake.Batches.Count);
-            for (int i = 0; i < bake.Batches.Count; i++)
+            if (groups == null) return new List<CachedInstanceGroupData>();
+            var list = new List<CachedInstanceGroupData>(groups.Count);
+            for (int i = 0; i < groups.Count; i++)
             {
-                var batch = bake.Batches[i];
+                var group = groups[i];
+                int count = group.Matrices.Count;
+                var positionsX = new int[count];
+                var positionsY = new int[count];
+                var positionsZ = new int[count];
+                var positionsR = new int[count];
+                for (int m = 0; m < count; m++)
+                {
+                    positionsX[m] = group.Identities[m].X;
+                    positionsY[m] = group.Identities[m].Y;
+                    positionsZ[m] = group.Identities[m].Z;
+                    positionsR[m] = group.Identities[m].R;
+                }
+                list.Add(new CachedInstanceGroupData
+                {
+                    PrefabHash = group.PrefabHash,
+                    Matrices = group.Matrices.ToArray(),
+                    PositionsX = positionsX,
+                    PositionsY = positionsY,
+                    PositionsZ = positionsZ,
+                    PositionsR = positionsR,
+                });
+            }
+            return list;
+        }
+
+        private static void RegisterLiveMaterials(List<MeshBaker.BatchInstance> batches)
+        {
+            if (batches == null) return;
+            for (int i = 0; i < batches.Count; i++)
+            {
+                var mr = batches[i].Combined != null ? batches[i].Combined.GetComponent<MeshRenderer>() : null;
+                if (mr != null) RegisterMaterial(mr.sharedMaterial);
+            }
+        }
+
+        private static List<CachedBatchData> ExtractBatchDataFromLive(List<MeshBaker.BatchInstance> batches)
+        {
+            if (batches == null) return new List<CachedBatchData>();
+            var list = new List<CachedBatchData>(batches.Count);
+            for (int i = 0; i < batches.Count; i++)
+            {
+                var batch = batches[i];
                 var mr = batch.Combined != null ? batch.Combined.GetComponent<MeshRenderer>() : null;
                 var matName = mr != null && mr.sharedMaterial != null ? mr.sharedMaterial.name : "";
                 var mesh = batch.Mesh;
@@ -484,12 +664,13 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // --- Binary format -----------------------------------------------------
 
-        private static void WriteBakeResult(BinaryWriter bw, long worldUid, Vector2i coord, MeshBaker.BakeResult bake)
+        private static void WriteBakeResult(BinaryWriter bw, long worldUid, Vector2s coord, MeshBaker.BakeResult bake)
         {
             bw.Write(MAGIC);
             bw.Write(VERSION);
-            bw.Write(coord.x);
-            bw.Write(coord.y);
+            // Valheim 1.0's Vector2s holds shorts; the format stores int32, which the reader expects.
+            bw.Write((int)coord.x);
+            bw.Write((int)coord.y);
             bw.Write(worldUid);
 
             int identityCount = bake.ContributorIdentities?.Count ?? 0;
@@ -502,12 +683,55 @@ namespace FiresEasyBakeMeshes.EasyBake
                     bw.Write(id.X);
                     bw.Write(id.Y);
                     bw.Write(id.Z);
+                    bw.Write(id.R);
+                }
+            }
+
+            int transformCount = bake.PieceTransforms?.Count ?? 0;
+            bw.Write(transformCount);
+            if (bake.PieceTransforms != null)
+            {
+                foreach (var entry in bake.PieceTransforms)
+                {
+                    bw.Write(entry.Key.PrefabHash);
+                    bw.Write(entry.Key.X);
+                    bw.Write(entry.Key.Y);
+                    bw.Write(entry.Key.Z);
+                    bw.Write(entry.Key.R);
+                    var t = entry.Value;
+                    bw.Write(t.Position.x); bw.Write(t.Position.y); bw.Write(t.Position.z);
+                    bw.Write(t.Rotation.x); bw.Write(t.Rotation.y); bw.Write(t.Rotation.z); bw.Write(t.Rotation.w);
+                    bw.Write(t.Scale.x); bw.Write(t.Scale.y); bw.Write(t.Scale.z);
                 }
             }
 
             bw.Write(bake.Batches.Count);
             for (int i = 0; i < bake.Batches.Count; i++)
                 WriteBatch(bw, bake.Batches[i]);
+
+            int farCount = bake.FarBatches?.Count ?? 0;
+            bw.Write(farCount);
+            for (int i = 0; i < farCount; i++)
+                WriteBatch(bw, bake.FarBatches[i]);
+
+            int instanceGroupCount = bake.InstanceGroups?.Count ?? 0;
+            bw.Write(instanceGroupCount);
+            for (int i = 0; i < instanceGroupCount; i++)
+            {
+                var group = bake.InstanceGroups[i];
+                bw.Write(group.PrefabHash);
+                bw.Write(group.Matrices.Count);
+                for (int m = 0; m < group.Matrices.Count; m++)
+                {
+                    var matrix = group.Matrices[m];
+                    for (int e = 0; e < 16; e++) bw.Write(matrix[e]);
+                    var identity = group.Identities[m];
+                    bw.Write(identity.X);
+                    bw.Write(identity.Y);
+                    bw.Write(identity.Z);
+                    bw.Write(identity.R);
+                }
+            }
         }
 
         private static void WriteBatch(BinaryWriter bw, MeshBaker.BatchInstance batch)
@@ -585,7 +809,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // Read path is split so the background worker can call it WITHOUT
         // touching Unity API. It returns intermediate arrays; ConstructFromCache
         // turns those into Mesh + GameObject on the main thread.
-        private static CachedZoneData ReadCachedZoneData(BinaryReader br, long expectedWorldUid, Vector2i expectedCoord)
+        private static CachedZoneData ReadCachedZoneData(BinaryReader br, long expectedWorldUid, Vector2s expectedCoord)
         {
             uint magic = br.ReadUInt32();
             if (magic != MAGIC) throw new InvalidDataException($"bad magic 0x{magic:X8}");
@@ -609,7 +833,28 @@ namespace FiresEasyBakeMeshes.EasyBake
                     X = br.ReadInt32(),
                     Y = br.ReadInt32(),
                     Z = br.ReadInt32(),
+                    R = br.ReadInt32(),
                 });
+            }
+
+            int transformCount = br.ReadInt32();
+            var transforms = new Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform>(transformCount);
+            for (int i = 0; i < transformCount; i++)
+            {
+                var id = new MeshBaker.PieceIdentity
+                {
+                    PrefabHash = br.ReadInt32(),
+                    X = br.ReadInt32(),
+                    Y = br.ReadInt32(),
+                    Z = br.ReadInt32(),
+                    R = br.ReadInt32(),
+                };
+                transforms[id] = new MeshBaker.PieceTransform
+                {
+                    Position = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
+                    Rotation = new Quaternion(br.ReadSingle(), br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
+                    Scale = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
+                };
             }
 
             int batchCount = br.ReadInt32();
@@ -620,8 +865,57 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (b != null) batches.Add(b);
             }
 
-            if (batches.Count == 0) return null;
-            return new CachedZoneData { Coord = expectedCoord, ContributorIdentities = identities, Batches = batches };
+            int farBatchCount = br.ReadInt32();
+            var farBatches = new List<CachedBatchData>(farBatchCount);
+            for (int i = 0; i < farBatchCount; i++)
+            {
+                var farBatch = ReadCachedBatchData(br);
+                if (farBatch != null) farBatches.Add(farBatch);
+            }
+
+            int instanceGroupCount = br.ReadInt32();
+            var instanceGroups = new List<CachedInstanceGroupData>(instanceGroupCount);
+            for (int i = 0; i < instanceGroupCount; i++)
+            {
+                int prefabHash = br.ReadInt32();
+                int matrixCount = br.ReadInt32();
+                var matrices = new Matrix4x4[matrixCount];
+                var positionsX = new int[matrixCount];
+                var positionsY = new int[matrixCount];
+                var positionsZ = new int[matrixCount];
+                var positionsR = new int[matrixCount];
+                for (int m = 0; m < matrixCount; m++)
+                {
+                    var matrix = new Matrix4x4();
+                    for (int e = 0; e < 16; e++) matrix[e] = br.ReadSingle();
+                    matrices[m] = matrix;
+                    positionsX[m] = br.ReadInt32();
+                    positionsY[m] = br.ReadInt32();
+                    positionsZ[m] = br.ReadInt32();
+                    positionsR[m] = br.ReadInt32();
+                }
+                instanceGroups.Add(new CachedInstanceGroupData
+                {
+                    PrefabHash = prefabHash,
+                    Matrices = matrices,
+                    PositionsX = positionsX,
+                    PositionsY = positionsY,
+                    PositionsZ = positionsZ,
+                    PositionsR = positionsR,
+                });
+            }
+
+            if (batches.Count == 0 && instanceGroups.Count == 0) return null;
+
+            return new CachedZoneData
+            {
+                Coord = expectedCoord,
+                ContributorIdentities = identities,
+                PieceTransforms = transforms,
+                Batches = batches,
+                FarBatches = farBatches,
+                InstanceGroups = instanceGroups,
+            };
         }
 
         private static CachedBatchData ReadCachedBatchData(BinaryReader br)

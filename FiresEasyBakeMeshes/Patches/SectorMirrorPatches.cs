@@ -65,6 +65,10 @@ namespace FiresEasyBakeMeshes.Patches
         public static void Postfix()
         {
             EasyBake.SectorInstanceMirror.Reset();
+            // Zone state outlives the scene otherwise: after a relog a zone still "baked" would hide returning pieces
+            // behind combined meshes the old scene took with it, and skipped ZDOs would belong to a finished session.
+            try { EasyBake.ZoneTracker.Reset(); }
+            catch { }
         }
     }
 
@@ -76,9 +80,20 @@ namespace FiresEasyBakeMeshes.Patches
     [HarmonyPatch(typeof(ZNetScene), nameof(ZNetScene.HaveInstanceInSector))]
     public static class ZNetScene_HaveInstanceInSector_Patch
     {
+        private static bool s_standDownLogged;
+
         [HarmonyPrefix]
-        public static bool Prefix(Vector2i sector, ref bool __result)
+        public static bool Prefix(Vector2s sector, ref bool __result, bool __runOriginal)
         {
+            if (!__runOriginal)
+            {
+                if (!s_standDownLogged)
+                {
+                    s_standDownLogged = true;
+                    EasyBakeLog.Info("[SectorMirror] Another mod already answers ZNetScene.HaveInstanceInSector; the sector mirror stands down.");
+                }
+                return false;
+            }
             if (!FiresEasyBakeMeshesPlugin.SectorMirrorEnabled.Value) return true;
             if (EasyBake.SectorInstanceMirror.TryHasInstance(sector, out bool hasInstance))
             {

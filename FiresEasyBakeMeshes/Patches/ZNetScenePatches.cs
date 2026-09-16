@@ -7,10 +7,29 @@ namespace FiresEasyBakeMeshes.Patches
     [HarmonyPatch(typeof(ZNetScene), "Awake")]
     public static class ZNetScene_Awake_Patch
     {
+        private static bool s_censusRegistered;
+
         [HarmonyPostfix]
         public static void Postfix(ZNetScene __instance)
         {
             if (!FiresEasyBakeMeshesPlugin.PluginEnabled.Value) return;
+
+            if (!s_censusRegistered)
+            {
+                s_censusRegistered = true;
+                new Terminal.ConsoleCommand("ebm_census",
+                    "FiresEasyBakeMeshes: count every loaded object and why it was created instead of skipped (also written to the log).",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        string report = EasyBake.ZoneTracker.Census();
+                        EasyBakeLog.Info(report);
+                        foreach (var line in report.Split('\n')) args.Context?.AddString(line);
+                    }));
+            }
+
+            // Prefab-derived verdicts are rebuilt per scene: mods can register different prefabs each session.
+            EasyBake.SkipEligibility.Clear();
+            EasyBake.StandInColliders.Clear();
 
             // The material-registry walk + prewarm both run on the main
             // thread inside ZNetScene.Awake's lifecycle window. Pre-fix:
@@ -107,6 +126,7 @@ namespace FiresEasyBakeMeshes.Patches
             }
 
             EasyBakeLog.Info($"[Cache] World {worldUid:x16} has a cache — building material registry.");
+            EasyBake.InstanceDefinitionCache.Clear();
             var registryEnum = EasyBake.MeshCacheStore.BuildMaterialRegistryAsync(scene);
             while (registryEnum.MoveNext())
                 yield return registryEnum.Current;
@@ -179,9 +199,22 @@ namespace FiresEasyBakeMeshes.Patches
     [HarmonyPatch(typeof(ZNetScene), "RemoveObjects")]
     public static class ZNetScene_RemoveObjects_Patch
     {
+        private static bool s_standDownLogged;
+
+        // A prefix that already replaced RemoveObjects (ValheimCommunityPatch's zone-diff removal) hands on lists
+        // that do not describe the active area; destroying against them unloads everything it just created.
         [HarmonyPrefix]
-        public static bool Prefix(ZNetScene __instance, List<ZDO> currentNearObjects, List<ZDO> currentDistantObjects)
+        public static bool Prefix(ZNetScene __instance, List<ZDO> currentNearObjects, List<ZDO> currentDistantObjects, bool __runOriginal)
         {
+            if (!__runOriginal)
+            {
+                if (!s_standDownLogged)
+                {
+                    s_standDownLogged = true;
+                    EasyBakeLog.Info("[DTS] Another mod already replaces ZNetScene.RemoveObjects; destroy time-slicing and zone keepalive stand down.");
+                }
+                return false;
+            }
             if (!FiresEasyBakeMeshesPlugin.BatchingActive()) return true;
 
             // Layer 1: keepalive injection. Pass player center + vanilla's
@@ -195,12 +228,13 @@ namespace FiresEasyBakeMeshes.Patches
                 if (zs != null && net != null)
                 {
                     var center = ZoneSystem.GetZone(net.GetReferencePosition());
-                    int vanillaCovered = zs.m_activeArea; // strict near area
+                    // strict near area - 1.0 replaced m_activeArea with SimulationDistance
+                        int vanillaCovered = net.GetSyncedSimulationDistance().NearSimulationDistance;
                     EasyBake.ZoneKeepalive.AppendKeepaliveZDOs(currentNearObjects, center, vanillaCovered);
                 }
                 else
                 {
-                    EasyBake.ZoneKeepalive.AppendKeepaliveZDOs(currentNearObjects, new Vector2i(0, 0), -1);
+                    EasyBake.ZoneKeepalive.AppendKeepaliveZDOs(currentNearObjects, new Vector2s(0, 0), -1);
                 }
             }
 

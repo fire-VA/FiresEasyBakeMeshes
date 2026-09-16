@@ -8,11 +8,14 @@ namespace FiresEasyBakeMeshes
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     [BepInDependency("com.Fire.FiresUnifiedCore", BepInDependency.DependencyFlags.HardDependency)]
+    // Runs after GameCamera, which moves the camera in its own LateUpdate, so the instanced
+    // draw tests the view the frame is about to be rendered from.
+    [DefaultExecutionOrder(1000)]
     public class FiresEasyBakeMeshesPlugin : BaseUnityPlugin
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.0.3";
+        public const string PluginVersion = "1.2.15";
 
         public static ConfigEntry<bool> PluginEnabled;
         public static ConfigEntry<bool> VerboseZoneLogging;
@@ -22,8 +25,17 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<int>   BatchingMinPiecesPerZone;
         public static ConfigEntry<int>   BatchingMinPiecesPerBatch;
         public static ConfigEntry<float> BatchingSettleDelaySeconds;
+        public static ConfigEntry<bool>  BatchingFarTierEnabled;
+        public static ConfigEntry<float> BatchingFarTierDistance;
+        public static ConfigEntry<bool>  BatchingInstancingEnabled;
+        public static ConfigEntry<bool>  BatchingCullOffScreen;
+        public static ConfigEntry<bool>  BatchingMultiPartPieces;
+        public static ConfigEntry<float> BatchingBuildRadius;
+        public static ConfigEntry<int>   BatchingMinInstancesPerPrefab;
+        public static ConfigEntry<bool>  BatchingDamageablePieces;
         public static ConfigEntry<bool>  BatchingVerbose;
         public static ConfigEntry<bool>  BatchingExcludeTransparent;
+        public static ConfigEntry<bool>  SkipBakedPieceObjects;
 
         public static ConfigEntry<bool>   PrewarmEnabled;
         public static ConfigEntry<bool>   PrewarmRunOnServer;
@@ -58,6 +70,12 @@ namespace FiresEasyBakeMeshes
 
         public static ConfigEntry<bool>  LightFlickerLodEnabled;
         public static ConfigEntry<float> LightFlickerLodDistance;
+        public static ConfigEntry<float> LightFlickerMidDistance;
+        public static ConfigEntry<float> LightFlickerFarDistance;
+        public static ConfigEntry<float> LightFlickerMidRate;
+        public static ConfigEntry<float> LightFlickerFarRate;
+        public static ConfigEntry<float> LightFlickerDistantRate;
+        public static ConfigEntry<float> LightFlickerTierCheckRate;
 
         public static ConfigEntry<bool>  ZSFXLodEnabled;
         public static ConfigEntry<float> ZSFXLodDistance;
@@ -118,6 +136,44 @@ namespace FiresEasyBakeMeshes
                     "to vanilla rendering rather than getting its own combined mesh.",
                     new AcceptableValueRange<int>(1, 10000)));
 
+            BatchingInstancingEnabled = Config.Bind("Batching", "InstancingEnabled", true,
+                new ConfigDescription(
+                    "Draw uniform single-mesh prefabs (palisades, floor tiles, stakewalls)\nas GPU instances instead of merging them into a combined mesh. Costs no\nvertex duplication, and a removed piece drops out in O(1) instead of\nforcing the zone to rebake."));
+
+            BatchingCullOffScreen = Config.Bind("Batching", "SkipInstancesOutOfView", true,
+                new ConfigDescription(
+                    "Instanced pieces are handed to the graphics card again every frame, for every\nloaded zone, including the ones behind you. With this on, a group of instances\nwhose box is outside the camera is left out of the frame entirely. The box is\nstretched along the sun first, so shadows still land on what you can see."));
+
+            BatchingMultiPartPieces = Config.Bind("Batching", "MultiPartInstancing", true,
+                new ConfigDescription(
+                    "Draw pieces built from more than one mesh - vines, log poles, tiled roofs - as GPU\ninstances as well, one draw per mesh and material. Without it only prefabs that come\ndown to a single renderer are instanced and the rest are merged or left to draw\nthemselves. Applies to zones baked after a change."));
+
+            BatchingMinInstancesPerPrefab = Config.Bind("Batching", "MinInstancesPerPrefab", 10,
+                new ConfigDescription(
+                    "A prefab needs at least this many copies in one zone before it is\ndrawn as instances. Below it the pieces fall through to mesh combining,\nwhere they still batch by material with everything else.",
+                    new AcceptableValueRange<int>(2, 10000)));
+
+            BatchingDamageablePieces = Config.Bind("Batching", "DamageablePieces", true,
+                new ConfigDescription(
+                    "Also draw building pieces that can take damage as GPU instances. They stay\n" +
+                    "in the world, so rain wear, support and raids work as normal, and a piece\n" +
+                    "goes back to drawing itself the moment it is damaged, burns or is\n" +
+                    "highlighted by a hammer. Never skipped. Applies to zones baked after a change."));
+
+            BatchingFarTierEnabled = Config.Bind("Batching", "FarTierEnabled", true,
+                new ConfigDescription(
+                    "Bake a second combined mesh per zone from each piece's LOD1 geometry\n" +
+                    "and swap to it once the viewer is far enough away. Without it a baked\n" +
+                    "zone draws full LOD0 detail at every distance."));
+
+            BatchingFarTierDistance = Config.Bind("Batching", "FarTierDistanceMeters", 64f,
+                new ConfigDescription(
+                    "Distance from the zone centre at which a baked zone swaps to its LOD1\n" +
+                    "mesh. A zone is 64m across, so its centre is at most ~45m from any\n" +
+                    "point inside it — keep this at or above 64 and the swap can never\n" +
+                    "happen while you are standing in the zone watching it.",
+                    new AcceptableValueRange<float>(48f, 512f)));
+
             BatchingSettleDelaySeconds = Config.Bind("Batching", "SettleDelaySeconds", 1.5f,
                 new ConfigDescription(
                     "Wait this long after the last piece is added or removed in a zone\n" +
@@ -135,6 +191,23 @@ namespace FiresEasyBakeMeshes
                 "breaks per-piece depth sorting — stained glass sorts against the world\n" +
                 "per pane, a merged mesh sorts once for the whole batch. Excluded pieces\n" +
                 "stay live and render normally.");
+
+            SkipBakedPieceObjects = Config.Bind("Batching", "SkipBakedPieceObjects", true,
+                "Multiplayer clients only. Pieces a bake already draws are not created as game objects:\n" +
+                "a stand-in collider takes each one's place, so they cost nothing per frame. Only\n" +
+                "invulnerable, purely structural pieces qualify; anything that crafts, stores, lights,\n" +
+                "protects, comforts or animates is always created. Real pieces come back while a build\n" +
+                "tool is out nearby, or when a skipped piece is removed, moved or loses invulnerability.\n" +
+                "Never runs on a server, host or single-player world.");
+            SkipBakedPieceObjects.SettingChanged += (_, __) =>
+            {
+                if (!SkipBakedPieceObjects.Value) EasyBake.ZoneTracker.HandBackAllSkipped();
+            };
+
+            BatchingBuildRadius = Config.Bind("Batching", "BuildToolRadiusMeters", 24f,
+                new ConfigDescription(
+                    "While a build tool is out, the real pieces come back within this many metres of you, so the\nhammer can snap to them, highlight them and take them down. Everything further away stays\nbaked. In a dense base this is the most expensive thing skipping does, so keep it near what\nyou can actually reach.",
+                    new AcceptableValueRange<float>(4f, 256f)));
 
             PrewarmEnabled = Config.Bind("Prewarm", "Enabled", true,
                 "Workstream B: at ZNetScene.Awake, instantiate every prefab in m_prefabs\n" +
@@ -330,24 +403,57 @@ namespace FiresEasyBakeMeshes
                 "and sector counts. Useful for verifying the mirror is staying populated.");
 
             LightFlickerLodEnabled = Config.Bind("Optimize", "LightFlickerLodEnabled", true,
-                "Distance-LOD on LightFlicker.CustomUpdate. Vanilla runs flicker math\n" +
-                "(6+ sin/cos calls + position jitter) every frame for every lit prefab\n" +
-                "in the scene. At a megabase with hundreds of torches/braziers this\n" +
-                "aggregates to 8-10 ms/sec. Beyond LightFlickerLodDistance the per-frame\n" +
-                "flicker isn't visible (distance falloff dominates), so we skip the\n" +
-                "computation. Persistent lights only — temporary FX lights (item-drop\n" +
-                "sparkle, projectile trail, anything with m_ttl > 0) always tick so they\n" +
-                "can self-destruct.");
+                "Distance-tiered throttling of LightFlicker.CustomUpdate. Vanilla runs\n" +
+                "flicker math (6+ sin/cos calls + position jitter) every frame for every\n" +
+                "lit prefab in the scene; at a megabase with hundreds of torches/braziers\n" +
+                "this aggregates to 8-10 ms/sec. Distant lights update less often instead\n" +
+                "of being skipped outright — vanilla zeroes a light's intensity when it is\n" +
+                "enabled and only CustomUpdate writes it back, so a light that never ticks\n" +
+                "renders black. Skipped time is banked and handed to the next real update,\n" +
+                "so flicker and fade still run at the correct speed. Temporary FX lights\n" +
+                "(m_ttl > 0) and lights still fading in always run every frame.");
 
             LightFlickerLodDistance = Config.Bind("Optimize", "LightFlickerLodDistance", 30f,
                 new ConfigDescription(
-                    "Distance in meters beyond which LightFlicker.CustomUpdate is skipped\n" +
-                    "for persistent lights. Lights inside this radius flicker normally;\n" +
-                    "lights outside hold their last intensity. 30 m is conservative — a\n" +
-                    "torch's flicker is essentially invisible past 20 m due to camera\n" +
-                    "distance and falloff. Lower for more aggressive savings; raise if\n" +
-                    "you see distant lights pop between flicker / static.",
+                    "Radius in meters within which lights flicker at full vanilla rate.\n" +
+                    "Beyond it they step down through the mid / far / distant tiers below.",
                     new AcceptableValueRange<float>(5f, 200f)));
+
+            LightFlickerMidDistance = Config.Bind("Optimize", "LightFlickerMidDistance", 60f,
+                new ConfigDescription(
+                    "Outer radius of the mid tier. Lights between LightFlickerLodDistance\n" +
+                    "and this distance update at LightFlickerMidRate.",
+                    new AcceptableValueRange<float>(10f, 300f)));
+
+            LightFlickerFarDistance = Config.Bind("Optimize", "LightFlickerFarDistance", 100f,
+                new ConfigDescription(
+                    "Outer radius of the far tier. Lights between LightFlickerMidDistance\n" +
+                    "and this distance update at LightFlickerFarRate; anything beyond uses\n" +
+                    "LightFlickerDistantRate.",
+                    new AcceptableValueRange<float>(20f, 500f)));
+
+            LightFlickerMidRate = Config.Bind("Optimize", "LightFlickerMidRate", 10f,
+                new ConfigDescription(
+                    "Updates per second for lights in the mid distance tier.",
+                    new AcceptableValueRange<float>(1f, 60f)));
+
+            LightFlickerFarRate = Config.Bind("Optimize", "LightFlickerFarRate", 5f,
+                new ConfigDescription(
+                    "Updates per second for lights in the far distance tier.",
+                    new AcceptableValueRange<float>(1f, 30f)));
+
+            LightFlickerDistantRate = Config.Bind("Optimize", "LightFlickerDistantRate", 2f,
+                new ConfigDescription(
+                    "Updates per second for lights beyond LightFlickerFarDistance. Keep\n" +
+                    "above zero so distant lights still receive an intensity write.",
+                    new AcceptableValueRange<float>(0.5f, 10f)));
+
+            LightFlickerTierCheckRate = Config.Bind("Optimize", "LightFlickerTierCheckRate", 2f,
+                new ConfigDescription(
+                    "How often each light re-measures its distance tier. Caching the tier\n" +
+                    "is what removes the per-frame distance math; raise it only if lights\n" +
+                    "visibly lag a tier change while you sprint past them.",
+                    new AcceptableValueRange<float>(0.5f, 10f)));
 
             ZSFXLodEnabled = Config.Bind("Optimize", "ZSFXLodEnabled", true,
                 "Distance-LOD on ZSFX.CustomUpdate. ZSFX is Valheim's per-sound wrapper\n" +
@@ -464,6 +570,9 @@ namespace FiresEasyBakeMeshes
                 EasyBakeLog.Info(
                     $"{PluginName} v{PluginVersion} loaded but PluginEnabled=false — no patches applied. " +
                     "Flip PluginEnabled to true in the config manager to enable live (no restart needed).");
+
+            try { Utilities.EbmHelpContent.Register(); }
+            catch (System.Exception ex) { EasyBakeLog.Warn($"Help registration failed: {ex.Message}"); }
 
             // Compact "loaded" banner — oven with heat squiggles. Deferred to
             // world-load time (when ZNetScene is up) so it bookends the load;
@@ -582,7 +691,9 @@ namespace FiresEasyBakeMeshes
 
             if (!BatchingActive()) return;
             long tZone = EasyBake.Probe.Start();
+            long trackStart = System.Diagnostics.Stopwatch.GetTimestamp();
             EasyBake.ZoneTracker.Update();
+            EasyBake.InstancedDraw.NoteZoneTracking(System.Diagnostics.Stopwatch.GetTimestamp() - trackStart);
             EasyBake.Probe.Stop("EasyBake:zoneTrack", tZone);
 
             // Keepalive lifecycle: refresh entries within the active ring,
@@ -596,7 +707,9 @@ namespace FiresEasyBakeMeshes
             {
                 var refPos = ZNet.instance.GetReferencePosition();
                 var center = ZoneSystem.GetZone(refPos);
-                int activeArea = ZoneSystem.instance.m_activeArea;
+                // Valheim 1.0: the fixed m_activeArea radius became the player-configurable,
+                    // server-synced SimulationDistance.
+                    int activeArea = ZNet.instance.GetSyncedSimulationDistance().NearSimulationDistance;
                 long tKeep = EasyBake.Probe.Start();
                 EasyBake.ZoneKeepalive.Update(center, activeArea);
                 EasyBake.Probe.Stop("EasyBake:keepalive", tKeep);
@@ -618,6 +731,15 @@ namespace FiresEasyBakeMeshes
             // No-op when ZSyncStaticSkipVerbose=false. Cheap enough to call
             // every Update — guards on the throttle internally.
             EasyBake.StaticPieceZSyncSkip.MaybeReport();
+        }
+
+        // Instances are drawn here rather than in Update because GameCamera moves the
+        // camera in its own LateUpdate: deciding what is out of view any earlier would
+        // test last frame's view and let a fast turn clip geometry at the screen edge.
+        private void LateUpdate()
+        {
+            if (!BatchingActive()) return;
+            EasyBake.ZoneTracker.DrawInstances();
         }
 
         public static bool BatchingActive()

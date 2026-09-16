@@ -13,6 +13,7 @@
     <LangVersion>latest</LangVersion>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -66,7 +67,7 @@
     <!-- FiresUnifiedCore — hosts PrewarmCoroutine (FiresCore.Async.PrewarmCoroutine).
          Loaded at runtime via BepInDependency on Plugin.cs. -->
     <Reference Include="FiresUnifiedCore">
-      <HintPath>..\..\FiresUnifiedCore\FiresUnifiedCore\bin\Debug\FiresUnifiedCore.dll</HintPath>
+      <HintPath>..\..\FiresUnifiedCore\FiresUnifiedCore\bin\Release\FiresUnifiedCore.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>
@@ -74,16 +75,25 @@
     <Compile Include="Plugin.cs" />
     <Compile Include="EasyBakeLog.cs" />
     <Compile Include="Utilities\FiresEasyBakeBanner.cs" />
+    <Compile Include="Utilities\EbmHelpContent.cs" />
     <Compile Include="Utilities\BakeSummary.cs" />
     <Compile Include="EasyBake\InvulnerableClassifier.cs" />
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
+    <Compile Include="EasyBake\EasyBakeSuppressedVisuals.cs" />
+    <Compile Include="EasyBake\InstanceDefinition.cs" />
+    <Compile Include="EasyBake\ZoneInstanceGroup.cs" />
+    <Compile Include="EasyBake\InstancedDraw.cs" />
     <Compile Include="EasyBake\MeshCacheStore.cs" />
     <Compile Include="EasyBake\ZoneKeepalive.cs" />
     <Compile Include="EasyBake\DestroyTimeSlicer.cs" />
     <Compile Include="EasyBake\SectorInstanceMirror.cs" />
     <Compile Include="EasyBake\StaticPieceZSyncSkip.cs" />
     <Compile Include="EasyBake\Probe.cs" />
+    <Compile Include="EasyBake\PieceData.cs" />
+    <Compile Include="EasyBake\SkipEligibility.cs" />
+    <Compile Include="EasyBake\StandInColliders.cs" />
+    <Compile Include="Patches\SkipCreationPatches.cs" />
     <Compile Include="Patches\ClutterSystemPatches.cs" />
     <Compile Include="Patches\SectorMirrorPatches.cs" />
     <Compile Include="Patches\LightFlickerPatches.cs" />
@@ -92,7 +102,7 @@
     <Compile Include="Patches\WearNTearPatches.cs" />
     <Compile Include="Patches\VanillaTimingRacePatches.cs" />
     <Compile Include="Patches\CreateDestroyObjectsPatches.cs" />
-    <Compile Include="Patches\InfinityHammerCompatPatches.cs" />
+    <Compile Include="Patches\BakeInvalidationPatches.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
@@ -102,7 +112,7 @@
        folder. EasyBake hard-deps FiresUnifiedCore (already deployed there); it's a
        code-only mod (no bundles/assets) so the DLL is a complete install. -->
   <PropertyGroup>
-    <BlueHillsPluginDir>C:\Users\travi\AppData\Roaming\r2modmanPlus-local\Valheim\profiles\BlueHills\BepInEx\plugins\FiresEasyBakeMeshes\</BlueHillsPluginDir>
+    <BlueHillsPluginDir>$(AppData)\r2modmanPlus-local\Valheim\profiles\BlueHills\BepInEx\plugins\FiresEasyBakeMeshes\</BlueHillsPluginDir>
   </PropertyGroup>
   <Target Name="DeployToBlueHills" AfterTargets="Build" Condition="Exists('$(BlueHillsPluginDir)')">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BlueHillsPluginDir)" OverwriteReadOnlyFiles="true" />

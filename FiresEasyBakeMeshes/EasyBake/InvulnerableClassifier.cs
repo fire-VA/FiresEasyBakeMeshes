@@ -54,7 +54,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             return health < 0f;
         }
 
-        private static bool AllImmune(HitData.DamageModifiers m)
+        internal static bool AllImmune(HitData.DamageModifiers m)
         {
             return m.m_blunt     == HitData.DamageModifier.Immune
                 && m.m_slash     == HitData.DamageModifier.Immune

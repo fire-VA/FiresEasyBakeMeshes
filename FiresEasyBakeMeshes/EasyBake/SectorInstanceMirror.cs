@@ -14,7 +14,7 @@ namespace FiresEasyBakeMeshes.EasyBake
     // shows ZoneSystem.Update spiking to 80-87 ms/call during in-town movement,
     // dropping the frame to 5-10 fps.
     //
-    // This module maintains a Dictionary<Vector2i, int> "count of non-distant
+    // This module maintains a Dictionary<Vector2s, int> "count of non-distant
     // instances per sector" updated incrementally via Harmony patches on:
     //   - ZNetScene.AddInstance (postfix): increment
     //   - ZNetScene.OnZDODestroyed (prefix): decrement
@@ -48,12 +48,12 @@ namespace FiresEasyBakeMeshes.EasyBake
     internal static class SectorInstanceMirror
     {
         // Per-sector count of non-distant ZNetViews currently tracked.
-        private static readonly Dictionary<Vector2i, int> _countBySector = new Dictionary<Vector2i, int>();
+        private static readonly Dictionary<Vector2s, int> _countBySector = new Dictionary<Vector2s, int>();
 
         // ZDO -> sector at the time the ZDO was last observed in this mirror.
         // Required so OnInstanceRemoved knows which sector to decrement (the
         // ZNetView's transform may already be Unity-null by removal time).
-        private static readonly Dictionary<ZDO, Vector2i> _zdoSector = new Dictionary<ZDO, Vector2i>();
+        private static readonly Dictionary<ZDO, Vector2s> _zdoSector = new Dictionary<ZDO, Vector2s>();
 
         private static float _lastRebuildTime;
 
@@ -86,7 +86,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // out result = true if any tracked instance exists in the sector.
         // Returns true if the mirror has data; false to signal "fall back to vanilla."
-        public static bool TryHasInstance(Vector2i sector, out bool result)
+        public static bool TryHasInstance(Vector2s sector, out bool result)
         {
             result = _countBySector.TryGetValue(sector, out int count) && count > 0;
             return true;
@@ -139,13 +139,13 @@ namespace FiresEasyBakeMeshes.EasyBake
             _lastRebuildTime = 0f;
         }
 
-        private static void Increment(Vector2i sector)
+        private static void Increment(Vector2s sector)
         {
             _countBySector.TryGetValue(sector, out int count);
             _countBySector[sector] = count + 1;
         }
 
-        private static void Decrement(Vector2i sector)
+        private static void Decrement(Vector2s sector)
         {
             if (!_countBySector.TryGetValue(sector, out int count)) return;
             if (count <= 1) _countBySector.Remove(sector);

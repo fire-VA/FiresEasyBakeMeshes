@@ -7,7 +7,7 @@ using UnityEngine;
 namespace FiresEasyBakeMeshes
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
-    [BepInDependency("com.Fire.FiresUnifiedCore", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.Fire.FiresUnifiedCore", "0.2.29")]
     // Runs after GameCamera, which moves the camera in its own LateUpdate, so the instanced
     // draw tests the view the frame is about to be rendered from.
     [DefaultExecutionOrder(1000)]
@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.15";
+        public const string PluginVersion = "1.2.29";
 
         public static ConfigEntry<bool> PluginEnabled;
         public static ConfigEntry<bool> VerboseZoneLogging;
@@ -35,6 +35,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<bool>  BatchingDamageablePieces;
         public static ConfigEntry<bool>  BatchingVerbose;
         public static ConfigEntry<bool>  BatchingExcludeTransparent;
+        public static ConfigEntry<string> BatchingExcludedPrefabs;
         public static ConfigEntry<bool>  SkipBakedPieceObjects;
 
         public static ConfigEntry<bool>   PrewarmEnabled;
@@ -49,6 +50,9 @@ namespace FiresEasyBakeMeshes
 
         public static ConfigEntry<bool> CachePersistEnabled;
 
+        public static ConfigEntry<int>   CreateBudgetPerFrame;
+        public static ConfigEntry<bool>  DeferCreationWhileBaking;
+        public static ConfigEntry<bool>  CreationCensusEnabled;
         public static ConfigEntry<bool>  CreateDestroySkipEnabled;
         public static ConfigEntry<float> CreateDestroySkipMaxSeconds;
         public static ConfigEntry<bool>  CreateDestroySkipVerbose;
@@ -192,6 +196,18 @@ namespace FiresEasyBakeMeshes
                 "per pane, a merged mesh sorts once for the whole batch. Excluded pieces\n" +
                 "stay live and render normally.");
 
+            BatchingExcludedPrefabs = Config.Bind("Batching", "ExcludedPrefabs", "",
+                "Comma-separated prefab names (exact, case-sensitive) that are never baked, instanced or skipped:\n" +
+                "they always keep their own renderers. Add a prefab here when the bake draws it wrong. Mods can\n" +
+                "opt their own pieces out without this list, through FiresCore's MeshBakeBridge.\n" +
+                "Applies to pieces as they load; relog to rebake zones that already hold one.");
+            BatchingExcludedPrefabs.SettingChanged += (_, __) =>
+            {
+                EasyBake.ZoneTracker.ReloadExcludedPrefabs();
+                EasyBake.SkipEligibility.Clear();
+            };
+            FiresCore.Bridge.MeshBakeBridge.ExclusionsChanged += EasyBake.SkipEligibility.Clear;
+
             SkipBakedPieceObjects = Config.Bind("Batching", "SkipBakedPieceObjects", true,
                 "Multiplayer clients only. Pieces a bake already draws are not created as game objects:\n" +
                 "a stand-in collider takes each one's place, so they cost nothing per frame. Only\n" +
@@ -294,6 +310,38 @@ namespace FiresEasyBakeMeshes
                 "is ~4x faster than rebuilding from source pieces. Disable to always rebake\n" +
                 "(useful when debugging or after admin-removing pieces, which the cache\n" +
                 "can't detect and would leave as ghost geometry).");
+
+            CreationCensusEnabled = Config.Bind("Diagnostics", "CreationCensusEnabled", false,
+                "Counts what ZNetScene actually creates: objects per CreateObjects call against\n" +
+                "the budget handed out, and a breakdown by prefab. Diagnostic only — it changes\n" +
+                "no behaviour, but it hooks every CreateObject and keeps a dictionary, so leave\n" +
+                "it OFF unless you are chasing creation cost. It is what found that ~59,000 of\n" +
+                "61,194 CreateObject calls per 30s were creating nothing at all.");
+
+            DeferCreationWhileBaking = Config.Bind("Optimize", "DeferCreationWhileBaking", false,
+                "OFF, and measured. Holds a skippable piece back while its zone is still\n" +
+                "baking, so it is never built just to be destroyed when the bake lands.\n" +
+                "Sound in principle; on a dense world it made everything worse:\n" +
+                "  fps 51.7 -> 20.1, ZNetScene 4,632 -> 7,286 ms/30s,\n" +
+                "  CreateObject 24,494 -> 39,620 calls, unloaded-after-creation 5,282 -> 10,916.\n" +
+                "A held ZDO is never marked Created, so vanilla retries it every pass and the\n" +
+                "hold costs a full re-check each time; meanwhile the bake almost never lands\n" +
+                "inside the window (0 zones released vs thousands expired), so the piece is\n" +
+                "built anyway, only later. The real fix is making the bake land BEFORE the\n" +
+                "zone is populated, not stalling vanilla until it does.");
+
+            CreateBudgetPerFrame = Config.Bind("Optimize", "CreateBudgetPerFrame", 40,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Ceiling on how many objects ZNetScene may instantiate in ONE frame.\n" +
+                    "Vanilla's budget is Max(backlog/100, 10), so the more objects are waiting\n" +
+                    "the bigger each frame's burst gets. On a dense world that inverts: with\n" +
+                    "~24,000 objects queued the budget becomes 240 in a single frame, and at\n" +
+                    "0.18ms each that is ~44ms of instantiation in one frame — measured as a\n" +
+                    "122ms stall about once a second. This caps the burst WITHOUT lowering\n" +
+                    "vanilla's own floor, so an area takes a few more frames to fill but fills\n" +
+                    "smoothly. It does not reduce total work, only how lumpy it is.\n" +
+                    "0 = off (pure vanilla). Lower = smoother but slower to populate.",
+                    new BepInEx.Configuration.AcceptableValueRange<int>(0, 500)));
 
             CreateDestroySkipEnabled = Config.Bind("Optimize", "CreateDestroySkipEnabled", true,
                 "Skip ZNetScene.CreateDestroyObjects when the player hasn't crossed a sector\n" +

@@ -1,10 +1,28 @@
 using System;
 using System.Collections.Generic;
+using FiresCore.Pieces;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace FiresEasyBakeMeshes.EasyBake
 {
+    // A prefab as one wear look shows it: the unit instanced groups, instance definitions and stand-in colliders share.
+    internal readonly struct InstanceKey : IEquatable<InstanceKey>
+    {
+        public readonly int PrefabHash;
+        public readonly WearLook Look;
+
+        public InstanceKey(int prefabHash, WearLook look)
+        {
+            PrefabHash = prefabHash;
+            Look = look;
+        }
+
+        public bool Equals(InstanceKey other) => PrefabHash == other.PrefabHash && Look == other.Look;
+        public override bool Equals(object obj) => obj is InstanceKey other && Equals(other);
+        public override int GetHashCode() => unchecked(PrefabHash * 397 ^ Look.GetHashCode());
+    }
+
     // One drawable piece of a prefab: a mesh, one of its submeshes with the material for it,
     // and where that sits relative to the first part, so a whole prefab can be redrawn from
     // the instance matrices the group already holds.
@@ -43,7 +61,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static readonly HashSet<string> s_farOffsetLogged = new HashSet<string>();
 
-        public static bool TryBuild(GameObject prefab, out InstanceDefinition definition, out string rejectReason)
+        public static bool TryBuild(GameObject prefab, WearLook look, out InstanceDefinition definition, out string rejectReason)
         {
             definition = null;
             rejectReason = null;
@@ -56,15 +74,13 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             HashSet<Renderer> lod0Set, lodControlled;
             IndexLodMembership(prefab, out lod0Set, out lodControlled);
-            var damageStateRenderers = CollectDamageStateRenderers(prefab);
 
             var visible = new List<MeshRenderer>();
             for (int i = 0; i < allRenderers.Length; i++)
             {
                 var renderer = allRenderers[i];
                 if (renderer == null || !renderer.enabled) continue;
-                if (damageStateRenderers != null && damageStateRenderers.Contains(renderer)) continue;
-                if (!IsActiveWithinPrefab(renderer.transform, prefab.transform)) continue;
+                if (!WearLooks.IsShown(prefab, look, renderer.transform)) continue;
                 bool isLodControlled = lodControlled != null && lodControlled.Contains(renderer);
                 if (isLodControlled && (lod0Set == null || !lod0Set.Contains(renderer))) continue;
 
@@ -108,7 +124,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     parts.Add(new InstancePart
                     {
                         NearMesh = nearMesh,
-                        FarMesh = ResolveFarMesh(prefab, renderer, nearMesh, material, damageStateRenderers, m),
+                        FarMesh = ResolveFarMesh(prefab, look, renderer, nearMesh, material, m),
                         SubMesh = m,
                         FromFirst = i == 0 ? Matrix4x4.identity : firstInverse * offset,
                         RenderParams = new RenderParams(material)
@@ -169,51 +185,11 @@ namespace FiresEasyBakeMeshes.EasyBake
             return merged;
         }
 
-        // WearNTear carries three damage-state visuals and toggles them with SetActive at runtime,
-        // so on the PREFAB every state's renderers are present at once. A piece only draws as an
-        // instance while it is healthy, so the worn and broken subtrees are excluded outright -
-        // counting them would make every building piece look like it shows renderers it never does.
-        private static HashSet<Renderer> CollectDamageStateRenderers(GameObject prefab)
-        {
-            var wear = prefab.GetComponent<WearNTear>();
-            if (wear == null) return null;
-
-            HashSet<Renderer> excluded = null;
-            AddSubtreeRenderers(wear.m_worn, wear.m_new, ref excluded);
-            AddSubtreeRenderers(wear.m_broken, wear.m_new, ref excluded);
-            return excluded;
-        }
-
-        private static void AddSubtreeRenderers(GameObject state, GameObject healthyState, ref HashSet<Renderer> into)
-        {
-            if (state == null || state == healthyState) return;
-            var renderers = state.GetComponentsInChildren<Renderer>(true);
-            for (int i = 0; i < renderers.Length; i++)
-            {
-                if (renderers[i] == null) continue;
-                if (into == null) into = new HashSet<Renderer>();
-                into.Add(renderers[i]);
-            }
-        }
-
-        // activeInHierarchy is always false on a prefab asset, so activeSelf is walked up to
-        // the prefab root instead to find what would actually be visible once placed.
-        private static bool IsActiveWithinPrefab(Transform node, Transform root)
-        {
-            while (node != null)
-            {
-                if (!node.gameObject.activeSelf) return false;
-                if (node == root) return true;
-                node = node.parent;
-            }
-            return true;
-        }
-
         // Instances draw the far mesh with LOD0's offset, so LOD1 only stands in when it is the single renderer in the
         // LOD1 slot of the group that switches this LOD0 renderer, carries this part's material on the same submesh and
         // sits exactly where LOD0 does. Anything else keeps the near mesh, so distance never moves or drops part of a piece.
-        private static Mesh ResolveFarMesh(GameObject prefab, MeshRenderer nearRenderer, Mesh nearMesh, Material material,
-            HashSet<Renderer> damageStateRenderers, int subMesh)
+        private static Mesh ResolveFarMesh(GameObject prefab, WearLook look, MeshRenderer nearRenderer, Mesh nearMesh, Material material,
+            int subMesh)
         {
             var lodGroups = prefab.GetComponentsInChildren<LODGroup>(true);
             for (int g = 0; g < lodGroups.Length; g++)
@@ -231,8 +207,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (farRenderer == null) return nearMesh;
                 }
                 if (farRenderer == null || farRenderer == nearRenderer || !farRenderer.enabled) return nearMesh;
-                if (damageStateRenderers != null && damageStateRenderers.Contains(farRenderer)) return nearMesh;
-                if (!IsActiveWithinPrefab(farRenderer.transform, prefab.transform)) return nearMesh;
+                if (!WearLooks.IsShown(prefab, look, farRenderer.transform)) return nearMesh;
                 if (!Draws(farRenderer.sharedMaterials, material, subMesh)) return nearMesh;
                 var farFilter = farRenderer.GetComponent<MeshFilter>();
                 if (farFilter == null || farFilter.sharedMesh == null) return nearMesh;
@@ -302,31 +277,31 @@ namespace FiresEasyBakeMeshes.EasyBake
     }
 
     // Definitions are derived from prefab assets, so they are world-independent and
-    // built once per prefab. A null entry is a cached rejection, which keeps repeat
+    // built once per prefab and look. A null entry is a cached rejection, which keeps repeat
     // lookups for non-instanceable prefabs off the component-walk path.
     internal static class InstanceDefinitionCache
     {
-        private static readonly Dictionary<int, InstanceDefinition> _byPrefabHash
-            = new Dictionary<int, InstanceDefinition>();
+        private static readonly Dictionary<InstanceKey, InstanceDefinition> _byKey
+            = new Dictionary<InstanceKey, InstanceDefinition>();
         private static readonly Dictionary<string, int> _rejectionsByReason
             = new Dictionary<string, int>();
 
         public static void Clear()
         {
-            _byPrefabHash.Clear();
+            _byKey.Clear();
             _rejectionsByReason.Clear();
         }
 
-        public static bool TryGet(int prefabHash, out InstanceDefinition definition)
+        public static bool TryGet(InstanceKey key, out InstanceDefinition definition)
         {
-            if (_byPrefabHash.TryGetValue(prefabHash, out definition)) return definition != null;
+            if (_byKey.TryGetValue(key, out definition)) return definition != null;
 
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? scene.GetPrefab(key.PrefabHash) : null;
             InstanceDefinition built;
             string rejectReason;
-            InstanceDefinition.TryBuild(prefab, out built, out rejectReason);
-            _byPrefabHash[prefabHash] = built;
+            InstanceDefinition.TryBuild(prefab, key.Look, out built, out rejectReason);
+            _byKey[key] = built;
             definition = built;
 
             if (built == null && rejectReason != null)
@@ -336,8 +311,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 _rejectionsByReason[rejectReason] = seen + 1;
                 if (FiresEasyBakeMeshesPlugin.BatchingVerbose.Value)
                 {
-                    string prefabName = prefab != null ? prefab.name : prefabHash.ToString();
-                    EasyBakeLog.Info($"[Instancing] '{prefabName}' not instanceable: {rejectReason}.");
+                    string prefabName = prefab != null ? prefab.name : key.PrefabHash.ToString();
+                    EasyBakeLog.Info($"[Instancing] '{prefabName}' ({key.Look}) not instanceable: {rejectReason}.");
                 }
             }
             return definition != null;

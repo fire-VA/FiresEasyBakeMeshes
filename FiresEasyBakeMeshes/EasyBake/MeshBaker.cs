@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using FiresCore.Pieces;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -198,12 +199,15 @@ namespace FiresEasyBakeMeshes.EasyBake
             public Vector3 Position;
             public Quaternion Rotation;
             public Vector3 Scale;
+            // The wear look the bake drew the piece with; a skipped piece has to still show it.
+            public WearLook Look;
 
-            public static PieceTransform From(Transform transform) => new PieceTransform
+            public static PieceTransform From(Transform transform, WearLook look) => new PieceTransform
             {
                 Position = transform.position,
                 Rotation = transform.rotation,
                 Scale = transform.localScale,
+                Look = look,
             };
         }
 
@@ -233,6 +237,8 @@ namespace FiresEasyBakeMeshes.EasyBake
         private class PieceLodInfo
         {
             public WearNTear Source;
+            public WearLook Look;
+            public int NearCandidates;
             public List<BatchKey> ContributedBatchKeys = new List<BatchKey>();
             public List<MeshContribution> NearContributions = new List<MeshContribution>();
             public List<MeshContribution> FarContributions = new List<MeshContribution>();
@@ -242,6 +248,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             public bool FarGeometryUnusable;
             public bool FullyCovered;
             public bool AnyContribution => ContributedBatchKeys.Count > 0;
+            // Its look shows no model at all, like an invisible piece: nothing to draw, so only its stand-in colliders
+            // take its place.
+            public bool DrawsNothing => NearCandidates == 0 && !HadIneligibleEnabled;
         }
 
         public static BakeResult Bake(Vector2s coord, HashSet<WearNTear> pieces)
@@ -259,7 +268,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (instancedPieces.Contains(wnt)) continue;
                 // A damageable piece can only leave an instanced group; merged geometry would need a rebake per hit.
                 if (!InvulnerableClassifier.IsInvulnerable(wnt)) continue;
-                var info = new PieceLodInfo { Source = wnt, TintOnlyPropertyBlocks = wnt.GetComponentInChildren<RandomMaterialValues>(true) != null };
+                if (CarriesEditsTheBakeCannotDraw(wnt)) continue;
+                var info = new PieceLodInfo
+                {
+                    Source = wnt,
+                    Look = LookOf(wnt),
+                    TintOnlyPropertyBlocks = wnt.GetComponentInChildren<RandomMaterialValues>(true) != null,
+                };
                 CollectContributions(wnt.gameObject, info,
                     ref candidates, ref skippedNonLod0, ref skippedPropertyBlock, ref skippedNonReadable);
                 pieceInfos.Add(info);
@@ -367,12 +382,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int p = 0; p < pieceInfos.Count; p++)
             {
                 var info = pieceInfos[p];
-                if (!info.FullyCovered || !info.AnyContribution) continue;
                 if (info.Source == null) continue;
+                bool drawn = info.FullyCovered && info.AnyContribution;
+                if (!drawn && !info.DrawsNothing) continue;
 
                 var identity = PieceIdentity.From(info.Source.gameObject, info.Source.transform.position);
                 result.ContributorIdentities.Add(identity);
-                result.PieceTransforms[identity] = PieceTransform.From(info.Source.transform);
+                result.PieceTransforms[identity] = PieceTransform.From(info.Source.transform, info.Look);
+                if (!drawn) continue;
 
                 var suppression = EasyBakeSuppressedVisuals.SuppressPiece(info.Source.gameObject);
                 if (suppression != null) result.SuppressedPieces.Add(suppression);
@@ -387,7 +404,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 result.ContributorIdentities.Add(instancedIdentity);
                 // Only invulnerable pieces get a stand-in transform, which is what skipping and stand-ins key on.
                 if (InvulnerableClassifier.IsInvulnerable(piece))
-                    result.PieceTransforms[instancedIdentity] = PieceTransform.From(piece.transform);
+                    result.PieceTransforms[instancedIdentity] = PieceTransform.From(piece.transform, LookOf(piece));
                 var instancedSuppression = EasyBakeSuppressedVisuals.SuppressPiece(piece.gameObject);
                 if (instancedSuppression != null) result.SuppressedPieces.Add(instancedSuppression);
             }
@@ -531,6 +548,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (inNearTier && mr.enabled)
                 {
                     candidates++;
+                    info.NearCandidates++;
                     // An enabled renderer we can't bake means this piece can never be
                     // fully covered — its geometry lands in no batch. Flag it so the
                     // coverage gate leaves the whole piece vanilla instead of hiding a
@@ -693,47 +711,45 @@ namespace FiresEasyBakeMeshes.EasyBake
             return refusal;
         }
 
-        // Partitions the zone's pieces: any prefab that is instanceable, and appears at least MinInstancesPerPrefab times
-        // or cannot be combined at all, becomes a GPU-instanced group, and those pieces are held back so the combine path
-        // skips them. Prefabs below the threshold fall through to combining, where they still batch by material with
+        // Partitions the zone's pieces: every prefab and wear look that is instanceable, and appears at least
+        // MinInstancesPerPrefab times or cannot be combined at all, becomes a GPU-instanced group, and those pieces are held
+        // back so the combine path skips them. The rest fall through to combining, where they still batch by material with
         // everything else.
         private static HashSet<WearNTear> BuildInstanceGroups(HashSet<WearNTear> pieces, List<ZoneInstanceGroup> into)
         {
             var instanced = new HashSet<WearNTear>();
             if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return instanced;
 
-            var candidatesByPrefab = new Dictionary<int, List<WearNTear>>();
+            var candidatesByKey = new Dictionary<InstanceKey, List<WearNTear>>();
             foreach (var wnt in pieces)
             {
                 if (wnt == null || wnt.gameObject == null) continue;
-                var view = wnt.GetComponent<ZNetView>();
-                var zdo = view != null ? view.GetZDO() : null;
+                var zdo = ZdoOf(wnt);
                 if (zdo == null) continue;
                 if (!InvulnerableClassifier.IsInvulnerable(wnt)
                     && (!FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value || !ShowsHealthyState(wnt))) continue;
+                if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) continue;
 
-                int prefabHash = zdo.GetPrefab();
-                InstanceDefinition definition;
-                if (!InstanceDefinitionCache.TryGet(prefabHash, out definition)) continue;
+                var key = new InstanceKey(zdo.GetPrefab(), LookOf(zdo));
+                if (!InstanceDefinitionCache.TryGet(key, out _)) continue;
 
-                List<WearNTear> list;
-                if (!candidatesByPrefab.TryGetValue(prefabHash, out list))
+                if (!candidatesByKey.TryGetValue(key, out var list))
                 {
                     list = new List<WearNTear>();
-                    candidatesByPrefab.Add(prefabHash, list);
+                    candidatesByKey.Add(key, list);
                 }
                 list.Add(wnt);
             }
 
             int minInstances = FiresEasyBakeMeshesPlugin.BatchingMinInstancesPerPrefab.Value;
-            foreach (var entry in candidatesByPrefab)
+            foreach (var entry in candidatesByKey)
             {
-                if (entry.Value.Count < minInstances && !OnlyInstancingCanDraw(entry.Key, entry.Value)) continue;
+                if (entry.Value.Count < minInstances && !OnlyInstancingCanDraw(entry.Key.PrefabHash, entry.Value)) continue;
 
                 InstanceDefinition definition;
                 if (!InstanceDefinitionCache.TryGet(entry.Key, out definition)) continue;
 
-                var group = new ZoneInstanceGroup { PrefabHash = entry.Key, Definition = definition };
+                var group = new ZoneInstanceGroup { PrefabHash = entry.Key.PrefabHash, Look = entry.Key.Look, Definition = definition };
                 for (int i = 0; i < entry.Value.Count; i++)
                 {
                     var piece = entry.Value[i];
@@ -747,11 +763,36 @@ namespace FiresEasyBakeMeshes.EasyBake
             return instanced;
         }
 
-        // Mirrors WearNTear.SetHealthVisual: above 75% health a piece shows its healthy look, which is all an instance draws.
+        // Mirrors WearNTear.SetHealthVisual: above 75% health a piece shows its healthy look, the only one a damageable
+        // piece is drawn with, since its next hit would change it.
         internal static bool ShowsHealthyState(WearNTear wnt)
         {
-            if (wnt.GetHealthPercentage() <= 0.75f) return false;
+            if (wnt.GetHealthPercentage() <= WearLooks.NewModelAbove) return false;
             return wnt.m_new == null || wnt.m_new.activeInHierarchy;
+        }
+
+        internal static ZDO ZdoOf(WearNTear wnt)
+        {
+            var view = wnt.GetComponent<ZNetView>();
+            return view != null ? view.GetZDO() : null;
+        }
+
+        internal static WearLook LookOf(ZDO zdo)
+        {
+            var scene = ZNetScene.instance;
+            return WearLooks.Resolve(scene != null ? scene.GetPrefab(zdo.GetPrefab()) : null, zdo);
+        }
+
+        internal static WearLook LookOf(WearNTear wnt)
+        {
+            var zdo = ZdoOf(wnt);
+            return zdo != null ? LookOf(zdo) : default(WearLook);
+        }
+
+        internal static bool CarriesEditsTheBakeCannotDraw(WearNTear wnt)
+        {
+            var zdo = ZdoOf(wnt);
+            return zdo != null && PieceData.MustStayLive(zdo, zdo.GetPrefab());
         }
 
         private static void GroupContributions(List<MeshContribution> contributions,

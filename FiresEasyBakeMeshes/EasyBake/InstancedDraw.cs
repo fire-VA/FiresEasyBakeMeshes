@@ -17,6 +17,20 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly double MsPerTick = 1000.0 / Stopwatch.Frequency;
         private static readonly Plane[] s_planes = new Plane[6];
 
+        // What ZoneTracker.Update spends its frame on, so the tracking figure can be read rather than guessed at.
+        internal enum Phase
+        {
+            Zones,
+            StandIns,
+            Unloading,
+            Checks,
+            Baking,
+            BuildHold,
+        }
+
+        private static readonly string[] PhaseNames = { "walking zones", "stand-ins", "unloading", "checks", "baking", "holding for build tools" };
+        private static readonly double[] s_phaseMs = new double[PhaseNames.Length];
+
         private static bool s_culling;
         private static Vector3 s_shadowSweep;
         private static long s_drawStart;
@@ -35,9 +49,15 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_drawMs = s_worstDrawMs = s_trackMs = s_frameMs = 0.0;
             s_nextReport = 0f;
             s_trackTicks = 0L;
+            for (int i = 0; i < s_phaseMs.Length; i++) s_phaseMs[i] = 0.0;
         }
 
         internal static void NoteZoneTracking(long ticks) => s_trackTicks = ticks;
+
+        internal static long Mark() => Stopwatch.GetTimestamp();
+
+        internal static void NotePhase(Phase phase, long start)
+            => s_phaseMs[(int)phase] += (Stopwatch.GetTimestamp() - start) * MsPerTick;
 
         internal static void BeginFrame()
         {
@@ -114,12 +134,23 @@ namespace FiresEasyBakeMeshes.EasyBake
                 : "skipping what is out of view is off";
             EasyBakeLog.Info(
                 $"[Draw] Over {s_frames} frames of {s_frameMs / frames:F1} ms: drawing instances took " +
-                $"{s_drawMs / frames:F2} ms a frame (worst {s_worstDrawMs:F2} ms) and tracking zones {s_trackMs / frames:F2} ms; " +
-                $"{s_groupsDrawn / frames:F0} of {s_groups / frames:F0} groups drawn a frame in " +
+                $"{s_drawMs / frames:F2} ms a frame (worst {s_worstDrawMs:F2} ms) and tracking zones {s_trackMs / frames:F2} ms " +
+                $"({Phases(frames)}); {s_groupsDrawn / frames:F0} of {s_groups / frames:F0} groups drawn a frame in " +
                 $"{s_zoneVisits / frames:F0} zones, {s_instancesDrawn / frames:F0} of {s_instances / frames:F0} pieces, {tail}.");
 
             Reset();
             s_nextReport = now + ReportSeconds;
+        }
+
+        private static string Phases(double frames)
+        {
+            var parts = new System.Text.StringBuilder();
+            for (int i = 0; i < s_phaseMs.Length; i++)
+            {
+                if (parts.Length > 0) parts.Append(", ");
+                parts.Append(PhaseNames[i]).Append(' ').Append((s_phaseMs[i] / frames).ToString("F2"));
+            }
+            return parts.ToString();
         }
     }
 }

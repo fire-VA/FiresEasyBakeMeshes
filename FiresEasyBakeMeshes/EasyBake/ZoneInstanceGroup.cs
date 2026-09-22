@@ -13,6 +13,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private const int MaxInstancesPerDraw = 1023;
 
         public int PrefabHash;
+        public FiresCore.Pieces.WearLook Look;
         public InstanceDefinition Definition;
         // In the first part's space: the piece transform with that part's offset folded in.
         // Later parts are this list carried through their own offset from the first.

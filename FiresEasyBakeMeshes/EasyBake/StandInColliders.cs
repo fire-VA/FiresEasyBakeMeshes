@@ -1,11 +1,13 @@
 using System.Collections.Generic;
+using FiresCore.Pieces;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
 {
-    // Rebuilds a piece's solid colliders from its prefab at the piece's cached transform, without creating the piece.
-    // Players, creatures, projectiles and support checks hit the same shapes on the same layers as the real piece; a
-    // support check that finds no WearNTear on them treats them as solid ground.
+    // Rebuilds a piece's solid colliders from its prefab at the piece's cached transform and look, without creating the
+    // piece. Players, creatures, projectiles and support checks hit the same shapes on the same layers as the real piece;
+    // a support check that finds no WearNTear on them treats them as solid ground. A piece whose look hides every model
+    // keeps only the colliders outside them, the invisible wall its builder made.
     internal static class StandInColliders
     {
         private sealed class Template
@@ -16,15 +18,15 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         private static readonly Template[] NoTemplates = new Template[0];
-        private static readonly Dictionary<int, Template[]> _byPrefab = new Dictionary<int, Template[]>();
+        private static readonly Dictionary<InstanceKey, Template[]> _byKey = new Dictionary<InstanceKey, Template[]>();
 
-        public static void Clear() => _byPrefab.Clear();
+        public static void Clear() => _byKey.Clear();
 
         // Returns the object holding this piece's stand-in colliders, or null when the piece has none to stand in.
         public static GameObject Build(Transform root, MeshBaker.PieceIdentity identity, MeshBaker.PieceTransform piece, out int colliders)
         {
             colliders = 0;
-            var templates = GetTemplates(identity.PrefabHash);
+            var templates = GetTemplates(new InstanceKey(identity.PrefabHash, piece.Look));
             if (templates.Length == 0) return null;
 
             var pieceMatrix = Matrix4x4.TRS(piece.Position, piece.Rotation, piece.Scale);
@@ -54,21 +56,19 @@ namespace FiresEasyBakeMeshes.EasyBake
             return go;
         }
 
-        private static Template[] GetTemplates(int prefabHash)
+        private static Template[] GetTemplates(InstanceKey key)
         {
-            if (_byPrefab.TryGetValue(prefabHash, out var cached)) return cached;
+            if (_byKey.TryGetValue(key, out var cached)) return cached;
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? scene.GetPrefab(key.PrefabHash) : null;
             if (prefab == null) return NoTemplates;
 
-            var wear = prefab.GetComponent<WearNTear>();
             var root = prefab.transform;
             var list = new List<Template>();
             foreach (var collider in prefab.GetComponentsInChildren<Collider>(true))
             {
                 if (collider == null || !collider.enabled || collider.isTrigger) continue;
-                if (!ActiveWithinPrefab(collider.transform, root)) continue;
-                if (wear != null && (InState(collider.transform, wear.m_worn, wear.m_new) || InState(collider.transform, wear.m_broken, wear.m_new))) continue;
+                if (!WearLooks.IsShown(prefab, key.Look, collider.transform)) continue;
                 list.Add(new Template
                 {
                     Source = collider,
@@ -78,7 +78,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
 
             var templates = list.ToArray();
-            _byPrefab[prefabHash] = templates;
+            _byKey[key] = templates;
             return templates;
         }
 
@@ -114,25 +114,6 @@ namespace FiresEasyBakeMeshes.EasyBake
                     meshCopy.sharedMaterial = mesh.sharedMaterial;
                     break;
             }
-        }
-
-        // activeInHierarchy is always false on a prefab asset, so activeSelf is walked up to the root instead.
-        private static bool ActiveWithinPrefab(Transform node, Transform root)
-        {
-            while (node != null)
-            {
-                if (!node.gameObject.activeSelf) return false;
-                if (node == root) return true;
-                node = node.parent;
-            }
-            return true;
-        }
-
-        // Colliders under a damage-state subtree belong to a look an invulnerable piece never shows.
-        private static bool InState(Transform node, GameObject state, GameObject healthyState)
-        {
-            if (state == null || state == healthyState) return false;
-            return node == state.transform || node.IsChildOf(state.transform);
         }
     }
 }

@@ -49,14 +49,16 @@ anything that gives comfort. Pieces that can be damaged stay in the world too - 
 but rain wear, support and raids run on them exactly as before, and a piece goes back to drawing itself the
 moment it is hit, burns or is highlighted by a hammer.
 
-Per-piece edits are respected as well. A piece with an edited name, hover text or model is always created, so
-the edit still shows; edited numbers like health or wear are left to the bake, since a piece that is not
-there cannot wear or fall, and the value is applied again whenever it is created.
+Per-piece edits are respected as well. Edits that only change how a piece looks are baked exactly as they
+show: infinite health, the new, worn or broken look, and invisible pieces, which bake as nothing but keep their
+collider, just as players without the mod see them. Any other edit to a piece's data (hover text, sounds,
+effects, a swapped model, anything a map maker changed with data edits or Structure Tweaks) keeps that piece a
+real object, so hand-edited maps behave exactly as they were built.
 
 ## Requirements
 
 - BepInEx
-- FiresUnifiedCore
+- FiresUnifiedCore 0.2.29 or newer
 - Client side. Skipping piece objects only happens when you are a client on a server; on a host or a
   single-player world the pieces are always created, because that machine is the one simulating them.
 

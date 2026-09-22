@@ -53,16 +53,17 @@ namespace FiresEasyBakeMeshes.Patches
     //   - Other mods that depend on UpdateWear / UpdateCover side-effects on
     //     invulnerable pieces would break. Gated on a config so users can
     //     opt out if such a conflict appears.
-    // A piece drawn as an instance only matches its healthy look. Worn or broken (the same 75% line SetHealthVisual uses),
-    // burning in the Ashlands, or highlighted by a hammer, it goes back to drawing itself.
+    // A piece drawn as an instance matches the look it was baked with. When its health changes that look, and when it
+    // burns in the Ashlands or a hammer highlights it, it goes back to drawing itself. Awake's call passes no effects and is
+    // left to ZoneTracker.OnInstanceCreated.
     [HarmonyPatch(typeof(WearNTear), "SetHealthVisual")]
     public static class WearNTear_SetHealthVisual_Patch
     {
         [HarmonyPostfix]
-        public static void Postfix(WearNTear __instance, float health)
+        public static void Postfix(WearNTear __instance, bool triggerEffects)
         {
-            if (health > 0.75f || !FiresEasyBakeMeshesPlugin.BatchingActive()) return;
-            EasyBake.ZoneTracker.HandBackPiece(__instance);
+            if (!triggerEffects || !FiresEasyBakeMeshesPlugin.BatchingActive()) return;
+            EasyBake.ZoneTracker.OnLookMayHaveChanged(__instance);
         }
     }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Text;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -9,11 +10,10 @@ namespace FiresEasyBakeMeshes.EasyBake
     //
     // Vanilla applies per-piece field overrides in ZNetView.Awake: LoadFields reads "HasFields", then for every
     // MonoBehaviour ON THE OBJECT whose "HasFields<Type>" flag is set it writes each "<Type>.<field>" value it finds
-    // onto that component. Most of those edits survive skipping untouched - a piece that was never created cannot fall,
-    // wear or take damage, and the ZDO keeps the values for whenever it is created. What does NOT survive is an edit a
-    // player can see or touch on the piece itself: a renamed piece, its hover text, a swapped model or effect. Those
-    // keep their piece live; the rest are left to the bake, because tools write edit markers across a whole build and
-    // treating every one of them as a reason to keep 70,000 objects alive is what skipping exists to avoid.
+    // onto that component. The bake reproduces exactly one kind of edit - the fields that decide a piece's look, which is
+    // how Infinity Hammer's infinite health, its worn and damaged looks and the invisible-piece trick are made. Any other
+    // field edit is somebody's deliberate work on that piece, so the piece stays real and out of the bake entirely. The
+    // same goes for the keys Structure Tweaks reads to hide a piece, drop its collision or add behaviour to it.
     internal static class PieceData
     {
         private const int SamplesPerPrefab = 20;
@@ -23,18 +23,27 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly int CustomFieldsKey = ZNetView.CustomFieldsStr.GetStableHashCode();
         private static readonly int RandomMaterialSeedKey = "RandMatSeed".GetStableHashCode();
 
-        // Numbers and flags on a piece that is not there change nothing, but these turn it into a different piece.
-        private static readonly HashSet<string> AlwaysLiveFields = new HashSet<string>(StringComparer.Ordinal)
+        private static readonly HashSet<string> LookFields = new HashSet<string>(StringComparer.Ordinal)
         {
-            "Piece.m_comfort", "Piece.m_comfortGroup", "Piece.m_groundPiece", "Piece.m_groundOnly",
-            "ZNetView.m_syncInitialScale",
+            nameof(WearNTear) + "." + nameof(WearNTear.m_health),
+            nameof(WearNTear) + "." + nameof(WearNTear.m_new),
+            nameof(WearNTear) + "." + nameof(WearNTear.m_worn),
+            nameof(WearNTear) + "." + nameof(WearNTear.m_broken),
         };
+
+        private static readonly string[] StructureTweaksKeyNames =
+        {
+            "override_render", "override_collision", "override_interact", "override_wear", "override_fall", "override_destroy",
+            "override_component", "override_status", "override_weather", "override_water", "override_event", "override_effect",
+        };
+
+        private static readonly Dictionary<int, string> StructureTweaksKeys = HashNames(StructureTweaksKeyNames);
 
         private sealed class EditTarget
         {
             public int MarkerKey;
             public readonly Dictionary<int, string> LiveFields = new Dictionary<int, string>();
-            public readonly Dictionary<int, string> BakeableFields = new Dictionary<int, string>();
+            public readonly Dictionary<int, string> LookFields = new Dictionary<int, string>();
         }
 
         private struct Verdict
@@ -54,7 +63,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Dictionary<Type, EditTarget> s_targetsByType = new Dictionary<Type, EditTarget>();
         private static readonly HashSet<int> s_keysOnPiece = new HashSet<int>();
         private static readonly Dictionary<string, int> s_liveEdits = new Dictionary<string, int>(StringComparer.Ordinal);
-        private static readonly Dictionary<string, int> s_bakedEdits = new Dictionary<string, int>(StringComparer.Ordinal);
+        private static readonly Dictionary<string, int> s_lookEdits = new Dictionary<string, int>(StringComparer.Ordinal);
         private static readonly Dictionary<ZDOID, Verdict> s_verdicts = new Dictionary<ZDOID, Verdict>();
 
         private static HashSet<int> s_vanillaKeys;
@@ -63,41 +72,63 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_sampledPieces;
         private static int s_piecesWithUnknownKeys;
 
-        // True only when an edit lands on this prefab and changes what the piece shows or offers, which no stand-in can.
-        // The markers are read first because a tool writes them for components most prefabs do not have, and the watcher asks
-        // this about every skipped piece every second; only a marker that matches a real component costs a read of the data,
-        // and that answer is kept until the piece changes.
+        // True when the piece carries an edit the bake does not reproduce. The answer is kept until the piece's data
+        // changes, because the watcher asks about every skipped piece every second.
         public static bool MustStayLive(ZDO zdo, int prefabHash)
-        {
-            if (!zdo.GetBool(CustomFieldsKey)) return false;
-
-            var targets = EditTargets(prefabHash);
-            for (int i = 0; i < targets.Length; i++)
-            {
-                if (!zdo.GetBool(targets[i].MarkerKey)) continue;
-                return EditedFieldsMatter(zdo, targets);
-            }
-            return false;
-        }
-
-        private static bool EditedFieldsMatter(ZDO zdo, EditTarget[] targets)
         {
             if (s_verdicts.TryGetValue(zdo.m_uid, out var known) && known.Revision == zdo.DataRevision) return known.StayLive;
 
-            ReadKeys(zdo);
             bool stayLive = false;
-            for (int i = 0; i < targets.Length; i++)
+            if (zdo.GetBool(CustomFieldsKey) || CarriesStructureTweak(zdo))
             {
-                var target = targets[i];
-                if (!zdo.GetBool(target.MarkerKey)) continue;
-                foreach (int key in s_keysOnPiece)
+                ReadKeys(zdo);
+                stayLive = CountEdits(zdo, EditTargets(prefabHash));
+            }
+            s_verdicts[zdo.m_uid] = new Verdict { Revision = zdo.DataRevision, StayLive = stayLive };
+            return stayLive;
+        }
+
+        // The edits that keep a piece real, for ebm_census.
+        public static string DescribeLiveEdits(ZDO zdo, int prefabHash)
+        {
+            ReadKeys(zdo);
+            var targets = EditTargets(prefabHash);
+            var named = new List<string>();
+            foreach (int key in s_keysOnPiece)
+            {
+                if (StructureTweaksKeys.TryGetValue(key, out string tweak)) named.Add(tweak);
+                for (int i = 0; i < targets.Length; i++)
+                    if (zdo.GetBool(targets[i].MarkerKey) && targets[i].LiveFields.TryGetValue(key, out string field)) named.Add(field);
+            }
+            return named.Count > 0 ? string.Join(", ", named.ToArray()) : "none found now";
+        }
+
+        private static bool CarriesStructureTweak(ZDO zdo)
+        {
+            foreach (int key in StructureTweaksKeys.Keys)
+                if (zdo.GetInt(key, out _) || zdo.GetFloat(key, out _) || zdo.GetString(key, out _)) return true;
+            return false;
+        }
+
+        private static bool CountEdits(ZDO zdo, EditTarget[] targets)
+        {
+            bool stayLive = false;
+            foreach (int key in s_keysOnPiece)
+            {
+                if (StructureTweaksKeys.TryGetValue(key, out string tweak))
                 {
+                    Count(s_liveEdits, tweak);
+                    stayLive = true;
+                    continue;
+                }
+                for (int i = 0; i < targets.Length; i++)
+                {
+                    var target = targets[i];
+                    if (!zdo.GetBool(target.MarkerKey)) continue;
                     if (target.LiveFields.TryGetValue(key, out string live)) { Count(s_liveEdits, live); stayLive = true; }
-                    else if (target.BakeableFields.TryGetValue(key, out string baked)) Count(s_bakedEdits, baked);
+                    else if (target.LookFields.TryGetValue(key, out string look)) Count(s_lookEdits, look);
                 }
             }
-
-            s_verdicts[zdo.m_uid] = new Verdict { Revision = zdo.DataRevision, StayLive = stayLive };
             return stayLive;
         }
 
@@ -106,7 +137,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_sampledPerPrefab.Clear();
             s_unknownKeys.Clear();
             s_liveEdits.Clear();
-            s_bakedEdits.Clear();
+            s_lookEdits.Clear();
             s_verdicts.Clear();
             s_sampledPieces = 0;
             s_piecesWithUnknownKeys = 0;
@@ -138,11 +169,11 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         public static string Report()
         {
-            if (s_liveEdits.Count == 0 && s_bakedEdits.Count == 0 && s_piecesWithUnknownKeys == 0) return null;
+            if (s_liveEdits.Count == 0 && s_lookEdits.Count == 0 && s_piecesWithUnknownKeys == 0) return null;
 
-            var line = new System.Text.StringBuilder("[Data] ");
-            if (s_liveEdits.Count > 0) line.Append($"kept live by field edits: {Top(s_liveEdits)}. ");
-            if (s_bakedEdits.Count > 0) line.Append($"field edits the bake keeps as they are: {Top(s_bakedEdits)}. ");
+            var line = new StringBuilder("[Data] ");
+            if (s_liveEdits.Count > 0) line.Append($"kept out of the bake by edits it does not reproduce: {Top(s_liveEdits)}. ");
+            if (s_lookEdits.Count > 0) line.Append($"look edits the bake draws: {Top(s_lookEdits)}. ");
             if (s_piecesWithUnknownKeys > 0)
             {
                 line.Append($"{s_piecesWithUnknownKeys} of {s_sampledPieces} sampled skipped pieces carry data the bake does not know:");
@@ -158,7 +189,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < targets.Length; i++)
             {
                 var target = targets[i];
-                if (key == target.MarkerKey || target.LiveFields.ContainsKey(key) || target.BakeableFields.ContainsKey(key)) return true;
+                if (key == target.MarkerKey || target.LiveFields.ContainsKey(key) || target.LookFields.ContainsKey(key)) return true;
             }
             return false;
         }
@@ -215,8 +246,6 @@ namespace FiresEasyBakeMeshes.EasyBake
             return targets;
         }
 
-        // Text and prefab references are what a player reads or sees on the piece; numbers and flags are state the piece
-        // would have applied to itself, and the ZDO still holds them for whenever it is created for real.
         private static EditTarget TargetFor(Type type)
         {
             if (s_targetsByType.TryGetValue(type, out var target)) return target;
@@ -225,15 +254,19 @@ namespace FiresEasyBakeMeshes.EasyBake
             foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public))
             {
                 string name = type.Name + "." + field.Name;
-                bool showsOnThePiece = field.FieldType == typeof(string)
-                    || field.FieldType == typeof(GameObject)
-                    || AlwaysLiveFields.Contains(name);
-                if (showsOnThePiece) target.LiveFields[name.GetStableHashCode()] = name;
-                else target.BakeableFields[name.GetStableHashCode()] = name;
+                if (LookFields.Contains(name)) target.LookFields[name.GetStableHashCode()] = name;
+                else target.LiveFields[name.GetStableHashCode()] = name;
             }
 
             s_targetsByType[type] = target;
             return target;
+        }
+
+        private static Dictionary<int, string> HashNames(string[] names)
+        {
+            var byHash = new Dictionary<int, string>(names.Length);
+            for (int i = 0; i < names.Length; i++) byHash[names[i].GetStableHashCode()] = names[i];
+            return byHash;
         }
 
         private static string Top(Dictionary<string, int> tally)

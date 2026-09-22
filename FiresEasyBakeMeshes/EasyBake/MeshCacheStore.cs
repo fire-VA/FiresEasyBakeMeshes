@@ -66,8 +66,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         //   6 — damageable pieces join instanced groups; a v5 zone would keep drawing them itself until it rebaked.
         //   7 — each identity carries a rotation key, so copies stacked on one spot turned for looks stay distinct.
         //   8 — tinted grausten merges into combined batches, and item and armor stands are never baked.
+        //  12 — each piece transform and instanced group carries the wear look it was drawn with, so worn, broken and
+        //       hidden pieces bake and skip with their own look.
         private const uint MAGIC = 0x434D4245;
-        private const int VERSION = 11;
+        private const int VERSION = 12;
 
         private static string _cacheRoot;
         private static readonly Dictionary<string, Material> _materialsByName = new Dictionary<string, Material>();
@@ -101,6 +103,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal class CachedInstanceGroupData
         {
             public int PrefabHash;
+            public byte Look;
             public Matrix4x4[] Matrices;
             // Quantised piece positions, parallel to Matrices, so a restored group can
             // still drop an individual piece without rebaking the zone.
@@ -441,17 +444,18 @@ namespace FiresEasyBakeMeshes.EasyBake
                 for (int i = 0; i < data.InstanceGroups.Count; i++)
                 {
                     var cachedGroup = data.InstanceGroups[i];
+                    var key = new InstanceKey(cachedGroup.PrefabHash, new FiresCore.Pieces.WearLook(cachedGroup.Look));
                     InstanceDefinition definition;
-                    if (!InstanceDefinitionCache.TryGet(cachedGroup.PrefabHash, out definition))
+                    if (!InstanceDefinitionCache.TryGet(key, out definition))
                     {
                         EasyBakeLog.Warn(
-                            $"[Cache] Zone ({data.Coord.x},{data.Coord.y}): instanced prefab {cachedGroup.PrefabHash} " +
+                            $"[Cache] Zone ({data.Coord.x},{data.Coord.y}): instanced prefab {cachedGroup.PrefabHash} ({key.Look}) " +
                             "no longer resolves — discarding cache so the zone rebakes.");
                         UnityEngine.Object.Destroy(parent);
                         return null;
                     }
 
-                    var group = new ZoneInstanceGroup { PrefabHash = cachedGroup.PrefabHash, Definition = definition };
+                    var group = new ZoneInstanceGroup { PrefabHash = cachedGroup.PrefabHash, Look = key.Look, Definition = definition };
                     for (int m = 0; m < cachedGroup.Matrices.Length; m++)
                     {
                         group.AddCached(cachedGroup.Matrices[m], new MeshBaker.PieceIdentity
@@ -605,6 +609,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 list.Add(new CachedInstanceGroupData
                 {
                     PrefabHash = group.PrefabHash,
+                    Look = group.Look.Bits,
                     Matrices = group.Matrices.ToArray(),
                     PositionsX = positionsX,
                     PositionsY = positionsY,
@@ -702,6 +707,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     bw.Write(t.Position.x); bw.Write(t.Position.y); bw.Write(t.Position.z);
                     bw.Write(t.Rotation.x); bw.Write(t.Rotation.y); bw.Write(t.Rotation.z); bw.Write(t.Rotation.w);
                     bw.Write(t.Scale.x); bw.Write(t.Scale.y); bw.Write(t.Scale.z);
+                    bw.Write(t.Look.Bits);
                 }
             }
 
@@ -720,6 +726,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 var group = bake.InstanceGroups[i];
                 bw.Write(group.PrefabHash);
+                bw.Write(group.Look.Bits);
                 bw.Write(group.Matrices.Count);
                 for (int m = 0; m < group.Matrices.Count; m++)
                 {
@@ -854,6 +861,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     Position = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                     Rotation = new Quaternion(br.ReadSingle(), br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
                     Scale = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()),
+                    Look = new FiresCore.Pieces.WearLook(br.ReadByte()),
                 };
             }
 
@@ -878,6 +886,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < instanceGroupCount; i++)
             {
                 int prefabHash = br.ReadInt32();
+                byte look = br.ReadByte();
                 int matrixCount = br.ReadInt32();
                 var matrices = new Matrix4x4[matrixCount];
                 var positionsX = new int[matrixCount];
@@ -897,6 +906,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 instanceGroups.Add(new CachedInstanceGroupData
                 {
                     PrefabHash = prefabHash,
+                    Look = look,
                     Matrices = matrices,
                     PositionsX = positionsX,
                     PositionsY = positionsY,

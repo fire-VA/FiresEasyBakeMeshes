@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text;
+using FiresCore.Pieces;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -15,6 +16,11 @@ namespace FiresEasyBakeMeshes.EasyBake
             public float LastChangeUnscaledTime;
             public float ConstructedUnscaledTime;
             public bool Baked;
+            // True when this zone's bake came from the on-disk cache rather than
+            // being built here. It is the difference between a revisit and a
+            // first visit, and it is the only thing that decides whether the
+            // stand-ins could possibly have been ready before vanilla populated.
+            public bool FromCache;
             public bool Dirty;
             // True iff the player is currently within range of this zone (it's
             // loaded in ZoneSystem). When the player walks away, ZoneActive flips
@@ -31,7 +37,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             // Pieces this client never created, or unloaded again, because the bake already draws them and a stand-in
             // collider takes their place. Handing one back to vanilla is just Created = false.
-            public readonly Dictionary<ZDO, MeshBaker.PieceIdentity> Skipped = new Dictionary<ZDO, MeshBaker.PieceIdentity>();
+            public readonly Dictionary<ZDO, SkippedPiece> Skipped = new Dictionary<ZDO, SkippedPiece>();
+            public float NextWatch;
             public GameObject StandInRoot;
             public readonly Dictionary<MeshBaker.PieceIdentity, GameObject> StandIns = new Dictionary<MeshBaker.PieceIdentity, GameObject>();
             public readonly Queue<MeshBaker.PieceIdentity> StandInQueue = new Queue<MeshBaker.PieceIdentity>();
@@ -40,6 +47,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             // them. Skipped pieces handed back wait in AwaitingRecreate so the stand-ins stay until the real ones exist.
             public bool HoldReal;
             public float HoldRealUntil;
+            // The hold covers the whole zone (a rebake or teardown reads its real pieces). A build tool's hold only keeps
+            // the pieces within reach real, so the rest of the zone can go on skipping while the tool is out.
+            public bool HoldWholeZone;
             public List<ZDO> AwaitingRecreate;
             // Set when only part of the zone was handed back (a build tool nearby): exactly these stand-ins go when the
             // real pieces are back, instead of every stand-in in the zone.
@@ -51,10 +61,29 @@ namespace FiresEasyBakeMeshes.EasyBake
             public int PresentPieces => Pieces.Count + Skipped.Count;
         }
 
+        // A skipped piece is compared with its bake again only once its ZDO has taken new data since it last matched. A
+        // ZDO returned to the pool loses its uid, so a destroyed or reused one never passes as unchanged.
+        private struct SkippedPiece
+        {
+            public MeshBaker.PieceIdentity Identity;
+            public ZDOID Uid;
+            public uint MatchedRevision;
+
+            public SkippedPiece(ZDO zdo, MeshBaker.PieceIdentity identity)
+            {
+                Identity = identity;
+                Uid = zdo.m_uid;
+                MatchedRevision = zdo.DataRevision;
+            }
+
+            public bool Unchanged(ZDO zdo) => zdo != null && zdo.m_uid == Uid && zdo.DataRevision == MatchedRevision;
+        }
+
         private static readonly Dictionary<Vector2s, ZoneState> _zones = new Dictionary<Vector2s, ZoneState>();
         private static readonly List<Vector2s> _dropScratch = new List<Vector2s>();
 
         private const float BuildHoldSeconds = 30f;
+        private const float BuildHoldRescanMeters = 2f;
         private const float RecreateTimeoutSeconds = 20f;
         private const float EmptyZoneGraceSeconds = 10f;
         private const float CacheValidationQuietSeconds = 10f;
@@ -62,17 +91,27 @@ namespace FiresEasyBakeMeshes.EasyBake
         private const double LoadingStandInBudgetMs = 12.0;
         private const double ConvertBudgetMs = 2.0;
         private const float SkipReportSeconds = 30f;
+        private const float WatchSeconds = 1f;
+        private const double WatchBudgetMs = 1.0;
         // An unloaded zone keeps its stand-ins switched off while the player stays within this many zones of the loaded
         // area, so walking back in reuses them instead of rebuilding every collider.
         private const int ParkedStandInExtraZones = 8;
 
         private static bool s_buildingNearby;
+        private static bool s_buildHoldScanned;
+        private static Vector3 s_buildHoldCenter;
+        private static float s_buildHoldRadius;
+        private static Vector2s s_buildHoldMinZone;
+        private static Vector2s s_buildHoldMaxZone;
         private static float s_nextRangeCheck;
-        private static float s_nextWatch;
         private static float s_nextSkipReport;
         private static int s_skippedAtCreation;
         private static int s_convertedLive;
+        private static int s_deferredForBake;
+        private static int s_zonesFromCache, s_zonesBakedFresh;
+        private static int s_convertedOnCached, s_convertedOnFresh;
         private static int s_standInColliders;
+        private static long s_standInTicks;
         private static int s_standInsOnDemand;
         private static int s_standInZonesReused;
         private static int s_handedBackForBuilding;
@@ -148,10 +187,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var identity = MeshBaker.PieceIdentity.From(go, wnt.transform.position);
                 if (state.Bake.ContributorIdentities.Contains(identity))
                 {
-                    // Damaged since the bake: the piece draws its own worn look instead of the healthy instance.
-                    if (!invulnerable && !MeshBaker.ShowsHealthyState(wnt))
+                    if (!StillMatchesBake(state, wnt, identity))
                     {
-                        HandBack(state, wnt, identity);
+                        HandBackChanged(state, wnt, identity, invulnerable);
                         return;
                     }
                     MeshBaker.DisableForCacheHit(go, state.Bake);
@@ -176,12 +214,14 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return;
             if (!invulnerable && !MeshBaker.ShowsHealthyState(wnt)) return;
-            var group = GroupFor(state, identity.PrefabHash) ?? OpenInstanceGroup(state, wnt, identity.PrefabHash, invulnerable);
+            if (MeshBaker.CarriesEditsTheBakeCannotDraw(wnt)) return;
+            var look = MeshBaker.LookOf(wnt);
+            var group = GroupFor(state, identity.PrefabHash, look) ?? OpenInstanceGroup(state, wnt, identity.PrefabHash, look, invulnerable);
             if (group == null) return;
 
             group.AddLate(wnt.transform.localToWorldMatrix, identity);
             state.Bake.ContributorIdentities.Add(identity);
-            if (invulnerable) state.Bake.PieceTransforms[identity] = MeshBaker.PieceTransform.From(wnt.transform);
+            if (invulnerable) state.Bake.PieceTransforms[identity] = MeshBaker.PieceTransform.From(wnt.transform, look);
             MeshBaker.DisableForCacheHit(wnt.gameObject, state.Bake);
             if (invulnerable && SkipCreationActive()) state.ConvertQueue.Enqueue(wnt);
             state.CacheStale = true;
@@ -190,24 +230,58 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // A prefab the combiner cannot take has no other way into a bake, so the first of its pieces to arrive after the zone
         // baked opens the group the zone never built for it.
-        private static ZoneInstanceGroup OpenInstanceGroup(ZoneState state, WearNTear wnt, int prefabHash, bool invulnerable)
+        private static ZoneInstanceGroup OpenInstanceGroup(ZoneState state, WearNTear wnt, int prefabHash, WearLook look, bool invulnerable)
         {
             if (!invulnerable || state.Bake?.InstanceGroups == null) return null;
             if (MeshBaker.WhyCombinerRefuses(prefabHash, wnt.gameObject) == null) return null;
-            if (!InstanceDefinitionCache.TryGet(prefabHash, out var definition)) return null;
+            if (!InstanceDefinitionCache.TryGet(new InstanceKey(prefabHash, look), out var definition)) return null;
 
-            var group = new ZoneInstanceGroup { PrefabHash = prefabHash, Definition = definition };
+            var group = new ZoneInstanceGroup { PrefabHash = prefabHash, Look = look, Definition = definition };
             state.Bake.InstanceGroups.Add(group);
             return group;
         }
 
-        private static ZoneInstanceGroup GroupFor(ZoneState state, int prefabHash)
+        private static ZoneInstanceGroup GroupFor(ZoneState state, int prefabHash, WearLook look)
         {
             var groups = state.Bake?.InstanceGroups;
             if (groups == null) return null;
             for (int i = 0; i < groups.Count; i++)
-                if (groups[i].PrefabHash == prefabHash) return groups[i];
+                if (groups[i].PrefabHash == prefabHash && groups[i].Look == look) return groups[i];
             return null;
+        }
+
+        // The bake drew this piece with the look it had then and without edits it cannot reproduce; a piece that has
+        // changed either since has to draw itself.
+        private static bool StillMatchesBake(ZoneState state, WearNTear wnt, MeshBaker.PieceIdentity identity)
+        {
+            if (MeshBaker.CarriesEditsTheBakeCannotDraw(wnt)) return false;
+            return MeshBaker.LookOf(wnt) == BakedLook(state, identity);
+        }
+
+        // Invulnerable pieces record their look; a damageable one only ever joins a group while it shows its healthy look.
+        private static WearLook BakedLook(ZoneState state, MeshBaker.PieceIdentity identity)
+        {
+            if (state.Bake.PieceTransforms.TryGetValue(identity, out var baked)) return baked.Look;
+            return HealthyLookOf(identity.PrefabHash);
+        }
+
+        private static WearLook HealthyLookOf(int prefabHash)
+        {
+            var scene = ZNetScene.instance;
+            return WearLooks.Healthy(scene != null ? scene.GetPrefab(prefabHash) : null);
+        }
+
+        // An instanced piece leaves its group, and joins the one for its new look if the zone has one; merged geometry
+        // cannot drop a single piece, so its zone rebakes.
+        private static void HandBackChanged(ZoneState state, WearNTear wnt, MeshBaker.PieceIdentity identity, bool invulnerable)
+        {
+            if (HandBack(state, wnt, identity))
+            {
+                TryJoinInstanceGroup(state, wnt, identity, invulnerable);
+                return;
+            }
+            state.Dirty = true;
+            state.LastChangeUnscaledTime = Time.unscaledTime;
         }
 
         private static void ConstructCached(ZoneState state, MeshCacheStore.CachedZoneData cachedData)
@@ -218,6 +292,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (state.Bake == null) return;
 
             state.Baked = true;
+            state.FromCache = true;
+            s_zonesFromCache++;
             state.NeedsCacheValidation = true;
             // Only pin via keepalive if the cached bake actually
             // contains combined mesh batches. Empty bakes (no
@@ -247,12 +323,24 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (state.Bake.ContributorIdentities.Contains(identity)) HandBack(state, wnt, identity);
         }
 
-        private static void HandBack(ZoneState state, WearNTear wnt, MeshBaker.PieceIdentity identity)
+        // Health changed on a piece that already exists. SetHealthVisual's first call, from WearNTear.Awake, is left to
+        // OnInstanceCreated, which compares the look against the bake once the piece is registered.
+        internal static void OnLookMayHaveChanged(WearNTear wnt)
+        {
+            if (wnt == null || _zones.Count == 0) return;
+            Vector3 position = wnt.transform.position;
+            if (!_zones.TryGetValue(ZoneSystem.GetZone(position), out var state) || !state.Baked || state.Bake?.ContributorIdentities == null) return;
+            var identity = MeshBaker.PieceIdentity.From(wnt.gameObject, position);
+            if (!state.Bake.ContributorIdentities.Contains(identity) || StillMatchesBake(state, wnt, identity)) return;
+            if (HandBack(state, wnt, identity)) TryJoinInstanceGroup(state, wnt, identity, InvulnerableClassifier.IsInvulnerable(wnt));
+        }
+
+        private static bool HandBack(ZoneState state, WearNTear wnt, MeshBaker.PieceIdentity identity)
         {
             var groups = state.Bake.InstanceGroups;
             bool removed = false;
             for (int i = 0; i < groups.Count && !removed; i++) removed = groups[i].TryRemove(identity);
-            if (!removed) return;
+            if (!removed) return false;
 
             state.Bake.ContributorIdentities.Remove(identity);
             state.Bake.PieceTransforms?.Remove(identity);
@@ -266,6 +354,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             state.CacheStale = true;
             s_handedBackLooks++;
+            return true;
         }
 
         public static void OnPieceDestroyed(WearNTear wnt)
@@ -410,7 +499,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             bool skipping = SkipCreationActive();
             var localPlayer = Player.m_localPlayer;
             s_buildingNearby = skipping && localPlayer != null && localPlayer.InPlaceMode();
-            if (s_buildingNearby) HoldZonesAround(localPlayer.transform.position, now);
+            long holdStart = InstancedDraw.Mark();
+            if (s_buildingNearby) HoldForBuildTools(localPlayer.transform.position, now);
+            else s_buildHoldScanned = false;
+            InstancedDraw.NotePhase(InstancedDraw.Phase.BuildHold, holdStart);
+
+            long walkStart = InstancedDraw.Mark();
 
             // Soft unload / reload pass. Zones that ZoneSystem stops tracking
             // get their combined-mesh parent hidden but kept in memory; their
@@ -455,7 +549,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 if (state.ZoneActive && state.Baked) UpdateFarTier(coord, state);
             }
+            InstancedDraw.NotePhase(InstancedDraw.Phase.Zones, walkStart);
 
+            long checkStart = InstancedDraw.Mark();
             FinishHandBacks(now);
             if (skipping)
             {
@@ -464,15 +560,23 @@ namespace FiresEasyBakeMeshes.EasyBake
                     s_nextRangeCheck = now + 0.25f;
                     ConstructCachedZonesInRange(zoneSystem);
                 }
+                InstancedDraw.NotePhase(InstancedDraw.Phase.Checks, checkStart);
+
+                long standInStart = InstancedDraw.Mark();
                 BuildStandIns();
+                InstancedDraw.NotePhase(InstancedDraw.Phase.StandIns, standInStart);
+
+                long unloadStart = InstancedDraw.Mark();
                 ConvertLivePieces();
-                if (now >= s_nextWatch)
-                {
-                    s_nextWatch = now + 1f;
-                    WatchSkipped();
-                }
+                InstancedDraw.NotePhase(InstancedDraw.Phase.Unloading, unloadStart);
+
+                checkStart = InstancedDraw.Mark();
+                WatchSkipped(now);
                 ReportSkipping(now);
             }
+            InstancedDraw.NotePhase(InstancedDraw.Phase.Checks, checkStart);
+
+            long bakeStart = InstancedDraw.Mark();
 
             // Now the per-frame bake decision. Only active zones with enough
             // settled invulnerable pieces qualify. A zone that's Baked AND not
@@ -542,6 +646,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 state.Bake = MeshBaker.Bake(state.Coord, state.Pieces);
                 Probe.Stop("EasyBake:bake", tBake);
                 state.Baked = true;
+                state.FromCache = false;
+                s_zonesBakedFresh++;
                 state.Dirty = false;
                 // Only pin via keepalive if the fresh bake produced batches.
                 // Zones with sub-threshold materials or all-PropBlock /
@@ -559,6 +665,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 // resurrect ghost geometry next session).
                 SaveZone(state);
             }
+
+            InstancedDraw.NotePhase(InstancedDraw.Phase.Baking, bakeStart);
 
             // Anything that fully collapses (an unloaded zone we never saw return,
             // or a zone where all pieces were genuinely destroyed while loaded) is
@@ -614,9 +722,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             SectorInstanceMirror.Reset();
             StaticPieceZSyncSkip.Reset();
             s_buildingNearby = false;
+            s_buildHoldScanned = false;
             s_skippedAtCreation = 0;
             s_convertedLive = 0;
+            s_deferredForBake = 0;
+            s_zonesFromCache = 0; s_zonesBakedFresh = 0;
+            s_convertedOnCached = 0; s_convertedOnFresh = 0;
             s_standInColliders = 0;
+            s_standInTicks = 0;
             s_standInsOnDemand = 0;
             s_standInZonesReused = 0;
             s_handedBackForBuilding = 0;
@@ -645,14 +758,33 @@ namespace FiresEasyBakeMeshes.EasyBake
         // stand-in collider already exists.
         public static bool TrySkipCreation(ZDO zdo)
         {
-            if (zdo == null || s_buildingNearby || !SkipCreationActive()) return false;
+            if (zdo == null || !SkipCreationActive()) return false;
             int prefabHash = zdo.GetPrefab();
             var info = SkipEligibility.Get(prefabHash);
             if (!info.Skippable) return false;
 
             Vector3 position = zdo.GetPosition();
-            var state = EnsureZoneFromCache(ZoneSystem.GetZone(position));
-            if (state == null || state.HoldReal || !state.Baked || state.Bake == null) return false;
+            if (s_buildingNearby && InBuildHold(position)) return false;
+            var zoneCoord = ZoneSystem.GetZone(position);
+            var state = EnsureZoneFromCache(zoneCoord);
+            if (state == null || !state.Baked || state.Bake == null)
+            {
+                // The bake has not landed yet, so this piece cannot be skipped —
+                // but it is a piece that WOULD be skipped, and creating it now
+                // only means destroying it again when the bake arrives. Hold it
+                // for a moment instead. See DeferCreation for why this is client
+                // only and why it expires.
+                if (DeferCreation.ShouldDefer(zdo, zoneCoord, bakePending: state != null))
+                {
+                    s_deferredForBake++;
+                    return true;
+                }
+                return false;
+            }
+            DeferCreation.OnZoneBaked(zoneCoord);
+            // A handed-back piece skipped again before it exists would have its stand-in dropped when the hand-back ends.
+            if (state.AwaitingRecreate != null) return false;
+            if (state.HoldReal && (state.HoldWholeZone || !s_buildingNearby)) return false;
 
             var identity = MeshBaker.PieceIdentity.From(zdo);
             if (!state.Bake.PieceTransforms.TryGetValue(identity, out var cached)) return false;
@@ -664,7 +796,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             EnsureStandIn(state, identity, cached);
 
             zdo.Created = true;
-            state.Skipped[zdo] = identity;
+            state.Skipped[zdo] = new SkippedPiece(zdo, identity);
             state.LastChangeUnscaledTime = Time.unscaledTime;
             s_skippedAtCreation++;
             return true;
@@ -720,6 +852,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 HoldRealPieces(state, 0f);
                 state.HoldReal = false;
+                state.HoldWholeZone = false;
                 state.StandInQueue.Clear();
                 state.ConvertQueue.Clear();
             }
@@ -787,11 +920,13 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             UnparkStandIns(state);
             if (state.StandIns.ContainsKey(identity)) return;
+            long started = Stopwatch.GetTimestamp();
             if (state.StandInRoot == null)
                 state.StandInRoot = new GameObject($"[EasyBake/Zone_{state.Coord.x}_{state.Coord.y}/standins]");
             state.StandIns[identity] = StandInColliders.Build(state.StandInRoot.transform, identity, transform, out int colliders);
             s_standInColliders += colliders;
             s_standInsOnDemand++;
+            s_standInTicks += Stopwatch.GetTimestamp() - started;
         }
 
         private static void QueueStandIns(ZoneState state)
@@ -811,6 +946,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void AfterFreshBake(ZoneState state, float now)
         {
             if (!SkipCreationActive() || state.Bake == null) return;
+            state.HoldWholeZone = false;
             if (state.HoldRealUntil <= now) state.HoldReal = false;
             DestroyStandIns(state);
             QueueStandIns(state);
@@ -837,20 +973,27 @@ namespace FiresEasyBakeMeshes.EasyBake
             var player = Player.m_localPlayer;
             double budget = player == null || player.IsTeleporting() ? LoadingStandInBudgetMs : StandInBudgetMs;
             var stopwatch = Stopwatch.StartNew();
-            for (int z = 0; z < _zoneScratch.Count; z++)
+            try
             {
-                var state = _zoneScratch[z];
-                if (state.StandInRoot == null)
-                    state.StandInRoot = new GameObject($"[EasyBake/Zone_{state.Coord.x}_{state.Coord.y}/standins]");
-                while (state.StandInQueue.Count > 0)
+                for (int z = 0; z < _zoneScratch.Count; z++)
                 {
-                    if (stopwatch.Elapsed.TotalMilliseconds >= budget) return;
-                    var identity = state.StandInQueue.Dequeue();
-                    if (state.StandIns.ContainsKey(identity)) continue;
-                    if (!state.Bake.PieceTransforms.TryGetValue(identity, out var transform)) continue;
-                    state.StandIns[identity] = StandInColliders.Build(state.StandInRoot.transform, identity, transform, out int colliders);
-                    s_standInColliders += colliders;
+                    var state = _zoneScratch[z];
+                    if (state.StandInRoot == null)
+                        state.StandInRoot = new GameObject($"[EasyBake/Zone_{state.Coord.x}_{state.Coord.y}/standins]");
+                    while (state.StandInQueue.Count > 0)
+                    {
+                        if (stopwatch.Elapsed.TotalMilliseconds >= budget) return;
+                        var identity = state.StandInQueue.Dequeue();
+                        if (state.StandIns.ContainsKey(identity)) continue;
+                        if (!state.Bake.PieceTransforms.TryGetValue(identity, out var transform)) continue;
+                        state.StandIns[identity] = StandInColliders.Build(state.StandInRoot.transform, identity, transform, out int colliders);
+                        s_standInColliders += colliders;
+                    }
                 }
+            }
+            finally
+            {
+                s_standInTicks += stopwatch.ElapsedTicks;
             }
         }
 
@@ -899,8 +1042,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                     view.ResetZDO();
                     Object.Destroy(wnt.gameObject);
                     zdo.Created = true;
-                    state.Skipped[zdo] = identity;
+                    state.Skipped[zdo] = new SkippedPiece(zdo, identity);
                     s_convertedLive++;
+                    if (state.FromCache) s_convertedOnCached++; else s_convertedOnFresh++;
                 }
             }
         }
@@ -916,40 +1060,65 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // A skipped piece that moved, turned, lost its invulnerability or changed scale no longer matches the bake. An
         // instanced one just leaves its group and is created again; merged geometry needs the zone's real pieces back
-        // for a rebake.
-        private static void WatchSkipped()
+        // for a rebake. Each zone is looked at about once a second, spread over frames within a small budget.
+        private static void WatchSkipped(float now)
         {
             var zdoMan = ZDOMan.instance;
             if (zdoMan == null) return;
+            _watchScratch.Clear();
             foreach (var state in _zones.Values)
+                if (state.Skipped.Count > 0 && state.Bake?.PieceTransforms != null && now >= state.NextWatch)
+                    _watchScratch.Add(state);
+            if (_watchScratch.Count == 0) return;
+            _watchScratch.Sort(CompareByNextWatch);
+
+            var stopwatch = Stopwatch.StartNew();
+            for (int z = 0; z < _watchScratch.Count; z++)
             {
-                if (state.Skipped.Count == 0 || state.Bake?.PieceTransforms == null) continue;
-                _changedScratch.Clear();
-                foreach (var entry in state.Skipped)
-                {
-                    var zdo = entry.Key;
-                    if (zdo != null && zdoMan.GetZDO(zdo.m_uid) == zdo
-                        && MeshBaker.PieceIdentity.From(zdo).Equals(entry.Value)
-                        && state.Bake.PieceTransforms.TryGetValue(entry.Value, out var cached)
-                        && SkipEligibility.ZdoMatches(zdo, SkipEligibility.Get(entry.Value.PrefabHash), cached))
-                        continue;
-                    _changedScratch.Add(entry);
-                }
-                if (_changedScratch.Count == 0) continue;
-
-                bool needsRebake = false;
-                for (int i = 0; i < _changedScratch.Count && !needsRebake; i++)
-                    needsRebake = !ReleaseChangedInstance(state, _changedScratch[i].Key, _changedScratch[i].Value);
-                if (!needsRebake) continue;
-
-                state.Dirty = true;
-                state.LastChangeUnscaledTime = Time.unscaledTime;
-                s_handedBackForChanges += state.Skipped.Count;
-                HoldRealPieces(state, 0f);
+                if (z > 0 && stopwatch.Elapsed.TotalMilliseconds >= WatchBudgetMs) return;
+                var state = _watchScratch[z];
+                state.NextWatch = now + WatchSeconds;
+                WatchZone(state, zdoMan);
             }
         }
 
+        private static void WatchZone(ZoneState state, ZDOMan zdoMan)
+        {
+            _changedScratch.Clear();
+            _rematchedScratch.Clear();
+            foreach (var entry in state.Skipped)
+            {
+                var zdo = entry.Key;
+                var skipped = entry.Value;
+                if (skipped.Unchanged(zdo)) continue;
+                if (zdo != null && zdo.m_uid == skipped.Uid && zdoMan.GetZDO(zdo.m_uid) == zdo
+                    && MeshBaker.PieceIdentity.From(zdo).Equals(skipped.Identity)
+                    && state.Bake.PieceTransforms.TryGetValue(skipped.Identity, out var cached)
+                    && SkipEligibility.ZdoMatches(zdo, SkipEligibility.Get(skipped.Identity.PrefabHash), cached))
+                {
+                    _rematchedScratch.Add(new KeyValuePair<ZDO, SkippedPiece>(zdo, new SkippedPiece(zdo, skipped.Identity)));
+                    continue;
+                }
+                _changedScratch.Add(new KeyValuePair<ZDO, MeshBaker.PieceIdentity>(zdo, skipped.Identity));
+            }
+            for (int i = 0; i < _rematchedScratch.Count; i++) state.Skipped[_rematchedScratch[i].Key] = _rematchedScratch[i].Value;
+            if (_changedScratch.Count == 0) return;
+
+            bool needsRebake = false;
+            for (int i = 0; i < _changedScratch.Count && !needsRebake; i++)
+                needsRebake = !ReleaseChangedInstance(state, _changedScratch[i].Key, _changedScratch[i].Value);
+            if (!needsRebake) return;
+
+            state.Dirty = true;
+            state.LastChangeUnscaledTime = Time.unscaledTime;
+            s_handedBackForChanges += state.Skipped.Count;
+            HoldRealPieces(state, 0f);
+        }
+
+        private static readonly List<ZoneState> _watchScratch = new List<ZoneState>();
         private static readonly List<KeyValuePair<ZDO, MeshBaker.PieceIdentity>> _changedScratch = new List<KeyValuePair<ZDO, MeshBaker.PieceIdentity>>();
+        private static readonly List<KeyValuePair<ZDO, SkippedPiece>> _rematchedScratch = new List<KeyValuePair<ZDO, SkippedPiece>>();
+        private static readonly System.Comparison<ZoneState> CompareByNextWatch = (a, b) => a.NextWatch.CompareTo(b.NextWatch);
 
         private static bool ReleaseChangedInstance(ZoneState state, ZDO zdo, MeshBaker.PieceIdentity identity)
         {
@@ -970,21 +1139,51 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // A build tool only ever snaps to, hits or removes what is close by, so only the pieces within the build radius
         // come back. In a dense base the surrounding zones hold tens of thousands of pieces, and recreating all of them
-        // every time the hammer comes out is the most expensive thing skipping does.
-        private static void HoldZonesAround(Vector3 position, float now)
+        // every time the hammer comes out is the most expensive thing skipping does. A scan hands back everything within
+        // the radius plus BuildHoldRescanMeters of where it ran, and TrySkipCreation skips nothing inside that sphere, so
+        // until the player has moved that far every piece in reach is already real and a frame only keeps the holds up.
+        private static void HoldForBuildTools(Vector3 position, float now)
         {
-            float radius = FiresEasyBakeMeshesPlugin.BatchingBuildRadius.Value;
+            float radius = FiresEasyBakeMeshesPlugin.BatchingBuildRadius.Value + BuildHoldRescanMeters;
+            bool moved = (position - s_buildHoldCenter).sqrMagnitude >= BuildHoldRescanMeters * BuildHoldRescanMeters;
+            if (s_buildHoldScanned && !moved && Mathf.Approximately(radius, s_buildHoldRadius) && KeepBuildHolds(now)) return;
+
+            s_buildHoldScanned = true;
+            s_buildHoldCenter = position;
+            s_buildHoldRadius = radius;
+            var extent = new Vector3(radius, 0f, radius);
+            s_buildHoldMinZone = ZoneSystem.GetZone(position - extent);
+            s_buildHoldMaxZone = ZoneSystem.GetZone(position + extent);
             float radiusSqr = radius * radius;
-            var center = ZoneSystem.GetZone(position);
-            for (int dx = -1; dx <= 1; dx++)
+            for (int x = s_buildHoldMinZone.x; x <= s_buildHoldMaxZone.x; x++)
             {
-                for (int dy = -1; dy <= 1; dy++)
+                for (int y = s_buildHoldMinZone.y; y <= s_buildHoldMaxZone.y; y++)
                 {
-                    if (!_zones.TryGetValue(new Vector2s(center.x + dx, center.y + dy), out var state)) continue;
+                    if (!_zones.TryGetValue(new Vector2s(x, y), out var state)) continue;
                     HoldRealPiecesNear(state, position, radiusSqr, now + BuildHoldSeconds);
                 }
             }
         }
+
+        // False when a zone the last scan covered is not held (built since, or its hold was released), which needs a scan.
+        private static bool KeepBuildHolds(float now)
+        {
+            float holdUntil = now + BuildHoldSeconds;
+            for (int x = s_buildHoldMinZone.x; x <= s_buildHoldMaxZone.x; x++)
+            {
+                for (int y = s_buildHoldMinZone.y; y <= s_buildHoldMaxZone.y; y++)
+                {
+                    if (!_zones.TryGetValue(new Vector2s(x, y), out var state)) continue;
+                    if (!state.HoldReal) return false;
+                    state.HoldRealUntil = Mathf.Max(state.HoldRealUntil, holdUntil);
+                    if (state.Skipped.Count == 0 && state.AwaitingRecreate == null) DestroyStandIns(state);
+                }
+            }
+            return true;
+        }
+
+        private static bool InBuildHold(Vector3 position)
+            => !s_buildHoldScanned || (position - s_buildHoldCenter).sqrMagnitude <= s_buildHoldRadius * s_buildHoldRadius;
 
         private static void HoldRealPiecesNear(ZoneState state, Vector3 position, float radiusSqr, float holdUntil)
         {
@@ -1016,7 +1215,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < _handBackScratch.Count; i++)
             {
                 var zdo = _handBackScratch[i];
-                var identity = state.Skipped[zdo];
+                var identity = state.Skipped[zdo].Identity;
                 zdo.Created = false;
                 state.AwaitingRecreate.Add(zdo);
                 if (!wholeZoneInFlight) state.AwaitingIdentities.Add(identity);
@@ -1029,6 +1228,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void HoldRealPieces(ZoneState state, float holdUntil)
         {
             state.HoldReal = true;
+            state.HoldWholeZone = true;
             state.HoldRealUntil = Mathf.Max(state.HoldRealUntil, holdUntil);
             if (state.Skipped.Count == 0)
             {
@@ -1091,6 +1291,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (state.HoldReal && !state.Dirty && state.AwaitingRecreate == null && now >= state.HoldRealUntil)
                 {
                     state.HoldReal = false;
+                    state.HoldWholeZone = false;
                     if (state.ZoneActive && state.Baked) QueueStandIns(state);
                 }
             }
@@ -1110,6 +1311,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             state.StandInQueue.Clear();
             state.ConvertQueue.Clear();
             state.HoldReal = false;
+            state.HoldWholeZone = false;
             state.HoldRealUntil = 0f;
         }
 
@@ -1142,12 +1344,32 @@ namespace FiresEasyBakeMeshes.EasyBake
                 skippedNow += state.Skipped.Count;
                 zones++;
             }
+            double standInSeconds = (double)s_standInTicks / Stopwatch.Frequency;
+            double microsPerCollider = s_standInColliders > 0 ? standInSeconds * 1000000.0 / s_standInColliders : 0.0;
+            DeferCreation.Report();
+            // THE REVISIT VERDICT. A zone EBM has never seen must instantiate its
+            // pieces before it can bake them — MeshBaker works from live
+            // WearNTear components, not ZDOs — so create-then-destroy on a FIRST
+            // visit is the cost of learning the zone and cannot be scheduled
+            // away. A zone that came back from the cache is the opposite case:
+            // ConstructCachedZonesInRange builds its stand-ins when the terrain
+            // loads, before vanilla reaches the pieces, so its converted count
+            // SHOULD be ~0. If it is not, the pre-construct is losing the race
+            // and that is a real bug rather than a cold cache.
+            EasyBakeLog.Info(
+                $"[Revisit] zones baked this period: {s_zonesFromCache} from cache, {s_zonesBakedFresh} fresh. " +
+                $"Pieces built-then-unloaded: {s_convertedOnCached} on CACHED zones (want ~0 — the bake should have " +
+                $"landed first), {s_convertedOnFresh} on FRESH zones (unavoidable; the baker needs the live pieces). " +
+                (s_convertedOnCached > s_convertedOnFresh / 4 && s_zonesFromCache > 0
+                    ? "CACHED zones are still paying the build-then-destroy cost — the pre-construct is not winning the race."
+                    : "Cached zones are pre-constructing ahead of population as intended."));
             EasyBakeLog.Info(
                 $"[Skip] {skippedNow} baked pieces are not created right now, in {zones} zones. So far: {s_skippedAtCreation} skipped at " +
-                $"creation, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built ({s_standInsOnDemand} " +
+                $"creation, {s_deferredForBake} held for a pending bake, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built in {standInSeconds:F1} s " +
+                $"({microsPerCollider:F0} microseconds each; {s_standInsOnDemand} " +
                 $"built as their pieces arrived, {s_standInZonesReused} zone revisits reused theirs); real pieces " +
                 $"brought back: {s_handedBackForBuilding} for build tools, {s_handedBackForChanges} for removals or changes; " +
-                $"{s_handedBackLooks} instanced pieces went back to drawing themselves after damage, burning or a hammer highlight; " +
+                $"{s_handedBackLooks} instanced pieces went back to drawing themselves after damage, a look change, burning or a hammer highlight; " +
                 $"{s_joinedLate} pieces that arrived after their zone baked joined its instanced groups.");
 
             string data = PieceData.Report();
@@ -1221,7 +1443,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             bool invulnerable = InvulnerableClassifier.IsInvulnerable(wnt);
             if (!invulnerable && !FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value)
                 return "building pieces that can take damage (DamageablePieces is off)";
-            if (HasBakeUnsafeComponent(go)) return "doors, chests, item and armor stands, glass, shields and mine rocks (always left live)";
+            if (HasBakeUnsafeComponent(go)) return "doors, chests, item and armor stands, glass, shields, mine rocks and pieces excluded from baking (always left live)";
 
             Vector3 position = go.transform.position;
             if (!_zones.TryGetValue(ZoneSystem.GetZone(position), out var state) || !state.Baked || state.Bake == null)
@@ -1236,7 +1458,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             var info = SkipEligibility.Get(zdo.GetPrefab());
             if (!info.Skippable) return "baked, but not skippable because the prefab has " + info.Blocker;
-            if (state.HoldReal) return "baked, held real for build tools or a rebake";
+            if (state.HoldReal) return state.HoldWholeZone ? "baked, held real for a rebake" : "baked, held real for build tools";
             if (!state.Bake.PieceTransforms.TryGetValue(identity, out var cached)) return "baked, but no stand-in transform was recorded";
             string mismatch = SkipEligibility.DescribeMismatch(zdo, info, cached, out string detail);
             if (mismatch != null)
@@ -1253,9 +1475,11 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static string WhyDamageableNotDrawn(ZoneState state, ZDO zdo, WearNTear wnt)
         {
-            if (!MeshBaker.ShowsHealthyState(wnt)) return "worn or broken (it draws its own damaged look)";
-            if (!InstanceDefinitionCache.TryGet(zdo.GetPrefab(), out _)) return "its prefab has several renderers or materials, which instancing cannot draw";
-            return GroupFor(state, zdo.GetPrefab()) != null
+            if (!MeshBaker.ShowsHealthyState(wnt)) return "worn or broken (a damageable piece draws its own look, since the next hit changes it)";
+            if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) return "a field edit or Structure Tweaks key on it is not a look the bake draws";
+            var healthy = new InstanceKey(zdo.GetPrefab(), HealthyLookOf(zdo.GetPrefab()));
+            if (!InstanceDefinitionCache.TryGet(healthy, out _)) return "its prefab has several renderers or materials, which instancing cannot draw";
+            return GroupFor(state, healthy.PrefabHash, healthy.Look) != null
                 ? "handed back after a hammer highlight or burning, or damaged and since repaired"
                 : "fewer copies of its prefab in the zone than MinInstancesPerPrefab when it baked";
         }
@@ -1265,12 +1489,15 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static string WhyLeftOutOfBake(ZoneState state, ZDO zdo, GameObject go)
         {
             int prefabHash = zdo.GetPrefab();
-            if (GroupFor(state, prefabHash) != null)
-                return "its prefab has an instanced group here but it is not in it (handed back after a hammer highlight or a change)";
+            if (PieceData.MustStayLive(zdo, prefabHash))
+                return "a field edit or Structure Tweaks key on it is not a look the bake draws (" + PieceData.DescribeLiveEdits(zdo, prefabHash) + ")";
+            var key = new InstanceKey(prefabHash, MeshBaker.LookOf(zdo));
+            if (GroupFor(state, prefabHash, key.Look) != null)
+                return "its prefab has an instanced group for its look here but it is not in it (handed back after a hammer highlight or a change)";
 
             string refusal = MeshBaker.WhyCombinerRefuses(prefabHash, go);
             if (refusal == null) return "too few copies for an instanced group and too few sharing its material for a combined batch";
-            return InstanceDefinitionCache.TryGet(prefabHash, out _)
+            return InstanceDefinitionCache.TryGet(key, out _)
                 ? refusal + ", and its zone has no instanced group for it yet"
                 : refusal + ", and instancing cannot draw it either";
         }
@@ -1319,6 +1546,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             // Item and armor stands show whatever is hung on them, added at runtime; a bake would freeze a stale item.
             if (HasComponentAnywhere<ItemStand>(go))       return true;
             if (HasComponentAnywhere<ArmorStand>(go))      return true;
+            // Excluded: the piece's own mod opted it out through FiresCore's MeshBakeBridge, or the user listed it in
+            // [Batching] ExcludedPrefabs.
+            if (IsExcludedFromBaking(go))                  return true;
             // Category C — transparent geometry. Combining transparent pieces
             // into a static batch breaks per-piece depth sorting: each glass
             // pane must sort against the world individually, but a merged mesh
@@ -1332,6 +1562,35 @@ namespace FiresEasyBakeMeshes.EasyBake
             return false;
         }
 
+        // Never baked, instanced or skipped; these pieces always keep their own renderers.
+        internal static bool IsExcludedFromBaking(GameObject go)
+            => FiresCore.Bridge.MeshBakeBridge.IsExcludedFromBaking(go) || IsExcludedPrefab(go);
+
+        private static HashSet<string> s_excludedPrefabs;
+
+        internal static void ReloadExcludedPrefabs() => s_excludedPrefabs = null;
+
+        private static bool IsExcludedPrefab(GameObject go)
+        {
+            if (s_excludedPrefabs == null)
+            {
+                s_excludedPrefabs = new HashSet<string>(System.StringComparer.Ordinal);
+                foreach (var name in (FiresEasyBakeMeshesPlugin.BatchingExcludedPrefabs?.Value ?? string.Empty).Split(','))
+                {
+                    string trimmed = name.Trim();
+                    if (trimmed.Length > 0) s_excludedPrefabs.Add(trimmed);
+                }
+            }
+            return s_excludedPrefabs.Count > 0 && s_excludedPrefabs.Contains(PrefabName(go));
+        }
+
+        private static string PrefabName(GameObject go)
+        {
+            string name = go.name;
+            int paren = name.IndexOf('(');
+            return paren > 0 ? name.Substring(0, paren).Trim() : name;
+        }
+
         // Per-prefab-name verdict cache — the renderer/material walk runs once
         // per prefab kind, not per piece instance per zone scan.
         private static readonly Dictionary<string, bool> _transparentByName
@@ -1339,9 +1598,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static bool IsTransparentPiece(GameObject go)
         {
-            string key = go.name;
-            int paren = key.IndexOf('(');
-            if (paren > 0) key = key.Substring(0, paren).Trim();
+            string key = PrefabName(go);
             if (_transparentByName.TryGetValue(key, out bool cached)) return cached;
 
             bool result = key.StartsWith("FiresGlass", System.StringComparison.Ordinal);

@@ -78,6 +78,7 @@
     <Compile Include="Utilities\EbmHelpContent.cs" />
     <Compile Include="Utilities\BakeSummary.cs" />
     <Compile Include="EasyBake\InvulnerableClassifier.cs" />
+    <Compile Include="EasyBake\DeferCreation.cs" />
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
     <Compile Include="EasyBake\EasyBakeSuppressedVisuals.cs" />
@@ -101,6 +102,8 @@
     <Compile Include="Patches\ZNetScenePatches.cs" />
     <Compile Include="Patches\WearNTearPatches.cs" />
     <Compile Include="Patches\VanillaTimingRacePatches.cs" />
+    <Compile Include="Patches\CreationCensus.cs" />
+    <Compile Include="Patches\CreateBudgetGovernor.cs" />
     <Compile Include="Patches\CreateDestroyObjectsPatches.cs" />
     <Compile Include="Patches\BakeInvalidationPatches.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />

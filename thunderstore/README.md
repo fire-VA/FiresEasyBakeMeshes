@@ -58,7 +58,7 @@ real object, so hand-edited maps behave exactly as they were built.
 ## Requirements
 
 - BepInEx
-- FiresUnifiedCore 0.2.29 or newer
+- FiresUnifiedCore 0.2.35 or newer
 - Client side. Skipping piece objects only happens when you are a client on a server; on a host or a
   single-player world the pieces are always created, because that machine is the one simulating them.
 

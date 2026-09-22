@@ -47,7 +47,16 @@ namespace FiresEasyBakeMeshes.Patches
     {
         private static int s_peakAsked, s_peakGiven;
         private static long s_frames, s_capped;
-        private static float s_lastReport;
+
+        // EBM's budget part of the status box: null while nothing was held back since the last box.
+        internal static string TakeStatus()
+        {
+            string status = s_capped == 0 ? null
+                : $"create budget held back {s_capped:N0} of {s_frames:N0} pass(es) " +
+                  $"(backlog asked up to {s_peakAsked:N0} in a frame, allowed {s_peakGiven:N0})";
+            s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
+            return status;
+        }
 
         [HarmonyTranspiler]
         public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
@@ -91,16 +100,6 @@ namespace FiresEasyBakeMeshes.Patches
             CreationCensus.LastNominal = nominal;
             if (given < vanilla) s_capped++;
             if (given > s_peakGiven) s_peakGiven = given;
-
-            if (Time.realtimeSinceStartup - s_lastReport > 30f)
-            {
-                s_lastReport = Time.realtimeSinceStartup;
-                if (s_frames > 0)
-                    Log.Info($"[CreateBudget] {s_capped:N0} of {s_frames:N0} pass(es) capped; " +
-                        $"the backlog asked for up to {s_peakAsked:N0} object(s) in one frame, allowed {s_peakGiven:N0}. " +
-                        (cap <= 0 ? "Cap is OFF." : $"Cap {cap}."));
-                s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
-            }
             return given;
         }
     }

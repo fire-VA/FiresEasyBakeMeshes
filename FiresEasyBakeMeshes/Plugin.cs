@@ -7,7 +7,7 @@ using UnityEngine;
 namespace FiresEasyBakeMeshes
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
-    [BepInDependency("com.Fire.FiresUnifiedCore", "0.2.29")]
+    [BepInDependency("com.Fire.FiresUnifiedCore", "0.2.35")]
     // Runs after GameCamera, which moves the camera in its own LateUpdate, so the instanced
     // draw tests the view the frame is about to be rendered from.
     [DefaultExecutionOrder(1000)]
@@ -15,7 +15,8 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.29";
+        public const string PluginVersion = "1.2.30";
+        private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
         public static ConfigEntry<bool> VerboseZoneLogging;
@@ -622,10 +623,22 @@ namespace FiresEasyBakeMeshes
             try { Utilities.EbmHelpContent.Register(); }
             catch (System.Exception ex) { EasyBakeLog.Warn($"Help registration failed: {ex.Message}"); }
 
+            FiresCore.Logging.StatusBanner.Register(StatusSource, DescribeStatus);
+
             // Compact "loaded" banner — oven with heat squiggles. Deferred to
             // world-load time (when ZNetScene is up) so it bookends the load;
             // the BIG "loading" banner already fired at the top of Awake.
             StartCoroutine(EmitCompactBannerWhenZNetReady());
+        }
+
+        // EBM's line in Core's status box: idle CreateDestroyObjects ticks skipped, and create-budget passes held back.
+        private static string DescribeStatus()
+        {
+            int skipped = Patches.ZNetScene_CreateDestroyObjects_Patch.TakeSkippedSinceStatus();
+            string budget = Patches.ZNetScene_CreateObjectsSorted_Budget.TakeStatus();
+            string skips = skipped > 0 ? $"skipped {skipped:N0} idle CreateDestroyObjects ticks" : null;
+            if (skips == null) return budget;
+            return budget == null ? skips : $"{skips}; {budget}";
         }
 
         // Waits for ZNetScene + its prefab table to be live (same readiness

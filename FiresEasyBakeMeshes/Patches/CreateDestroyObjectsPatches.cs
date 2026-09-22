@@ -81,7 +81,15 @@ namespace FiresEasyBakeMeshes.Patches
         private static bool s_instancesFieldChecked;
 
         private static int _skippedSinceReport;
+        private static int _skippedSinceStatus;
         private static float _lastReportTime;
+
+        internal static int TakeSkippedSinceStatus()
+        {
+            int skipped = _skippedSinceStatus;
+            _skippedSinceStatus = 0;
+            return skipped;
+        }
         private static bool s_standDownLogged;
 
         [HarmonyPrefix]
@@ -143,6 +151,7 @@ namespace FiresEasyBakeMeshes.Patches
             if (!stateChanged && !ttlExpired && _lastZoneCount >= 0)
             {
                 _skippedSinceReport++;
+                _skippedSinceStatus++;
                 if (FiresEasyBakeMeshesPlugin.CreateDestroySkipVerbose.Value
                     && (now - _lastReportTime) > 5f)
                 {

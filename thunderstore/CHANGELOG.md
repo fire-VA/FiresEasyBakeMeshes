@@ -1,3 +1,6 @@
+* v1.2.30 - quieter logs
+  - EBM's periodic log lines moved into the shared Fires status box (needs FiresUnifiedCore 0.2.35)
+
 * v1.2.29 - bakes what you actually see, smoother loading
   - worn, damaged and invisible pieces are baked with the look they show, and invisible pieces keep only their collision
   - pieces with map-maker field edits or Structure Tweaks overrides stay real, so adventure maps work as built

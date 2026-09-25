@@ -62,8 +62,8 @@ namespace FiresEasyBakeMeshes
         }
 
         // Compact banner — oven under heat squiggles over a status frame. 31-char
-        // frame body (3 lead + ╔ + 26 ═ + ╗); 🧱 is a surrogate pair that renders
-        // 2 cells, so the status line's padding assumes an emoji-aware console font.
+        // frame body (3 lead + ╔ + 26 ═ + ╗); 🧱 is a surrogate pair, but the console
+        // ADVANCES ONE column for it (no VS16), however wide the font paints the glyph, so this row pads it as one cell.
         private static readonly Banner.Segment[][] s_compactLines =
         {
             new[] { new Banner.Segment("                ) ) )",        ConsoleColor.Yellow) },
@@ -89,7 +89,7 @@ namespace FiresEasyBakeMeshes
             {
                 new Banner.Segment("   ║        ",         ConsoleColor.DarkGray),
                 new Banner.Segment("🧱 OVEN HOT",          ConsoleColor.Yellow),
-                new Banner.Segment("       ║",             ConsoleColor.DarkGray),
+                new Banner.Segment("        ║",             ConsoleColor.DarkGray),
             },
             new[] { new Banner.Segment("   ╚══════════════════════════╝", ConsoleColor.DarkGray) },
             new[] { new Banner.Segment("    FIRES EASY BAKE MESHES",   ConsoleColor.Cyan) },

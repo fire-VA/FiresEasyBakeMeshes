@@ -48,13 +48,113 @@ namespace FiresEasyBakeMeshes.Patches
         private static int s_peakAsked, s_peakGiven;
         private static long s_frames, s_capped;
 
+        // ═══ WHERE THE TIME IN THIS METHOD ACTUALLY GOES ═════════════════════
+        // The comment above concluded "the SORT IS NOT THE PROBLEM" from a run
+        // with ~24,000 candidates, where creation was 4,477 of 4,545 ms. On
+        // 2026-09-24 the same probes read CreateObjectsSorted 81.9 ms/s against
+        // CreateObject(per-instance) 11.5 ms/s - 70 ms/s that is neither
+        // creation nor explained by a candidate list the budget says is only
+        // ~5,600. Rather than rewrite a vanilla hot path on a model that does
+        // not reconcile, split the method and let it say.
+        //
+        // The transpiler above already gives a free boundary: Mathf.Max is
+        // evaluated AFTER the candidate walk and BEFORE the sort, so Budget()
+        // is a timestamp exactly between the two halves. Prefix starts the
+        // clock, Budget() closes the walk, Postfix closes sort+create-loop.
+        private static readonly System.Diagnostics.Stopwatch s_clock = System.Diagnostics.Stopwatch.StartNew();
+        private static AccessTools.FieldRef<ZNetScene, List<ZDO>> s_candidates;
+        private static bool s_candidatesResolved;
+        private static long s_entered, s_midpoint;
+        private static long s_walkTicks, s_tailTicks;
+        private static int s_nearPeak, s_candPeak, s_candLast, s_createdSum;
+
+        [HarmonyPrefix]
+        public static bool Prefix(ZNetScene __instance, List<ZDO> currentNearObjects)
+        {
+            s_entered = s_clock.ElapsedTicks;
+            s_midpoint = 0L;
+            int near = currentNearObjects != null ? currentNearObjects.Count : 0;
+            if (near > s_nearPeak) s_nearPeak = near;
+
+            // Returning false leaves the candidate list EMPTY, so the create loop below simply finds nothing. It
+            // cannot destroy or strand an object; the worst case is a piece appearing one deadline late.
+            if (EasyBake.ScanGate.Create.CanSkip(near, DistantCount(), InstanceCount(__instance), CurrentZone()))
+            {
+                s_entered = 0L;
+                return false;
+            }
+            return true;
+        }
+
+        private static int InstanceCount(ZNetScene scene) => scene != null ? scene.NrOfInstances() : 0;
+
+        // The distant list is the sibling of the near one and changes for the same reasons, so its length is part of
+        // "nothing moved". It lives on ZNetScene as a private temp the same way the near list does.
+        private static int DistantCount()
+        {
+            if (!s_distantResolved)
+            {
+                s_distantResolved = true;
+                try { s_distantList = AccessTools.FieldRefAccess<ZNetScene, List<ZDO>>("m_tempCurrentDistantObjects"); }
+                catch { s_distantList = null; }
+            }
+            var scene = ZNetScene.instance;
+            if (s_distantList == null || scene == null) return 0;
+            try { var list = s_distantList(scene); return list != null ? list.Count : 0; }
+            catch { return 0; }
+        }
+
+        private static Vector2s CurrentZone()
+        {
+            var net = ZNet.instance;
+            return net != null ? ZoneSystem.GetZone(net.GetReferencePosition()) : new Vector2s(0, 0);
+        }
+
+        private static AccessTools.FieldRef<ZNetScene, List<ZDO>> s_distantList;
+        private static bool s_distantResolved;
+
+        [HarmonyPostfix]
+        public static void Postfix(ZNetScene __instance, int created)
+        {
+            // Budget() never ran: the method returned at the IsActiveAreaLoaded gate.
+            if (s_midpoint == 0L) return;
+            s_tailTicks += s_clock.ElapsedTicks - s_midpoint;
+            s_createdSum += created;
+
+            if (!s_candidatesResolved)
+            {
+                s_candidatesResolved = true;
+                try { s_candidates = AccessTools.FieldRefAccess<ZNetScene, List<ZDO>>("m_tempCurrentObjects2"); }
+                catch { s_candidates = null; }
+            }
+            if (s_candidates == null || __instance == null) return;
+            try
+            {
+                var list = s_candidates(__instance);
+                s_candLast = list != null ? list.Count : 0;
+                if (s_candLast > s_candPeak) s_candPeak = s_candLast;
+                EasyBake.ScanGate.Create.NoteScanFound(s_candLast);
+            }
+            catch { }
+        }
+
+        // The exact candidate count, for FDT's overlay. Not backlog/100 - that
+        // integer division loses two digits at the sizes this matters at.
+        public static int LastCandidateCount => s_candLast;
+        public static int LastNearCount => s_nearPeak;
+
         // EBM's budget part of the status box: null while nothing was held back since the last box.
         internal static string TakeStatus()
         {
-            string status = s_capped == 0 ? null
-                : $"create budget held back {s_capped:N0} of {s_frames:N0} pass(es) " +
-                  $"(backlog asked up to {s_peakAsked:N0} in a frame, allowed {s_peakGiven:N0})";
+            if (s_frames == 0) return null;
+            double walkMs = s_walkTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double tailMs = s_tailTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            string status =
+                $"CreateObjectsSorted over {s_frames:N0} pass(es): walk {walkMs:N0} ms of up to {s_nearPeak:N0} near, " +
+                $"sort+create {tailMs:N0} ms of up to {s_candPeak:N0} candidate(s), {s_createdSum:N0} created" +
+                (s_capped == 0 ? "" : $"; budget held back {s_capped:N0} pass(es) (asked up to {s_peakAsked:N0}, allowed {s_peakGiven:N0})");
             s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
+            s_walkTicks = 0; s_tailTicks = 0; s_nearPeak = 0; s_candPeak = 0; s_createdSum = 0;
             return status;
         }
 
@@ -86,6 +186,11 @@ namespace FiresEasyBakeMeshes.Patches
         // Replaces Mathf.Max(backlog/100, maxCreatedPerFrame).
         public static int Budget(int backlogScaled, int nominal)
         {
+            // Mathf.Max sits between the candidate walk and the sort, so this is the split point.
+            long now = s_clock.ElapsedTicks;
+            if (s_entered != 0L) s_walkTicks += now - s_entered;
+            s_midpoint = now;
+
             int vanilla = Mathf.Max(backlogScaled, nominal);
             s_frames++;
             if (backlogScaled > s_peakAsked) s_peakAsked = backlogScaled;

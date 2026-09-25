@@ -16,6 +16,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             // What stops a prefab from being skipped, for ebm_census.
             public string Blocker;
             public GameObject Prefab;
+            // Its WearNTear carries a snow cap, so Deep North weather can change what it shows.
+            public bool CanShowSnow;
             public float DefaultHealth;
             public bool AllImmune;
             public bool SyncsScale;
@@ -93,6 +95,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 Skippable = true,
                 Prefab = prefab,
+                CanShowSnow = wear != null && wear.m_snow != null,
                 DefaultHealth = wear != null ? wear.m_health : 0f,
                 AllImmune = wear == null || InvulnerableClassifier.AllImmune(wear.m_damages),
                 SyncsScale = view.m_syncInitialScale,
@@ -126,6 +129,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (!info.Skippable) return false;
             if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) return false;
+            if (info.CanShowSnow && SnowReaches(zdo)) return false;
             if (!info.AllImmune && !(StoredHealth(zdo, info) < 0f)) return false;
             var look = WearLooks.Resolve(info.Prefab, zdo);
             if (look != cached.Look || info.BlockerFor(look) != null) return false;
@@ -141,6 +145,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 detail = PieceData.DescribeLiveEdits(zdo, zdo.GetPrefab());
                 return "a field edit or Structure Tweaks key on it changes what the piece shows or offers, which only a real piece carries";
+            }
+
+            if (info.CanShowSnow && SnowReaches(zdo))
+            {
+                detail = zdo.GetFloat(ZDOVars.s_snow, 0f) > 0f
+                    ? $"snow buildup {zdo.GetFloat(ZDOVars.s_snow, 0f):F2} on its ZDO"
+                    : "spawned with a location, so Deep North weather will snow it";
+                return "snow can change what it shows, which only a real piece tracks";
             }
 
             float health = StoredHealth(zdo, info);
@@ -186,6 +198,27 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (scale != Vector3.zero) return scale;
             float scalar = zdo.GetFloat(ZDOVars.s_scaleScalarHash, info.PrefabScale.x);
             return info.PrefabScale.x.Equals(scalar) ? info.PrefabScale : new Vector3(scalar, scalar, scalar);
+        }
+
+        // Valheim 1.0 grows snow on unroofed, unshielded pieces in Deep North and lets the player brush it off by
+        // walking past, switching m_snow / m_snowWorn / m_snowBroken on above a 0.25 buildup and driving _SnowLevel
+        // per object through MaterialMan (WearNTear.UpdateSnowVisual, Character's snow-walk sweep). A skipped piece
+        // never runs that update, so it would sit bare while its live neighbours whiten; a piece baked WITH snow on
+        // it would wear that snow forever, since a combined mesh has neither the switchable renderers nor the
+        // per-object property. Either way the snow cap is not static, so snow-capable prefabs stay live where snow
+        // can reach them.
+        //
+        // The two ZDO keys need different treatment. s_snow is only ever written inside WearNTear's DeepNorth branch,
+        // so it scopes itself. s_preSnow does NOT: ZoneSystem sets it on every location-spawned WearNTear in the
+        // world and only Deep North consumes it, so without the biome test this would hold every location piece
+        // everywhere out of the bake. IsDeepnorth is a world-angle and a magnitude, no noise sampling, and static -
+        // it needs no WorldGenerator instance.
+        private static bool SnowReaches(ZDO zdo)
+        {
+            if (zdo.GetFloat(ZDOVars.s_snow, 0f) > 0f) return true;
+            if (!zdo.GetBool(ZDOVars.s_preSnow)) return false;
+            Vector3 position = zdo.GetPosition();
+            return WorldGenerator.IsDeepnorth(position.x, position.z);
         }
 
         // The health WearNTear's damage gate reads: the ZDO's, defaulting to max health, which a field edit can replace.

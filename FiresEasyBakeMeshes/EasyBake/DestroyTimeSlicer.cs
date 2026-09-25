@@ -37,6 +37,12 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly HashSet<ZDO> _inQueue = new HashSet<ZDO>();
         private static readonly Stopwatch _sw = new Stopwatch();
 
+        private static Vector2s CurrentZone()
+        {
+            var net = ZNet.instance;
+            return net != null ? ZoneSystem.GetZone(net.GetReferencePosition()) : new Vector2s(0, 0);
+        }
+
         private static FieldInfo s_instancesField;
         private static bool s_instancesFieldChecked;
 
@@ -53,6 +59,26 @@ namespace FiresEasyBakeMeshes.EasyBake
             var instances = GetInstancesDict(scene);
             if (instances == null) return false;
 
+            // ═══ THE GATE, AND WHY THE EMPTY-QUEUE CONDITION IS NOT OPTIONAL ═══
+            // Steps 1-2 below stamp ~113,000 ZDOs and then walk every live
+            // ZNetView to find the ones without a stamp. Standing still they
+            // find nothing, every pass, forever - the same waste the create
+            // side had, measured at ~45 ms/s here.
+            //
+            // Skipping is far more dangerous on this side: a ZDO with no fresh
+            // earmark is DESTROYED. So the gate carries a second condition that
+            // has nothing to do with change detection - the queue must be EMPTY.
+            // An empty queue means the last scan that ran enqueued nothing; if
+            // nothing has changed since, this scan would enqueue nothing too.
+            // With work pending we always run the real scan, so a skip can never
+            // leave something queued and undrained, and step 3's re-earmark
+            // reprieve is never evaluated against stamps we failed to write.
+            if (_destroyQueue.Count == 0
+                && ScanGate.Destroy.CanSkip(near.Count, distant.Count, instances.Count, CurrentZone()))
+            {
+                return true;
+            }
+
             byte num = (byte)(Time.frameCount & 0xFF);
 
             // Step 1: earmark near + distant. Identical to vanilla.
@@ -63,12 +89,18 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             // Step 2: scan m_instances; enqueue new unearmarked ZDOs.
             // HashSet dedupes against ZDOs already queued in previous ticks.
+            int enqueuedThisTick = 0;
             foreach (var kv in instances)
             {
                 var zdo = kv.Key;
                 if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                {
                     _destroyQueue.Enqueue(zdo);
+                    enqueuedThisTick++;
+                }
             }
+            // What this scan found is exactly what a skip would have missed, so it is the audit's answer.
+            ScanGate.Destroy.NoteScanFound(enqueuedThisTick);
 
             // Step 3: drain queue under a per-frame time budget.
             float budgetMs = FiresEasyBakeMeshesPlugin.DestroyTimeSliceBudgetMs.Value;

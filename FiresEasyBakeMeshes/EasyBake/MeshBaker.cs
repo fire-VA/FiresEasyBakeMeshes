@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using FiresCore.Pieces;
+using Unity.Profiling;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -261,6 +262,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             var result = new BakeResult();
             var instancedPieces = BuildInstanceGroups(pieces, result.InstanceGroups);
 
+            EnsureBakeMarkers();
+            s_collectMarker.Begin();
             var pieceInfos = new List<PieceLodInfo>(pieces.Count);
             foreach (var wnt in pieces)
             {
@@ -273,12 +276,14 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     Source = wnt,
                     Look = LookOf(wnt),
-                    TintOnlyPropertyBlocks = wnt.GetComponentInChildren<RandomMaterialValues>(true) != null,
+                    TintOnlyPropertyBlocks = ScanPieceComponents(wnt.gameObject),
                 };
                 CollectContributions(wnt.gameObject, info,
                     ref candidates, ref skippedNonLod0, ref skippedPropertyBlock, ref skippedNonReadable);
                 pieceInfos.Add(info);
             }
+
+            s_collectMarker.End();
 
             var byBatchKey = new Dictionary<BatchKey, List<MeshContribution>>();
             for (int p = 0; p < pieceInfos.Count; p++)
@@ -365,8 +370,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 GroupContributions(info.FarContributions, farCovered);
             }
 
+            s_combineMarker.Begin();
             totalContributions = BuildTierBatches(coord, parent, materialized, nearCovered, result.Batches, farTier: false);
             BuildTierBatches(coord, parent, materialized, farCovered, result.FarBatches, farTier: true);
+            s_combineMarker.End();
 
             // Unified suppression pass — runs once per Bake instead of per-material.
             // Every FULLY-COVERED piece (each of its parts is now in a batch) hands its
@@ -378,6 +385,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // We also record an identity (prefab hash + cm-quantised world pos) so that
             // when this zone unloads + reloads later, the new piece instances can be
             // matched against the cache and re-suppressed without rebaking.
+            s_suppressMarker.Begin();
             result.ContributorIdentities = new HashSet<PieceIdentity>();
             for (int p = 0; p < pieceInfos.Count; p++)
             {
@@ -408,6 +416,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var instancedSuppression = EasyBakeSuppressedVisuals.SuppressPiece(piece.gameObject);
                 if (instancedSuppression != null) result.SuppressedPieces.Add(instancedSuppression);
             }
+
+            s_suppressMarker.End();
 
             sw.Stop();
             BakeSummary.RecordFreshBake(result.Batches.Count, sw.ElapsedMilliseconds);
@@ -494,12 +504,16 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void CollectContributions(GameObject root, PieceLodInfo info,
             ref int candidates, ref int skippedNonLod0, ref int skippedPropertyBlock, ref int skippedNonReadable)
         {
-            var lodGroups = root.GetComponentsInChildren<LODGroup>(includeInactive: true);
+            // The buffers were filled by ScanPieceComponents for this same piece, one walk earlier.
+            var lodGroups = s_pieceLodGroups;
+            var lod0Set = s_lod0Set;
+            var lodControlled = s_lodControlled;
+            var farSet = s_farSet;
+            lod0Set.Clear();
+            lodControlled.Clear();
+            farSet.Clear();
 
-            HashSet<Renderer> lod0Set = null;
-            HashSet<Renderer> lodControlled = null;
-            HashSet<Renderer> farSet = null;
-            for (int g = 0; g < lodGroups.Length; g++)
+            for (int g = 0; g < lodGroups.Count; g++)
             {
                 var lg = lodGroups[g];
                 if (lg == null) continue;
@@ -514,13 +528,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                     {
                         var r = rs[ri];
                         if (r == null) continue;
-                        if (lodControlled == null) lodControlled = new HashSet<Renderer>();
                         lodControlled.Add(r);
-                        if (li == 0)
-                        {
-                            if (lod0Set == null) lod0Set = new HashSet<Renderer>();
-                            lod0Set.Add(r);
-                        }
+                        if (li == 0) lod0Set.Add(r);
                     }
                 }
 
@@ -530,20 +539,19 @@ namespace FiresEasyBakeMeshes.EasyBake
                 for (int ri = 0; ri < farRenderers.Length; ri++)
                 {
                     if (farRenderers[ri] == null) continue;
-                    if (farSet == null) farSet = new HashSet<Renderer>();
                     farSet.Add(farRenderers[ri]);
                 }
             }
 
-            var renderers = root.GetComponentsInChildren<MeshRenderer>(includeInactive: false);
-            for (int i = 0; i < renderers.Length; i++)
+            var renderers = s_pieceRenderers;
+            for (int i = 0; i < renderers.Count; i++)
             {
                 var mr = renderers[i];
                 if (mr == null) continue;
 
-                bool isLodControlled = lodControlled != null && lodControlled.Contains(mr);
-                bool inNearTier = !isLodControlled || (lod0Set != null && lod0Set.Contains(mr));
-                bool inFarTier = isLodControlled ? farSet != null && farSet.Contains(mr) : mr.enabled;
+                bool isLodControlled = lodControlled.Contains(mr);
+                bool inNearTier = !isLodControlled || lod0Set.Contains(mr);
+                bool inFarTier = isLodControlled ? farSet.Contains(mr) : mr.enabled;
 
                 if (inNearTier && mr.enabled)
                 {
@@ -598,14 +606,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             var mesh = mf.sharedMesh;
             if (!mesh.isReadable) { skippedNonReadable++; return false; }
 
-            var mats = mr.sharedMaterials;
-            int subCount = Mathf.Min(mesh.subMeshCount, mats.Length);
+            mr.GetSharedMaterials(s_bakeMaterials);
+            int subCount = Mathf.Min(mesh.subMeshCount, s_bakeMaterials.Count);
             var localToWorld = mr.transform.localToWorldMatrix;
             bool meshNeeds32 = mesh.indexFormat == UnityEngine.Rendering.IndexFormat.UInt32;
 
             for (int s = 0; s < subCount; s++)
             {
-                var material = mats[s];
+                var material = s_bakeMaterials[s];
                 if (material == null) continue;
                 var batchKey = BatchKey.From(mr, material);
                 if (recordKeysInto != null) recordKeysInto.Add(batchKey);
@@ -660,6 +668,58 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < candidates.Count; i++)
                 if (candidates[i] != null && InvulnerableClassifier.IsInvulnerable(candidates[i])) return true;
             return false;
+        }
+
+        // One walk per piece instead of three. A fresh zone bake analyses every piece in it, and the typed
+        // GetComponentsInChildren overloads return a new array each time, which made the bake the largest allocator in
+        // the 2026-09-22 profile (2.4 GB, 53.8 M allocations). The list overload reuses these buffers, so a bake of
+        // 1,500 pieces allocates nothing to find their renderers.
+        private static readonly List<Component> s_pieceComponents = new List<Component>();
+        private static readonly List<LODGroup> s_pieceLodGroups = new List<LODGroup>();
+        private static readonly List<MeshRenderer> s_pieceRenderers = new List<MeshRenderer>();
+        private static readonly HashSet<Renderer> s_lod0Set = new HashSet<Renderer>();
+        private static readonly HashSet<Renderer> s_lodControlled = new HashSet<Renderer>();
+        private static readonly HashSet<Renderer> s_farSet = new HashSet<Renderer>();
+        // Renderer.sharedMaterials returns a fresh Material[] per access, and AppendContributions runs twice per
+        // renderer (near tier, far tier). GetSharedMaterials fills this reused list instead.
+        private static readonly List<Material> s_bakeMaterials = new List<Material>();
+
+        // A profile names the phase it lands in, so the bake reports its own three: reading the pieces, combining the
+        // meshes, and hiding the originals. Created on first bake — a ProfilerMarker built in a field initializer runs
+        // before the Profiler is up.
+        private static ProfilerMarker s_collectMarker, s_combineMarker, s_suppressMarker;
+        private static bool s_bakeMarkersReady;
+
+        private static void EnsureBakeMarkers()
+        {
+            if (s_bakeMarkersReady) return;
+            s_bakeMarkersReady = true;
+            s_collectMarker = new ProfilerMarker("EBM bake:collect");
+            s_combineMarker = new ProfilerMarker("EBM bake:combine");
+            s_suppressMarker = new ProfilerMarker("EBM bake:suppress");
+        }
+
+        // GetComponentsInChildren<MeshRenderer>(includeInactive: false) skips components on inactive GameObjects, so the
+        // one-pass walk has to include everything and apply that test itself. The renderer's own enabled flag is a
+        // separate question the tiers ask later, exactly as before.
+        private static bool ScanPieceComponents(GameObject root)
+        {
+            s_pieceLodGroups.Clear();
+            s_pieceRenderers.Clear();
+            bool tintOnly = false;
+
+            root.GetComponentsInChildren(true, s_pieceComponents);
+            for (int i = 0; i < s_pieceComponents.Count; i++)
+            {
+                var component = s_pieceComponents[i];
+                if (component == null) continue;
+
+                if (component is LODGroup lodGroup) s_pieceLodGroups.Add(lodGroup);
+                else if (component is MeshRenderer renderer) { if (renderer.gameObject.activeInHierarchy) s_pieceRenderers.Add(renderer); }
+                else if (component is RandomMaterialValues) tintOnly = true;
+            }
+            s_pieceComponents.Clear();
+            return tintOnly;
         }
 
         private static readonly Dictionary<int, string> _combinerRefusals = new Dictionary<int, string>();
@@ -768,7 +828,11 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static bool ShowsHealthyState(WearNTear wnt)
         {
             if (wnt.GetHealthPercentage() <= WearLooks.NewModelAbove) return false;
-            return wnt.m_new == null || wnt.m_new.activeInHierarchy;
+            // activeSelf, not activeInHierarchy: the question is whether the undamaged model is switched on, which is
+            // what WearNTear and Core's WearLooks both read. activeInHierarchy also answers false while the piece
+            // itself is switched off - mid-creation, parked, or reparented - and a piece that is merely not on screen
+            // yet is not worn. That read excluded 907 signs from the bake in one census.
+            return wnt.m_new == null || wnt.m_new.activeSelf;
         }
 
         internal static ZDO ZdoOf(WearNTear wnt)

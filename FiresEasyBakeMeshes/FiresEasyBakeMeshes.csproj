@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
@@ -20,7 +20,7 @@
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
     <OutputPath>bin\Debug\</OutputPath>
-    <DefineConstants>DEBUG;TRACE</DefineConstants>
+    <DefineConstants>DEBUG;TRACE;ENABLE_PROFILER</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
@@ -28,7 +28,7 @@
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
     <OutputPath>bin\Release\</OutputPath>
-    <DefineConstants>TRACE</DefineConstants>
+    <DefineConstants>TRACE;ENABLE_PROFILER</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
@@ -43,7 +43,7 @@
       <Private>False</Private>
     </Reference>
     <Reference Include="assembly_utils">
-      <HintPath>..\..\assembly_valheim\lib\assembly_utils.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="BepInEx">
@@ -79,6 +79,7 @@
     <Compile Include="Utilities\BakeSummary.cs" />
     <Compile Include="EasyBake\InvulnerableClassifier.cs" />
     <Compile Include="EasyBake\DeferCreation.cs" />
+    <Compile Include="EasyBake\ScanGate.cs" />
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
     <Compile Include="EasyBake\EasyBakeSuppressedVisuals.cs" />
@@ -109,17 +110,4 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
-  <!-- Post-build deploy to the active r2modman 'BlueHills' test profile. Gated on
-       Exists so a missing/renamed profile (other machines, CI) just skips and never
-       fails the build. Copies the built DLL + PDB into the r2modman-managed mod
-       folder. EasyBake hard-deps FiresUnifiedCore (already deployed there); it's a
-       code-only mod (no bundles/assets) so the DLL is a complete install. -->
-  <PropertyGroup>
-    <BlueHillsPluginDir>$(AppData)\r2modmanPlus-local\Valheim\profiles\BlueHills\BepInEx\plugins\FiresEasyBakeMeshes\</BlueHillsPluginDir>
-  </PropertyGroup>
-  <Target Name="DeployToBlueHills" AfterTargets="Build" Condition="Exists('$(BlueHillsPluginDir)')">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BlueHillsPluginDir)" OverwriteReadOnlyFiles="true" />
-    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(BlueHillsPluginDir)" OverwriteReadOnlyFiles="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
-    <Message Importance="high" Text="Deployed $(TargetFileName) (+pdb) -> $(BlueHillsPluginDir)" />
-  </Target>
 </Project>

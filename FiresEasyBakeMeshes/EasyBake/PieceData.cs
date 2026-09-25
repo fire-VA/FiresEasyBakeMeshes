@@ -23,12 +23,19 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly int CustomFieldsKey = ZNetView.CustomFieldsStr.GetStableHashCode();
         private static readonly int RandomMaterialSeedKey = "RandMatSeed".GetStableHashCode();
 
-        private static readonly HashSet<string> LookFields = new HashSet<string>(StringComparer.Ordinal)
+        // An edit only has to keep its piece real when it changes something a player can see or touch. Vanilla applies
+        // edits of six kinds (int, float, bool, Vector3, string, GameObject); of those only a string can rename a piece
+        // or rewrite its hover text, and only a GameObject can swap its model or effect. Numbers and flags - health,
+        // wear, scale, whether it can be removed - change nothing the bake draws, and a piece that was never created
+        // cannot act on them anyway. These few are named because they decide something the player meets: comfort is
+        // read off the piece, and the ground flags and initial scale change how it sits.
+        private static readonly HashSet<string> AlwaysLiveFields = new HashSet<string>(StringComparer.Ordinal)
         {
-            nameof(WearNTear) + "." + nameof(WearNTear.m_health),
-            nameof(WearNTear) + "." + nameof(WearNTear.m_new),
-            nameof(WearNTear) + "." + nameof(WearNTear.m_worn),
-            nameof(WearNTear) + "." + nameof(WearNTear.m_broken),
+            nameof(Piece) + "." + nameof(Piece.m_comfort),
+            nameof(Piece) + "." + nameof(Piece.m_comfortGroup),
+            nameof(Piece) + "." + nameof(Piece.m_groundPiece),
+            nameof(Piece) + "." + nameof(Piece.m_groundOnly),
+            nameof(ZNetView) + "." + nameof(ZNetView.m_syncInitialScale),
         };
 
         private static readonly string[] StructureTweaksKeyNames =
@@ -254,12 +261,23 @@ namespace FiresEasyBakeMeshes.EasyBake
             foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public))
             {
                 string name = type.Name + "." + field.Name;
-                if (LookFields.Contains(name)) target.LookFields[name.GetStableHashCode()] = name;
-                else target.LiveFields[name.GetStableHashCode()] = name;
+                if (KeepsPieceLive(field, name)) target.LiveFields[name.GetStableHashCode()] = name;
+                else target.LookFields[name.GetStableHashCode()] = name;
             }
 
             s_targetsByType[type] = target;
             return target;
+        }
+
+        // Naming the few that keep a piece live, rather than the few that do not. The list of fields the bake can
+        // reproduce is open-ended - every public field of every component on every modded prefab - so an allow-list of
+        // bakeable ones silently keeps everything it has not heard of, which is how a bool saying whether a piece can
+        // be removed came to hold thousands of pieces out of the bake.
+        private static bool KeepsPieceLive(FieldInfo field, string name)
+        {
+            if (AlwaysLiveFields.Contains(name)) return true;
+            if (field.FieldType == typeof(string)) return true;
+            return typeof(GameObject).IsAssignableFrom(field.FieldType);
         }
 
         private static Dictionary<int, string> HashNames(string[] names)

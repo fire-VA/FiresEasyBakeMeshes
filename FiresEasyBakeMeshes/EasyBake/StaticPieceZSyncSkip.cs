@@ -160,23 +160,30 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (HasComponentAnywhere<MineRock5>(go))       return true;
             if (HasComponentAnywhere<MineRock>(go))        return true;
 
-            // Category B — interactable stations / fixtures. Their main
-            // transform IS typically static, but any one of them could grow
-            // an animation in a future patch or via a mod. Conservative.
-            if (HasComponentAnywhere<Sign>(go))            return true;
+            // Category B1 — kept out of the skip whatever the setting says. A stand shows its item as a child visual
+            // built at runtime, a Pickable is consumed rather than placed, and a Switch drives a moving part.
             if (HasComponentAnywhere<ItemStand>(go))       return true;
             if (HasComponentAnywhere<ArmorStand>(go))      return true;
-            if (HasComponentAnywhere<Smelter>(go))         return true;
-            if (HasComponentAnywhere<CookingStation>(go))  return true;
-            if (HasComponentAnywhere<Fermenter>(go))       return true;
-            if (HasComponentAnywhere<Beehive>(go))         return true;
             if (HasComponentAnywhere<Pickable>(go))        return true;
-            if (HasComponentAnywhere<TeleportWorld>(go))   return true;
-            if (HasComponentAnywhere<Fireplace>(go))       return true;
-            if (HasComponentAnywhere<CraftingStation>(go)) return true;
-            if (HasComponentAnywhere<PrivateArea>(go))     return true;
             if (HasComponentAnywhere<Switch>(go))          return true;
-            if (HasComponentAnywhere<Bed>(go))             return true;
+
+            // Category B2 — stations and fixtures that are bolted to the ground. They were listed above out of caution
+            // rather than necessity: none of them moves its own transform, they are a large share of what a settlement
+            // is made of, and the cost of being wrong is that a non-owner sees one at its old spot until they reload.
+            // The toggle is the retreat if a mod ever animates one.
+            if (!FiresEasyBakeMeshesPlugin.ZSyncStaticSkipFixtures.Value)
+            {
+                if (HasComponentAnywhere<Sign>(go))            return true;
+                if (HasComponentAnywhere<Smelter>(go))         return true;
+                if (HasComponentAnywhere<CookingStation>(go))  return true;
+                if (HasComponentAnywhere<Fermenter>(go))       return true;
+                if (HasComponentAnywhere<Beehive>(go))         return true;
+                if (HasComponentAnywhere<TeleportWorld>(go))   return true;
+                if (HasComponentAnywhere<Fireplace>(go))       return true;
+                if (HasComponentAnywhere<CraftingStation>(go)) return true;
+                if (HasComponentAnywhere<PrivateArea>(go))     return true;
+                if (HasComponentAnywhere<Bed>(go))             return true;
+            }
 
             // Category C — vehicles and large physics bodies. Should be
             // caught above by the rigidbody / Piece checks, but defensive.

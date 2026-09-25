@@ -499,12 +499,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             bool skipping = SkipCreationActive();
             var localPlayer = Player.m_localPlayer;
             s_buildingNearby = skipping && localPlayer != null && localPlayer.InPlaceMode();
-            long holdStart = InstancedDraw.Mark();
+            long holdStart = InstancedDraw.Mark(InstancedDraw.Phase.BuildHold);
             if (s_buildingNearby) HoldForBuildTools(localPlayer.transform.position, now);
             else s_buildHoldScanned = false;
             InstancedDraw.NotePhase(InstancedDraw.Phase.BuildHold, holdStart);
 
-            long walkStart = InstancedDraw.Mark();
+            long walkStart = InstancedDraw.Mark(InstancedDraw.Phase.Zones);
 
             // Soft unload / reload pass. Zones that ZoneSystem stops tracking
             // get their combined-mesh parent hidden but kept in memory; their
@@ -551,7 +551,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             InstancedDraw.NotePhase(InstancedDraw.Phase.Zones, walkStart);
 
-            long checkStart = InstancedDraw.Mark();
+            long checkStart = InstancedDraw.Mark(InstancedDraw.Phase.Checks);
             FinishHandBacks(now);
             if (skipping)
             {
@@ -562,21 +562,21 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
                 InstancedDraw.NotePhase(InstancedDraw.Phase.Checks, checkStart);
 
-                long standInStart = InstancedDraw.Mark();
+                long standInStart = InstancedDraw.Mark(InstancedDraw.Phase.StandIns);
                 BuildStandIns();
                 InstancedDraw.NotePhase(InstancedDraw.Phase.StandIns, standInStart);
 
-                long unloadStart = InstancedDraw.Mark();
+                long unloadStart = InstancedDraw.Mark(InstancedDraw.Phase.Unloading);
                 ConvertLivePieces();
                 InstancedDraw.NotePhase(InstancedDraw.Phase.Unloading, unloadStart);
 
-                checkStart = InstancedDraw.Mark();
+                checkStart = InstancedDraw.Mark(InstancedDraw.Phase.Checks);
                 WatchSkipped(now);
                 ReportSkipping(now);
             }
             InstancedDraw.NotePhase(InstancedDraw.Phase.Checks, checkStart);
 
-            long bakeStart = InstancedDraw.Mark();
+            long bakeStart = InstancedDraw.Mark(InstancedDraw.Phase.Baking);
 
             // Now the per-frame bake decision. Only active zones with enough
             // settled invulnerable pieces qualify. A zone that's Baked AND not
@@ -1475,7 +1475,14 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static string WhyDamageableNotDrawn(ZoneState state, ZDO zdo, WearNTear wnt)
         {
-            if (!MeshBaker.ShowsHealthyState(wnt)) return "worn or broken (a damageable piece draws its own look, since the next hit changes it)";
+            // Which half of the healthy test failed, and by what value. A piece that is not actually damaged can still
+            // read as worn: WearNTear.Awake takes the stored health BEFORE it raises m_health for the world level, then
+            // divides one by the other, so an untouched piece on a levelled world reports a fraction of full health.
+            if (!MeshBaker.ShowsHealthyState(wnt))
+                return wnt.GetHealthPercentage() <= FiresCore.Pieces.WearLooks.NewModelAbove
+                    ? $"worn or broken (health reads {wnt.GetHealthPercentage():0.00} of {wnt.m_health:0} - a damageable "
+                      + "piece draws its own look, since the next hit changes it)"
+                    : "worn or broken (its undamaged look is switched off in the prefab)";
             if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) return "a field edit or Structure Tweaks key on it is not a look the bake draws";
             var healthy = new InstanceKey(zdo.GetPrefab(), HealthyLookOf(zdo.GetPrefab()));
             if (!InstanceDefinitionCache.TryGet(healthy, out _)) return "its prefab has several renderers or materials, which instancing cannot draw";

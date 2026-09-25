@@ -75,6 +75,10 @@ namespace FiresEasyBakeMeshes.Patches
         private static int _lastZdoCount = -1;
         private static float _lastVanillaTime = -1000f;
 
+        // The sectors the player's own update actually looks at, and the world-clock reading of the last pass. Core
+        // keeps a per-sector record of when anything in it last changed, so asking about these is what lets a quiet
+        // moment here be recognised as quiet, rather than being drowned out by a creature moving across the map.
+
         private static FieldInfo s_zonesField;
         private static bool s_zonesFieldChecked;
         private static FieldInfo s_instancesField;
@@ -142,11 +146,21 @@ namespace FiresEasyBakeMeshes.Patches
             float now = Time.unscaledTime;
             float maxSkipSeconds = FiresEasyBakeMeshesPlugin.CreateDestroySkipMaxSeconds.Value;
             bool ttlExpired = (now - _lastVanillaTime) >= maxSkipSeconds;
+
+            // The ring-scoped question this used to ask Core is GONE, 2026-09-24. Core maintained it with four
+            // postfixes on ZDO.IncreaseDataRevision / IncreaseOwnerRevision / Deserialize / SetOwnerInternal, firing
+            // more than 50,000 times a second, duplicating hooks VAGhettoNetworking already had on the same methods.
+            // It bought nothing: a full session with this skip enabled logged ZERO skipped ticks while ScanGate,
+            // which asks a cheaper question in a safer place, reached 95%. Back to the world-wide count, which is one
+            // O(1) read and answers "something changed" nearly always - so this skip is effectively off, and that is
+            // the honest state of it rather than a signal maintained at 50,000 writes a second to say the same thing.
+            bool contentChanged = zdoCount != _lastZdoCount;
+
             bool stateChanged = center.x != _lastCenter.x
                              || center.y != _lastCenter.y
                              || zoneCount != _lastZoneCount
                              || instanceCount != _lastInstanceCount
-                             || zdoCount != _lastZdoCount;
+                             || contentChanged;
 
             if (!stateChanged && !ttlExpired && _lastZoneCount >= 0)
             {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -13,7 +13,7 @@ namespace FiresEasyBakeMeshes.EasyBake
     // don't stall the main thread on file I/O while pieces are streaming in.
     //
     // Lifecycle (per session):
-    //   1. ZNetScene.Awake → BuildMaterialRegistry walks every prefab's
+    //   1. ZNetScene.Awake â†’ BuildMaterialRegistry walks every prefab's
     //      MeshRenderers and indexes their sharedMaterials by Material.name.
     //      Resolves cached material names back to live refs at construct time.
     //   2. Plugin.Update polls ZNet.GetWorldUID() each frame. As soon as a
@@ -27,7 +27,7 @@ namespace FiresEasyBakeMeshes.EasyBake
     //      session, calls TryGetPreloaded. If the data is in the dictionary,
     //      ConstructFromCache (main thread) builds the Mesh + GameObject
     //      hierarchy via Mesh.SetVertices/SetIndices on the prepared arrays.
-    //      That's a sub-millisecond per zone — no perceptible hitch.
+    //      That's a sub-millisecond per zone â€” no perceptible hitch.
     //   4. ZoneTracker.Update, after a fresh Bake completes, writes the new
     //      BakeResult to disk (also fail-soft). Save still runs on main thread
     //      but only after a bake actually happened (Login 1 or admin edits).
@@ -51,25 +51,25 @@ namespace FiresEasyBakeMeshes.EasyBake
         // filter that used to let doors/chests into the static mesh).
         //
         // Version history:
-        //   1 — initial format.
-        //   2 — Door + Container added to HasBakeUnsafeComponent. v1 caches
+        //   1 â€” initial format.
+        //   2 â€” Door + Container added to HasBakeUnsafeComponent. v1 caches
         //       contain frozen door/chest geometry; reject them so they
         //       rebake cleanly on next login.
-        //   3 — batches are grouped by full renderer settings rather than material
+        //   3 â€” batches are grouped by full renderer settings rather than material
         //       alone, and each zone also stores a far-tier (LOD1) batch list. v2
         //       caches have neither; reject them so they rebake.
-        //   4 — GPU-instanced prefab groups added alongside the combined batches.
+        //   4 â€” GPU-instanced prefab groups added alongside the combined batches.
         //       A v3 cache suppressed those pieces without recording what draws
         //       them, so reject it and rebake.
-        //   5 — each contributor's position, rotation and scale, which stand-in colliders need to replace pieces
+        //   5 â€” each contributor's position, rotation and scale, which stand-in colliders need to replace pieces
         //       that are never created.
-        //   6 — damageable pieces join instanced groups; a v5 zone would keep drawing them itself until it rebaked.
-        //   7 — each identity carries a rotation key, so copies stacked on one spot turned for looks stay distinct.
-        //   8 — tinted grausten merges into combined batches, and item and armor stands are never baked.
-        //  12 — each piece transform and instanced group carries the wear look it was drawn with, so worn, broken and
+        //   6 â€” damageable pieces join instanced groups; a v5 zone would keep drawing them itself until it rebaked.
+        //   7 â€” each identity carries a rotation key, so copies stacked on one spot turned for looks stay distinct.
+        //   8 â€” tinted grausten merges into combined batches, and item and armor stands are never baked.
+        //  12 â€” each piece transform and instanced group carries the wear look it was drawn with, so worn, broken and
         //       hidden pieces bake and skip with their own look.
         private const uint MAGIC = 0x434D4245;
-        private const int VERSION = 12;
+        private const int VERSION = 13;
 
         private static string _cacheRoot;
         private static readonly Dictionary<string, Material> _materialsByName = new Dictionary<string, Material>();
@@ -88,7 +88,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static long _preloadWorldUid;
 
         // Intermediate off-thread representation of one cached zone. Holds
-        // arrays only — no Unity Mesh/GameObject refs. The Construct step
+        // arrays only â€” no Unity Mesh/GameObject refs. The Construct step
         // turns this into a MeshBaker.BakeResult on the main thread.
         internal class CachedZoneData
         {
@@ -136,8 +136,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // True iff a per-world cache directory exists on disk. Used by the
         // ZNetScene.Awake postfix to decide whether the material registry needs
-        // to be built at all — the registry's sole consumer is cached zone
-        // reattach (ConstructFromCache → FindMaterial). No cache directory =>
+        // to be built at all â€” the registry's sole consumer is cached zone
+        // reattach (ConstructFromCache â†’ FindMaterial). No cache directory =>
         // no possible reattach => no need to spend ~50 main-thread-seconds
         // walking 3600+ prefabs to index materials we'll never look up.
         public static bool WorldHasCache(long worldUid)
@@ -151,7 +151,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             catch { return false; }
         }
 
-        // Synchronous entry point — preserved for callers that need the
+        // Synchronous entry point â€” preserved for callers that need the
         // registry immediately. Internally this is now a thin wrapper that
         // drains the coroutine in one frame. Prefer BuildMaterialRegistryAsync
         // when running on the main thread during world load.
@@ -161,13 +161,13 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (scene == null || scene.m_prefabs == null) { _materialsBuilt = true; return; }
 
             var enumerator = BuildMaterialRegistryAsync(scene, runSynchronously: true);
-            while (enumerator.MoveNext()) { /* drain — no yields when synchronous */ }
+            while (enumerator.MoveNext()) { /* drain â€” no yields when synchronous */ }
         }
 
         // Time-budgeted coroutine. Walks every prefab's MeshRenderers and
         // indexes sharedMaterials by Material.name. Yields when the per-frame
         // budget (FiresEasyBakeMeshesPlugin.MaterialRegistryFrameBudgetMs) is
-        // exhausted so the main thread stays responsive — the password dialog
+        // exhausted so the main thread stays responsive â€” the password dialog
         // and loading screen don't freeze during the walk.
         //
         // Sync mode (runSynchronously=true): never yields, runs to completion
@@ -382,7 +382,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
-        // Filename like "zone_-17_11.bin" → Vector2s(-17, 11).
+        // Filename like "zone_-17_11.bin" â†’ Vector2s(-17, 11).
         private static bool TryParseCoord(string fileNameNoExt, out Vector2s coord)
         {
             coord = default;
@@ -403,7 +403,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // --- Construction (main thread) ----------------------------------------
 
         // Turns the intermediate arrays into a live BakeResult with real Unity
-        // Mesh + GameObject instances. Cheap — just buffer copies into Unity's
+        // Mesh + GameObject instances. Cheap â€” just buffer copies into Unity's
         // mesh API; no disk I/O, no parsing.
         public static MeshBaker.BakeResult ConstructFromCache(CachedZoneData data)
         {
@@ -450,7 +450,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     {
                         EasyBakeLog.Warn(
                             $"[Cache] Zone ({data.Coord.x},{data.Coord.y}): instanced prefab {cachedGroup.PrefabHash} ({key.Look}) " +
-                            "no longer resolves — discarding cache so the zone rebakes.");
+                            "no longer resolves â€” discarding cache so the zone rebakes.");
                         UnityEngine.Object.Destroy(parent);
                         return null;
                     }
@@ -561,7 +561,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // Drops a zone's cache file AND its preloaded copy. Called when a
         // rebake produced no batches or a dirty zone tore down below the bake
-        // threshold — leaving the old file would resurrect the removed pieces'
+        // threshold â€” leaving the old file would resurrect the removed pieces'
         // ghost geometry next session.
         public static void Delete(long worldUid, Vector2s coord)
         {

@@ -1,4 +1,4 @@
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using System.Collections;
@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.30";
+        public const string PluginVersion = "1.2.46";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -86,6 +86,8 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<float> ZSFXLodDistance;
 
         public static ConfigEntry<bool>  ZSyncStaticSkipEnabled;
+        public static ConfigEntry<bool>  SkipUnchangedScans;
+        public static ConfigEntry<bool>  ZSyncStaticSkipFixtures;
         public static ConfigEntry<bool>  ZSyncStaticSkipVerbose;
 
         public static ConfigEntry<bool>  ClutterLodEnabled;
@@ -115,7 +117,7 @@ namespace FiresEasyBakeMeshes
 
             VerboseZoneLogging = Config.Bind("General", "Verbose Zone Logging", false,
                 "Log the per-zone cache-hit and fresh-bake lines (one line per zone,\n" +
-                "~25-30 at login on a megabase). Off by default — the debounced\n" +
+                "~25-30 at login on a megabase). Off by default â€” the debounced\n" +
                 "ZONES BAKED summary box carries the totals either way.");
 
             BatchingEnabled = Config.Bind("Batching", "Enabled", true,
@@ -124,7 +126,7 @@ namespace FiresEasyBakeMeshes
                 "GameObjects (and ZNetView, colliders, Piece) stay alive.");
 
             BatchingRunOnServer = Config.Bind("Batching", "RunOnServer", false,
-                "Run batching on dedicated server too. Default off — a headless server\n" +
+                "Run batching on dedicated server too. Default off â€” a headless server\n" +
                 "doesn't render so Mesh.CombineMeshes() output is pure wasted CPU + memory.\n" +
                 "A player-hosted world (host + client in one process) still gets the benefit\n" +
                 "regardless of this setting; this gate only suppresses true dedicated servers.");
@@ -175,7 +177,7 @@ namespace FiresEasyBakeMeshes
                 new ConfigDescription(
                     "Distance from the zone centre at which a baked zone swaps to its LOD1\n" +
                     "mesh. A zone is 64m across, so its centre is at most ~45m from any\n" +
-                    "point inside it — keep this at or above 64 and the swap can never\n" +
+                    "point inside it â€” keep this at or above 64 and the swap can never\n" +
                     "happen while you are standing in the zone watching it.",
                     new AcceptableValueRange<float>(48f, 512f)));
 
@@ -193,7 +195,7 @@ namespace FiresEasyBakeMeshes
             BatchingExcludeTransparent = Config.Bind("Batching", "ExcludeTransparentPieces", true,
                 "Skip pieces with transparent-queue materials (renderQueue >= 2500) and\n" +
                 "FiresGlass windows. Combining transparent geometry into a static batch\n" +
-                "breaks per-piece depth sorting — stained glass sorts against the world\n" +
+                "breaks per-piece depth sorting â€” stained glass sorts against the world\n" +
                 "per pane, a merged mesh sorts once for the whole batch. Excluded pieces\n" +
                 "stay live and render normally.");
 
@@ -233,7 +235,7 @@ namespace FiresEasyBakeMeshes
                 "prefab) once during loading rather than at zone borders during gameplay.");
 
             PrewarmRunOnServer = Config.Bind("Prewarm", "RunOnServer", false,
-                "Run prewarm on dedicated server too. Default off — server doesn't render\n" +
+                "Run prewarm on dedicated server too. Default off â€” server doesn't render\n" +
                 "so it gains nothing from shader-variant warm-up.");
 
             PrewarmPrefabsPerFrame = Config.Bind("Prewarm", "PrefabsPerFrame", 25,
@@ -250,7 +252,7 @@ namespace FiresEasyBakeMeshes
             PrewarmSkipNameContains = Config.Bind("Prewarm", "SkipNameContains", "",
                 "Comma-separated list of case-insensitive substrings. Any prefab whose\n" +
                 "name contains one of these tokens is skipped during prewarm. Empty by\n" +
-                "default — main-thread responsiveness is preserved by the time-budgeted\n" +
+                "default â€” main-thread responsiveness is preserved by the time-budgeted\n" +
                 "yield pattern (see TimeBudgetMs below), not by skipping. Use this\n" +
                 "config only when a specific prefab is misbehaving badly enough that\n" +
                 "you'd rather pay the first-instantiate cost in-game than at load.");
@@ -263,10 +265,10 @@ namespace FiresEasyBakeMeshes
                     "responsive (loading screen + any open dialogs stay interactive)\n" +
                     "at the cost of longer total wall time. A single very-slow prefab\n" +
                     "(e.g. ConsMassiveTower's ~30s first-Instantiate) will still freeze\n" +
-                    "the frame it lands on — Unity's shader-variant compile is\n" +
-                    "synchronous and can't be yielded mid-Instantiate — but every\n" +
+                    "the frame it lands on â€” Unity's shader-variant compile is\n" +
+                    "synchronous and can't be yielded mid-Instantiate â€” but every\n" +
                     "other prefab around it stops piling on. Lower = smoother but\n" +
-                    "longer. 8ms ≈ half a 16ms frame budget.",
+                    "longer. 8ms â‰ˆ half a 16ms frame budget.",
                     new AcceptableValueRange<float>(1f, 100f)));
 
             PrewarmSlowInstantiateThresholdMs = Config.Bind("Prewarm", "SlowInstantiateThresholdMs", 5000f,
@@ -283,7 +285,7 @@ namespace FiresEasyBakeMeshes
                 new ConfigDescription(
                     "Skip any prefab whose transform hierarchy exceeds this many nodes,\n" +
                     "WITHOUT instantiating it. A single Instantiate is atomic on the main\n" +
-                    "thread — the frame budget cannot split it — and combined-build\n" +
+                    "thread â€” the frame budget cannot split it â€” and combined-build\n" +
                     "mega-prefabs (e.g. ConsMassiveTower, ~29s) freeze the whole client\n" +
                     "on their first-ever warm-up, which the slow-instantiate detector\n" +
                     "above can only prevent from the SECOND session on. The node count is\n" +
@@ -296,7 +298,7 @@ namespace FiresEasyBakeMeshes
                 new ConfigDescription(
                     "Time-budgeted yield for the material-registry build pass that\n" +
                     "runs on ZNetScene.Awake (BEFORE prewarm starts). The build walks\n" +
-                    "every prefab's MeshRenderers to index sharedMaterials by name —\n" +
+                    "every prefab's MeshRenderers to index sharedMaterials by name â€”\n" +
                     "on a 5000+ prefab world this can take seconds synchronously,\n" +
                     "and the freeze lands right around the password-prompt /\n" +
                     "loading-screen-first-frame window. Yielding every Nms keeps the\n" +
@@ -307,14 +309,14 @@ namespace FiresEasyBakeMeshes
             CachePersistEnabled = Config.Bind("Cache", "PersistToDisk", true,
                 "Save baked meshes to BepInEx/config/FiresEasyBakeMeshes/cache/<worldUid>/\n" +
                 "and reload them on subsequent sessions of the same world. Eliminates the\n" +
-                "per-zone Mesh.CombineMeshes cost on re-entry — disk read + Mesh.SetVertices\n" +
+                "per-zone Mesh.CombineMeshes cost on re-entry â€” disk read + Mesh.SetVertices\n" +
                 "is ~4x faster than rebuilding from source pieces. Disable to always rebake\n" +
                 "(useful when debugging or after admin-removing pieces, which the cache\n" +
                 "can't detect and would leave as ghost geometry).");
 
             CreationCensusEnabled = Config.Bind("Diagnostics", "CreationCensusEnabled", false,
                 "Counts what ZNetScene actually creates: objects per CreateObjects call against\n" +
-                "the budget handed out, and a breakdown by prefab. Diagnostic only — it changes\n" +
+                "the budget handed out, and a breakdown by prefab. Diagnostic only â€” it changes\n" +
                 "no behaviour, but it hooks every CreateObject and keeps a dictionary, so leave\n" +
                 "it OFF unless you are chasing creation cost. It is what found that ~59,000 of\n" +
                 "61,194 CreateObject calls per 30s were creating nothing at all.");
@@ -337,7 +339,7 @@ namespace FiresEasyBakeMeshes
                     "Vanilla's budget is Max(backlog/100, 10), so the more objects are waiting\n" +
                     "the bigger each frame's burst gets. On a dense world that inverts: with\n" +
                     "~24,000 objects queued the budget becomes 240 in a single frame, and at\n" +
-                    "0.18ms each that is ~44ms of instantiation in one frame — measured as a\n" +
+                    "0.18ms each that is ~44ms of instantiation in one frame â€” measured as a\n" +
                     "122ms stall about once a second. This caps the burst WITHOUT lowering\n" +
                     "vanilla's own floor, so an area takes a few more frames to fill but fills\n" +
                     "smoothly. It does not reduce total work, only how lumpy it is.\n" +
@@ -366,7 +368,7 @@ namespace FiresEasyBakeMeshes
                 "Skip WearNTear.UpdateWear and UpdateCover for invulnerable pieces.\n" +
                 "Invulnerable pieces (m_health < 0 or all-Immune damage modifiers)\n" +
                 "can't take damage, so vanilla's per-piece wet/roof/support/biome/lava\n" +
-                "computation is wasted work — CanBeRemoved() zeros the accumulated\n" +
+                "computation is wasted work â€” CanBeRemoved() zeros the accumulated\n" +
                 "damage at the bottom of the method. At a megabase WearNTearUpdater is\n" +
                 "the single largest per-frame cost; this short-circuit reclaims roughly\n" +
                 "30 ms/sec. Disable only if a mod conflict requires vanilla behavior.");
@@ -383,7 +385,7 @@ namespace FiresEasyBakeMeshes
                 new ConfigDescription(
                     "Max zone-distance from the player to keep baked zones pinned. Beyond\n" +
                     "this radius the zone is released and vanilla destroys its instances.\n" +
-                    "Each zone is 64m. Default 15 = 960m radius — wide enough to cover\n" +
+                    "Each zone is 64m. Default 15 = 960m radius â€” wide enough to cover\n" +
                     "Render Limits' extended view (typically +12 zones) so zones at the\n" +
                     "edge of the rendered area don't get destroyed when you walk around\n" +
                     "within town. With ~30 baked zones at a megabase the memory cost is\n" +
@@ -431,7 +433,7 @@ namespace FiresEasyBakeMeshes
                 "Maintain a per-sector instance-count mirror of ZNetScene.m_instances and\n" +
                 "intercept ZNetScene.HaveInstanceInSector with an O(1) dictionary lookup.\n" +
                 "Vanilla walks every entry in m_instances (146k+ at megabase) for each\n" +
-                "ZoneSystem.UpdateTTL zone check — profile shows ZoneSystem.Update\n" +
+                "ZoneSystem.UpdateTTL zone check â€” profile shows ZoneSystem.Update\n" +
                 "spiking to 80+ ms/call during in-town movement. The mirror eliminates\n" +
                 "that scan. Staleness from instances that move sectors after spawn\n" +
                 "(creatures, ships) is corrected by a periodic full rebuild.");
@@ -456,7 +458,7 @@ namespace FiresEasyBakeMeshes
                 "flicker math (6+ sin/cos calls + position jitter) every frame for every\n" +
                 "lit prefab in the scene; at a megabase with hundreds of torches/braziers\n" +
                 "this aggregates to 8-10 ms/sec. Distant lights update less often instead\n" +
-                "of being skipped outright — vanilla zeroes a light's intensity when it is\n" +
+                "of being skipped outright â€” vanilla zeroes a light's intensity when it is\n" +
                 "enabled and only CustomUpdate writes it back, so a light that never ticks\n" +
                 "renders black. Skipped time is banked and handed to the next real update,\n" +
                 "so flicker and fade still run at the correct speed. Temporary FX lights\n" +
@@ -506,7 +508,7 @@ namespace FiresEasyBakeMeshes
 
             ZSFXLodEnabled = Config.Bind("Optimize", "ZSFXLodEnabled", true,
                 "Distance-LOD on ZSFX.CustomUpdate. ZSFX is Valheim's per-sound wrapper\n" +
-                "around Unity's AudioSource — manages fade in/out, pitch/volume modifiers,\n" +
+                "around Unity's AudioSource â€” manages fade in/out, pitch/volume modifiers,\n" +
                 "reverb routing, and concurrency suppression. It ticks every frame on every\n" +
                 "active sfx in the scene; at a megabase with hundreds of torch / brazier /\n" +
                 "fountain loops this aggregates to ~3 ms/sec. Unity's audio engine handles\n" +
@@ -519,7 +521,7 @@ namespace FiresEasyBakeMeshes
             ZSFXLodDistance = Config.Bind("Optimize", "ZSFXLodDistance", 60f,
                 new ConfigDescription(
                     "Distance in meters beyond which ZSFX.CustomUpdate is skipped. 60 m\n" +
-                    "is conservative — most ambient sfx have AudioSource.maxDistance under\n" +
+                    "is conservative â€” most ambient sfx have AudioSource.maxDistance under\n" +
                     "50 m so they're inaudible past that even when CustomUpdate is still\n" +
                     "running. Music and ambient zones have longer reach; raise this if you\n" +
                     "hear audio pop in/out at the edge of your hearing range. Lower for\n" +
@@ -538,12 +540,31 @@ namespace FiresEasyBakeMeshes
                 "or character-parent sync flag, no non-kinematic Rigidbody, and no component\n" +
                 "from the animated/interactable safelist (Door, Container, Sign, Smelter,\n" +
                 "CookingStation, Fireplace, Pickable, TeleportWorld, Bed, Ship, Vagon,\n" +
-                "MineRock, ShieldGenerator, …) — the same surface as the mesh-bake unsafe\n" +
+                "MineRock, ShieldGenerator, â€¦) â€” the same surface as the mesh-bake unsafe\n" +
                 "filter plus all interactables.\n" +
                 "\n" +
                 "Risk surface: in solo this is essentially free. In multiplayer an admin\n" +
                 "teleport on a static piece won't propagate to other clients until reload.\n" +
                 "Disable this toggle if you hit a sync issue in MP and we'll look at it.");
+
+            SkipUnchangedScans = Config.Bind("Optimize", "SkipUnchangedScans", true,
+                "Stop re-searching the whole active area for work that is not there. Every pass ZNetScene walks\n" +
+                "every object near you looking for ones with no model yet; standing in a settlement that is over\n" +
+                "113,000 objects visited to find zero, thirty times a second. This skips that search while the\n" +
+                "near list, the distant list, the live object count and your zone are all unchanged.\n" +
+                "It skips only the SEARCH, never the removal pass, so nothing can be deleted or stranded by it -\n" +
+                "the worst case is a new object appearing up to a second late. It also rechecks itself every few\n" +
+                "seconds by running a search it would have skipped and reporting whether that search found\n" +
+                "anything; the status box prints 'confirmed the skip, 0 wrong'. Turn it off if it ever says WRONG.");
+
+            ZSyncStaticSkipFixtures = Config.Bind("Optimize", "ZSyncStaticSkipFixtures", true,
+                "Also stop position updates on stations and fixtures that never move - signs, smelters,\n" +
+                "cooking stations, fermenters, beehives, portals, fireplaces, workbenches, wards and beds.\n" +
+                "They were left running out of caution rather than need, and in a settlement they are a\n" +
+                "large share of what is left. Item stands, armour stands, pickables and switches are never\n" +
+                "included. Turn this off if another player ever sees one of these at an old position after\n" +
+                "it was moved with an admin tool.");
+            ZSyncStaticSkipFixtures.SettingChanged += (_, __) => EasyBake.StaticPieceZSyncSkip.Reset();
 
             ZSyncStaticSkipVerbose = Config.Bind("Optimize", "ZSyncStaticSkipVerbose", false,
                 "Log a periodic summary of how many pieces have had their ZSync disabled and\n" +
@@ -553,7 +574,7 @@ namespace FiresEasyBakeMeshes
             ClutterLodEnabled = Config.Bind("Optimize", "ClutterLodEnabled", true,
                 "Skip ClutterSystem.LateUpdate while the player is standing still. Vanilla\n" +
                 "re-walks the full grass-patch ring around the camera TWICE every frame\n" +
-                "(generate + timeout, ~120 patches at default range) even when parked —\n" +
+                "(generate + timeout, ~120 patches at default range) even when parked â€”\n" +
                 "FiresDebugginTools measures this at ~3 ms EVERY frame, the largest steady\n" +
                 "cost on a natural (non-megabase) world. The grass set is identical frame to\n" +
                 "frame while stationary, so we skip the pass until the player moves, with a\n" +
@@ -575,7 +596,7 @@ namespace FiresEasyBakeMeshes
                     "Maximum time ClutterSystem.LateUpdate is skipped while parked before a\n" +
                     "forced vanilla pass. Keeps the grass-push trail decaying and picks up\n" +
                     "async heightmap-ready transitions. Lower = more responsive, less savings;\n" +
-                    "higher = more savings, longer-lived frozen push trail. 0.33s ≈ 3 Hz.",
+                    "higher = more savings, longer-lived frozen push trail. 0.33s â‰ˆ 3 Hz.",
                     new AcceptableValueRange<float>(0.05f, 5f)));
 
             ClutterLodVerbose = Config.Bind("Optimize", "ClutterLodVerbose", false,
@@ -583,7 +604,7 @@ namespace FiresEasyBakeMeshes
                 "skipped vs passed through, and the reason for each passthrough (moved past threshold,\n" +
                 "ttl expired, m_forceRebuild pending, no local player, freefly, disabled). Useful when\n" +
                 "ClutterSystem.LateUpdate cost in the FiresDebugginTools overlay doesn't drop while\n" +
-                "parked — the line will tell you whether the prefix is even being called, and if so,\n" +
+                "parked â€” the line will tell you whether the prefix is even being called, and if so,\n" +
                 "what's forcing it to pass through to vanilla.");
 
             EasyBake.MeshCacheStore.Initialize();
@@ -604,12 +625,12 @@ namespace FiresEasyBakeMeshes
                 if (PluginEnabled.Value && !_patchesApplied)
                 {
                     ApplyPatches();
-                    EasyBakeLog.Info($"{PluginName} re-enabled via config — patches restored.");
+                    EasyBakeLog.Info($"{PluginName} re-enabled via config â€” patches restored.");
                 }
                 else if (!PluginEnabled.Value && _patchesApplied)
                 {
                     RemovePatches();
-                    EasyBakeLog.Info($"{PluginName} disabled via config — patches removed, subsystem state reset.");
+                    EasyBakeLog.Info($"{PluginName} disabled via config â€” patches removed, subsystem state reset.");
                 }
             };
 
@@ -617,7 +638,7 @@ namespace FiresEasyBakeMeshes
                 ApplyPatches();
             else
                 EasyBakeLog.Info(
-                    $"{PluginName} v{PluginVersion} loaded but PluginEnabled=false — no patches applied. " +
+                    $"{PluginName} v{PluginVersion} loaded but PluginEnabled=false â€” no patches applied. " +
                     "Flip PluginEnabled to true in the config manager to enable live (no restart needed).");
 
             try { Utilities.EbmHelpContent.Register(); }
@@ -625,7 +646,7 @@ namespace FiresEasyBakeMeshes
 
             FiresCore.Logging.StatusBanner.Register(StatusSource, DescribeStatus);
 
-            // Compact "loaded" banner — oven with heat squiggles. Deferred to
+            // Compact "loaded" banner â€” oven with heat squiggles. Deferred to
             // world-load time (when ZNetScene is up) so it bookends the load;
             // the BIG "loading" banner already fired at the top of Awake.
             StartCoroutine(EmitCompactBannerWhenZNetReady());
@@ -636,6 +657,8 @@ namespace FiresEasyBakeMeshes
         {
             int skipped = Patches.ZNetScene_CreateDestroyObjects_Patch.TakeSkippedSinceStatus();
             string budget = Patches.ZNetScene_CreateObjectsSorted_Budget.TakeStatus();
+            string gate = EasyBake.ScanGate.TakeStatus();
+            budget = gate == null ? budget : (budget == null ? gate : gate + "; " + budget);
             string skips = skipped > 0 ? $"skipped {skipped:N0} idle CreateDestroyObjects ticks" : null;
             if (skips == null) return budget;
             return budget == null ? skips : $"{skips}; {budget}";
@@ -643,7 +666,7 @@ namespace FiresEasyBakeMeshes
 
         // Waits for ZNetScene + its prefab table to be live (same readiness
         // signal the other Fires mods use), then emits the compact loaded
-        // banner. Failure is non-fatal — falls back to a plain "loaded" log
+        // banner. Failure is non-fatal â€” falls back to a plain "loaded" log
         // line so the load event is still recorded in the file log.
         private IEnumerator EmitCompactBannerWhenZNetReady()
         {
@@ -687,20 +710,20 @@ namespace FiresEasyBakeMeshes
             }
             _patchesApplied = true;
             EasyBakeLog.Info(
-                $"{PluginName} v{PluginVersion} active — {succeeded} patches registered, {failed} skipped. " +
+                $"{PluginName} v{PluginVersion} active â€” {succeeded} patches registered, {failed} skipped. " +
                 $"Batching={(BatchingEnabled.Value ? "on" : "off")}, Prewarm={(PrewarmEnabled.Value ? "on" : "off")}.");
         }
 
         // Removes every patch this Harmony instance applied (won't touch
         // patches owned by other mods), then resets every EasyBake subsystem
         // that holds state so a re-enable later starts clean. ZoneTracker.Reset
-        // is the cascade — it tears down all baked zones (calling
+        // is the cascade â€” it tears down all baked zones (calling
         // MeshBaker.Restore per zone to flip MeshRenderers back on) and
         // internally invokes Reset on InvulnerableClassifier, ZoneKeepalive,
         // DestroyTimeSlicer, SectorInstanceMirror, and StaticPieceZSyncSkip.
         // The two patch classes that carry per-frame skip-cache state
         // (CreateDestroyObjectsPatches, ClutterSystemPatches) need their own
-        // ResetState calls — they're not subsystems ZoneTracker knows about.
+        // ResetState calls â€” they're not subsystems ZoneTracker knows about.
         private void RemovePatches()
         {
             if (!_patchesApplied) return;
@@ -733,7 +756,7 @@ namespace FiresEasyBakeMeshes
             // KickPreload is idempotent and cheap when already kicked, so
             // calling it every Update before the first non-zero UID is fine.
             //
-            // Route through MeshCacheStore.TryGetWorldUid() — it pre-checks
+            // Route through MeshCacheStore.TryGetWorldUid() â€” it pre-checks
             // ZNet.m_world via reflection. Vanilla GetWorldUID() does an
             // unchecked dereference of m_world and NREs every frame in the
             // ~6s window between ZNet.instance being assigned and the world
@@ -776,7 +799,7 @@ namespace FiresEasyBakeMeshes
                 EasyBake.Probe.Stop("EasyBake:keepalive", tKeep);
             }
 
-            // Sector mirror periodic rebuild — corrects drift from instances
+            // Sector mirror periodic rebuild â€” corrects drift from instances
             // that moved sectors since they were instantiated. Cheap when
             // disabled (SectorMirrorRebuildSeconds=0) or interval not yet
             // elapsed; expensive (~1 walk of m_instances) when it actually
@@ -790,7 +813,7 @@ namespace FiresEasyBakeMeshes
 
             // Static-piece ZSync skip: periodic verbose summary if enabled.
             // No-op when ZSyncStaticSkipVerbose=false. Cheap enough to call
-            // every Update — guards on the throttle internally.
+            // every Update â€” guards on the throttle internally.
             EasyBake.StaticPieceZSyncSkip.MaybeReport();
         }
 

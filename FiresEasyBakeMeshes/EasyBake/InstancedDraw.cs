@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Unity.Profiling;
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -30,6 +31,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static readonly string[] PhaseNames = { "walking zones", "stand-ins", "unloading", "checks", "baking", "holding for build tools" };
         private static readonly double[] s_phaseMs = new double[PhaseNames.Length];
+        // One Profiler sample per phase, so a profile attributes every allocation in ZoneTracker.Update to its phase.
+        private static ProfilerMarker[] s_phaseMarkers;
 
         private static bool s_culling;
         private static Vector3 s_shadowSweep;
@@ -54,10 +57,22 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void NoteZoneTracking(long ticks) => s_trackTicks = ticks;
 
-        internal static long Mark() => Stopwatch.GetTimestamp();
+        internal static long Mark(Phase phase)
+        {
+            if (s_phaseMarkers == null)
+            {
+                s_phaseMarkers = new ProfilerMarker[PhaseNames.Length];
+                for (int i = 0; i < PhaseNames.Length; i++) s_phaseMarkers[i] = new ProfilerMarker("EBM " + PhaseNames[i]);
+            }
+            s_phaseMarkers[(int)phase].Begin();
+            return Stopwatch.GetTimestamp();
+        }
 
         internal static void NotePhase(Phase phase, long start)
-            => s_phaseMs[(int)phase] += (Stopwatch.GetTimestamp() - start) * MsPerTick;
+        {
+            s_phaseMs[(int)phase] += (Stopwatch.GetTimestamp() - start) * MsPerTick;
+            s_phaseMarkers[(int)phase].End();
+        }
 
         internal static void BeginFrame()
         {

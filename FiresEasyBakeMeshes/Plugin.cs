@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.65";
+        public const string PluginVersion = "1.2.66";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -704,6 +704,17 @@ namespace FiresEasyBakeMeshes
                 "ClutterSystem.LateUpdate cost in the FiresDebugginTools overlay doesn't drop while\n" +
                 "parked â€” the line will tell you whether the prefix is even being called, and if so,\n" +
                 "what's forcing it to pass through to vanilla.");
+
+            // ── AN EDIT TO THE .cfg ON DISK HAS TO REACH THE RUNNING GAME ─────────────────────────────────
+            // BepInEx never re-reads a config file on its own, and a SettingChanged handler only fires when the
+            // in-memory entry changes - through the config UI or code - never from an external edit. So every
+            // SettingChanged wiring above was dead to a text edit, and only Core's watcher closes that gap.
+            //
+            // MEASURED, 2026-09-26: ZdoBakeVerifyEnabled was set to true in the live cfg mid-run. Eleven minutes
+            // later the file still read true, nothing had re-saved over it, and 89 fresh bakes had run with the
+            // feature still gated off in-process. The setting never arrived. Bound last, after every Config.Bind
+            // above, so the first reload cannot race an entry that does not exist yet.
+            FiresCore.Config.ConfigHotReload.Watch(Config);
 
             EasyBake.MeshCacheStore.Initialize();
 

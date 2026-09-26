@@ -50,16 +50,45 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_missingFromZdo = 0; s_extraInZdo = 0;
             s_posMismatch = 0; s_lookMismatch = 0; s_worstPosDelta = 0f;
             s_outsideZone = 0; s_sectorScanned = 0;
+            s_nextVerify = 0f; s_nextReport = 0f;
         }
 
         /// <summary>
         /// Called after a normal bake completes for a zone. Derives what a ZDO-only bake would have produced
         /// for the same zone and reports the difference. Never mutates <paramref name="live"/>.
         /// </summary>
+        // ── A DIAGNOSTIC WITH NO COST CEILING DROPPED THE NETWORK CONNECTION ──────────────────────────────
+        // MEASURED 2026-09-26. The first version ran on EVERY fresh bake with no throttle. A fresh bake happens
+        // dozens of times during a join, and each verify walks a radius query of ~70,000 ZDOs doing a
+        // ZoneSystem.GetZone plus a SkipEligibility lookup each. The client's ZNet.RPC_PeerInfo went from
+        // unmeasurable to 7,060 ms and the join collapsed into a connect/disconnect loop:
+        //     07:50:48 Connected -> 07:51:00 Lost connection: ErrorDisconnected
+        //     07:52:04 Connected -> 07:52:13 Lost connection: ErrorDisconnected
+        // Nothing ever walked. Bisected against the same dedi process by flipping only this setting: ON gave
+        // 4+ disconnects and zero movement, OFF gave one connect, zero disconnects and a walking route.
+        //
+        // The dedi was healthy throughout (RPC_PeerInfo 525 ms), so this was entirely self-inflicted on the
+        // client. Being measurement-only and default-off is what hid it: correctness got reviewed and cost
+        // never did. So the ceiling is structural now rather than advisory.
+        //
+        //   - NOT UNTIL THE WORLD IS UP. No verifying before the local player exists, which is what keeps it
+        //     off the join entirely - the join is precisely when fresh bakes come in bulk.
+        //   - ONE ZONE PER INTERVAL, whatever the bake rate. A traverse produces plenty of zones over minutes;
+        //     it does not need every one, and sampling cannot stall a frame budget.
+        private const float MinSecondsBetweenVerifies = 3f;
+        private static float s_nextVerify;
+
         internal static void Verify(Vector2s coord, MeshBaker.BakeResult live)
         {
             if (!FiresEasyBakeMeshesPlugin.ZdoBakeVerifyEnabled.Value) return;
             if (live == null || live.PieceTransforms == null) return;
+
+            // Join-time bakes are the expensive ones and the ones that broke the connection; skip them outright.
+            if (Player.m_localPlayer == null) return;
+
+            float now = Time.unscaledTime;
+            if (now < s_nextVerify) return;
+            s_nextVerify = now + MinSecondsBetweenVerifies;
 
             var derived = DeriveFromZdos(coord);
             if (derived == null) return;

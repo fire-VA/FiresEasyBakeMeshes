@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.67";
+        public const string PluginVersion = "1.2.68";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;

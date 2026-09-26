@@ -779,11 +779,25 @@ namespace FiresEasyBakeMeshes.EasyBake
         // that returns null as an invalid prefab and destroys the ZDO.
         internal static bool SkipCreationActive()
         {
-            return FiresEasyBakeMeshesPlugin.SkipBakedPieceObjects != null
-                && FiresEasyBakeMeshesPlugin.SkipBakedPieceObjects.Value
-                && FiresEasyBakeMeshesPlugin.BatchingActive()
-                && ZNet.instance != null
-                && !ZNet.instance.IsServer();
+            if (FiresEasyBakeMeshesPlugin.SkipBakedPieceObjects == null
+                || !FiresEasyBakeMeshesPlugin.SkipBakedPieceObjects.Value
+                || !FiresEasyBakeMeshesPlugin.BatchingActive()
+                || ZNet.instance == null) return false;
+
+            // ── SINGLE PLAYER IS NOT ARCHITECTURALLY DIFFERENT, IT IS THE SAME PROCESS ───────────────────
+            // A joined client skips; a host or single-player world did not, and the stated reason - "server" -
+            // was never the real one. EBM draws and decides entirely client-side; what differs on a host is
+            // only that the SAME process also owns the ZDOs, so vanilla's destroy-on-null error path is live
+            // in the call we intercept. ConsumeJustSkipped + the DestroyZDO prefix close that, so the gate
+            // becomes a question about SIMULATION, not about being a server.
+            //
+            // The remaining honest unknown is wear/support. On a dedicated server the SERVER owns WearNTear
+            // and still holds every object; on a host the host owns it and would be missing the skipped ones.
+            // Only invulnerable pieces are skipped by default, which do not take damage, but whether they are
+            // load-bearing for their neighbours is UNTESTED. So hosts are opt-in until somebody measures it on
+            // a throwaway world - not off because it cannot work.
+            if (!ZNet.instance.IsServer()) return true;
+            return FiresEasyBakeMeshesPlugin.SkipOnHost != null && FiresEasyBakeMeshesPlugin.SkipOnHost.Value;
         }
 
         // ZNetScene.CreateObject prefix. True means the piece stays uncreated: its cached bake draws it and its
@@ -832,6 +846,34 @@ namespace FiresEasyBakeMeshes.EasyBake
             BindDamageProxy(state, identity, zdo, info);
             state.LastChangeUnscaledTime = Time.unscaledTime;
             s_skippedAtCreation++;
+
+            // ── WHY A SKIP HAS TO ANNOUNCE ITSELF TO THE DESTROY PATH ────────────────────────────────────
+            // We signal a skip by returning null from ZNetScene.CreateObject. Vanilla's CreateObjectsSorted
+            // reads that null as "invalid prefab" and, WHEN IsServer(), deletes the object from the world:
+            //
+            //     else if (ZNet.instance.IsServer())
+            //     { zdo.SetOwner(...); ZLog.Log("Destroyed invalid prefab ZDO:" + zdo.m_uid);
+            //       ZDOMan.instance.DestroyZDO(zdo); }
+            //
+            // That is the ONLY reason skipping was client-only: our signal collides with vanilla's error path,
+            // and on a host the two are the same process. It is not a property of the optimisation.
+            //
+            // So the skip hands the ZDO forward as a ONE-SHOT, consumed by the DestroyZDO prefix that runs
+            // immediately afterwards in the same loop iteration. One-shot rather than a set membership test on
+            // purpose: a stale entry here would BLOCK A REAL DELETION, and a piece that refuses to die is a
+            // worse bug than one that is drawn twice. Nothing else can reach it - the destroy is the very next
+            // statement after the null return.
+            s_justSkippedForCreate = zdo;
+            return true;
+        }
+
+        private static ZDO s_justSkippedForCreate;
+
+        /// <summary>Consumes the one-shot skip signal. Returns true only for the ZDO we just declined to create.</summary>
+        internal static bool ConsumeJustSkipped(ZDO zdo)
+        {
+            if (!ReferenceEquals(zdo, s_justSkippedForCreate)) return false;
+            s_justSkippedForCreate = null;
             return true;
         }
 

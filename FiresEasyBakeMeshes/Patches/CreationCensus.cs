@@ -143,5 +143,90 @@ namespace FiresEasyBakeMeshes.Patches
             s_budgetSum = 0; s_budgetSamples = 0;
             s_byPrefab.Clear();
         }
+
+        // ═══ WHY THE QUEUE NEVER EMPTIES — BY REASON, NOT BY THEORY ═══════════════════════════════════════════
+        // Measured in town, 2026-09-26:
+        //     walk 1,912 ms of up to 107,306 near
+        //     sort+create 5,357 ms of up to 24,187 candidate(s), 20,480 created
+        //     budget held back 454 of 512 pass(es) (asked up to 241, allowed 40)
+        // 20,480 over 512 passes is exactly 40/pass — the cap, every pass — with the queue parked at 24,187. It
+        // is a treadmill, not a backlog, and every frame it survives pays the full walk, the full O(n log n)
+        // sort, and a CreateObject call per entry.
+        //
+        // I have now reached the wrong cause twice from reading code alone. First I concluded EBM's skip left
+        // ZDOs uncreated forever; ZoneTracker sets zdo.Created on that path, so no. Then I concluded they were
+        // prefabs missing from this stack, which the comment at the top of this file had already measured — but
+        // vanilla logs "Missing prefab hash" on exactly that path and this run has ZERO of them (Unity capture
+        // verified live with 3,260 [Unity] lines, so that is a real negative, not a broken probe).
+        //
+        // So this stops guessing. Every candidate is sorted into the reason it has no instance, straight from
+        // the same predicates vanilla and we use, and the cheapest question — does the reason even belong to
+        // us — is answered before anything is changed. Once every CandidateCensusSeconds so a 24k walk is a
+        // rounding error, and only when there is a queue worth explaining.
+        private static float s_lastBucket;
+        private static readonly Dictionary<int, int> s_stuckByPrefab = new Dictionary<int, int>();
+
+        internal static void BucketCandidates(List<ZDO> candidates)
+        {
+            if (!Active || candidates == null) return;
+            int n = candidates.Count;
+            if (n < 500) return;   // nothing to explain; the queue is draining normally
+
+            float every = FiresEasyBakeMeshesPlugin.CandidateCensusSeconds != null
+                ? FiresEasyBakeMeshesPlugin.CandidateCensusSeconds.Value : 15f;
+            if (every <= 0f) return;
+            if (Time.realtimeSinceStartup - s_lastBucket < every) return;
+            s_lastBucket = Time.realtimeSinceStartup;
+
+            var scene = ZNetScene.instance;
+            var zones = ZoneSystem.instance;
+            if (scene == null || zones == null) return;
+
+            int noPrefab = 0, absentPrefab = 0, zoneNotReady = 0, wouldSkip = 0, creatable = 0;
+            s_stuckByPrefab.Clear();
+
+            for (int i = 0; i < n; i++)
+            {
+                var zdo = candidates[i];
+                if (zdo == null) continue;
+
+                int hash = zdo.GetPrefab();
+                if (hash == 0) { noPrefab++; continue; }
+
+                // Absent from THIS client's ZNetScene: uncreatable here, and only a server ever cleans it up.
+                if (scene.GetPrefab(hash) == null)
+                {
+                    absentPrefab++;
+                    s_stuckByPrefab.TryGetValue(hash, out int a); s_stuckByPrefab[hash] = a + 1;
+                    continue;
+                }
+
+                // Vanilla's own `continue` in the create loop — it never even calls CreateObject for these.
+                if (!zones.IsZoneReadyForType(zdo.GetSector(), zdo.Type)) { zoneNotReady++; continue; }
+
+                // Ours: a piece a bake will draw, held back until the bake lands. Bounded by an expiry, so it
+                // should not accumulate — if it dominates, that expiry is not working.
+                if (EasyBake.SkipEligibility.Get(hash).Skippable) { wouldSkip++; continue; }
+
+                creatable++;
+            }
+
+            Log.Info($"[Candidates] {n:N0} ZDO(s) queued with no instance: " +
+                     $"{creatable:N0} creatable and just waiting for budget, " +
+                     $"{wouldSkip:N0} bake-skippable, " +
+                     $"{zoneNotReady:N0} in a zone not ready for their type (vanilla skips these every pass), " +
+                     $"{absentPrefab:N0} whose prefab is ABSENT from this client, " +
+                     $"{noPrefab:N0} with no prefab set.");
+
+            if (absentPrefab > 0)
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[Candidates] {s_stuckByPrefab.Count:N0} distinct ABSENT prefab hash(es) — these can NEVER be " +
+                          "created on this client and are re-offered every frame forever:");
+                foreach (var kv in s_stuckByPrefab.OrderByDescending(k => k.Value).Take(12))
+                    sb.Append($"\n    {kv.Value,7:N0}  hash {kv.Key}");
+                Log.Warn(sb.ToString());
+            }
+        }
     }
 }

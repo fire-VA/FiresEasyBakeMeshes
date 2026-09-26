@@ -113,6 +113,35 @@ namespace FiresEasyBakeMeshes.Patches
         private static AccessTools.FieldRef<ZNetScene, List<ZDO>> s_distantList;
         private static bool s_distantResolved;
 
+        // The candidate list AS THE BUDGET SEES IT. Mathf.Max is evaluated after the candidate walk, so by the time
+        // Budget() runs this list is already filled for this frame — the exact queue length the release threshold is
+        // about. Not backlog/100: that integer division throws away two digits at the sizes this decides on.
+        private static int CandidateCount()
+        {
+            if (!s_candidatesResolved)
+            {
+                s_candidatesResolved = true;
+                try { s_candidates = AccessTools.FieldRefAccess<ZNetScene, List<ZDO>>("m_tempCurrentObjects2"); }
+                catch { s_candidates = null; }
+            }
+            var scene = ZNetScene.instance;
+            if (s_candidates == null || scene == null) return 0;
+            try { var list = s_candidates(scene); return list != null ? list.Count : 0; }
+            catch { return 0; }
+        }
+
+        // The list itself, for the reason-bucket census. Same resolution as CandidateCount, no second field ref.
+        private static List<ZDO> CandidateList()
+        {
+            if (!s_candidatesResolved) { CandidateCount(); }
+            var scene = ZNetScene.instance;
+            if (s_candidates == null || scene == null) return null;
+            try { return s_candidates(scene); } catch { return null; }
+        }
+
+        private static long s_released;
+        private static int s_releasePeak;
+
         [HarmonyPostfix]
         public static void Postfix(ZNetScene __instance, int created)
         {
@@ -155,10 +184,14 @@ namespace FiresEasyBakeMeshes.Patches
                 $"SORT {sortMs:N0} ms over {s_sortCalls:N0} call(s) of up to {s_sortPeak:N0}, " +
                 $"CREATE {tailMs - sortMs:N0} ms for {s_createdSum:N0} object(s) " +
                 $"(sort+create {tailMs:N0} ms of up to {s_candPeak:N0} candidate(s))" +
-                (s_capped == 0 ? "" : $"; budget held back {s_capped:N0} pass(es) (asked up to {s_peakAsked:N0}, allowed {s_peakGiven:N0})");
+                (s_capped == 0 ? "" : $"; budget held back {s_capped:N0} pass(es) (asked up to {s_peakAsked:N0}, allowed {s_peakGiven:N0})") +
+                // Named on its own line of the status box: "held back" and "released" are opposite decisions and
+                // reading one as the other is how the cap looked harmless for a week.
+                (s_released == 0 ? "" : $"; cap RELEASED on {s_released:N0} pass(es), queue peaked at {s_releasePeak:N0}");
             s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
             s_walkTicks = 0; s_tailTicks = 0; s_nearPeak = 0; s_candPeak = 0; s_createdSum = 0;
             s_sortTicks = 0; s_sortCalls = 0; s_sortPeak = 0;
+            s_released = 0; s_releasePeak = 0;
             return status;
         }
 
@@ -249,6 +282,37 @@ namespace FiresEasyBakeMeshes.Patches
             int cap = Player.m_localPlayer == null ? 0
                     : (FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame != null
                     ? FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value : 0);
+
+            // ═══ A CEILING ON CREATES IS PAID IN SORTS, EVERY FRAME ═════════════════════════════════════════════
+            // The cap trades one frame's instantiation burst for a longer queue. That trade is only a win while the
+            // queue still drains, because the queue is re-sorted IN FULL on every frame it survives:
+            //
+            //   create an object   0.183 ms  ONCE   (settled across three worlds)
+            //   leave it queued    its share of an O(n log n) Sort  EVERY FRAME
+            //
+            // In town the queue reached 56,878 candidates. Vanilla's rule would have allowed 568 creates a frame;
+            // the cap allowed 40, and at the ~10 fps that produced, 400 objects/s is slower than a walking player
+            // queues them. So the queue never clears, the sort bill never ends, and the cap has bought a permanent
+            // per-frame sort to avoid a one-off ~10 s of creation spread over the whole visit.
+            //
+            // This is the same failure already found and fixed on the other side of spawn ("RESPAWN WAIT STUCK
+            // 142s ... 45,428 of 66,968 valid ZDO(s) have no instance"), where the answer was to let vanilla's
+            // catch-up rule run. Above the release threshold it runs here too. Held as config, not a constant, so
+            // it can be flipped live in one place and A/B'd in a single run against the same ground.
+            int release = FiresEasyBakeMeshesPlugin.CreateBudgetReleaseAbove != null
+                ? FiresEasyBakeMeshesPlugin.CreateBudgetReleaseAbove.Value : 0;
+            int queued = CandidateCount();
+
+            // Mathf.Max runs after the candidate walk, so the list is complete here and this is the one point in
+            // the frame where the queue can be explained rather than just counted. Self-throttled.
+            CreationCensus.BucketCandidates(CandidateList());
+            if (cap > 0 && release > 0 && queued > release)
+            {
+                cap = 0;
+                s_released++;
+                if (queued > s_releasePeak) s_releasePeak = queued;
+            }
+
             // 0 = off, and the cap can never pull the budget below what the game
             // itself asked for — a loading screen still gets its 100.
             int given = cap <= 0 ? vanilla : Mathf.Min(vanilla, Mathf.Max(nominal, cap));

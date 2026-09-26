@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.70";
+        public const string PluginVersion = "1.2.72";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -38,6 +38,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<bool>  BatchingExcludeTransparent;
         public static ConfigEntry<string> BatchingExcludedPrefabs;
         public static ConfigEntry<bool>  SkipBakedPieceObjects;
+        public static ConfigEntry<bool>  SkipOnHost;
         public static ConfigEntry<bool>  SkipDamageablePieces;
         public static ConfigEntry<bool>  SkipVegetation;
 
@@ -54,6 +55,8 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<bool> CachePersistEnabled;
 
         public static ConfigEntry<int>   CreateBudgetPerFrame;
+        public static ConfigEntry<int>   CreateBudgetReleaseAbove;
+        public static ConfigEntry<float> CandidateCensusSeconds;
         public static ConfigEntry<bool>  DeferCreationWhileBaking;
         public static ConfigEntry<bool>  CreationCensusEnabled;
         public static ConfigEntry<bool>  CreateDestroySkipEnabled;
@@ -222,7 +225,19 @@ namespace FiresEasyBakeMeshes
                 "invulnerable, purely structural pieces qualify; anything that crafts, stores, lights,\n" +
                 "protects, comforts or animates is always created. Real pieces come back while a build\n" +
                 "tool is out nearby, or when a skipped piece is removed, moved or loses invulnerability.\n" +
-                "Never runs on a server, host or single-player world.");
+                "On a joined client this is always allowed; for a host or single-player world see SkipOnHost.");
+
+            SkipOnHost = Config.Bind("Batching", "SkipOnHost", false,
+                "OFF by default, and NOT because skipping cannot work in single player - it can.\n" +
+                "A host renders exactly like a joined client; the only real difference is that the same\n" +
+                "process also owns the ZDOs, so vanilla's 'CreateObject returned null = invalid prefab,\n" +
+                "delete it' path is live in the call EBM intercepts. That deletion is blocked precisely\n" +
+                "(ZDOMan_DestroyZDO_SkipGuard_Patch), so it is no longer the blocker.\n" +
+                "What is UNMEASURED is wear and support: on a dedicated server the SERVER owns WearNTear\n" +
+                "and still holds every object, while a host owns it and would be missing the skipped ones.\n" +
+                "Only invulnerable pieces are skipped by default and those take no damage, but whether\n" +
+                "they are load-bearing for their neighbours has not been tested. Turn this on with a world\n" +
+                "you can afford to lose, check that nothing collapses, and report the result.");
             SkipBakedPieceObjects.SettingChanged += (_, __) =>
             {
                 if (!SkipBakedPieceObjects.Value) EasyBake.ZoneTracker.HandBackAllSkipped();
@@ -391,6 +406,37 @@ namespace FiresEasyBakeMeshes
                     "smoothly. It does not reduce total work, only how lumpy it is.\n" +
                     "0 = off (pure vanilla). Lower = smoother but slower to populate.",
                     new BepInEx.Configuration.AcceptableValueRange<int>(0, 500)));
+
+            CreateBudgetReleaseAbove = Config.Bind("Optimize", "CreateBudgetReleaseAbove", 8000,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Candidate count above which CreateBudgetPerFrame STANDS DOWN and vanilla's\n" +
+                    "own catch-up budget runs again.\n" +
+                    "\n" +
+                    "A ceiling on creates-per-frame is paid against a backlog that is re-sorted\n" +
+                    "IN FULL every frame it survives. Creating an object costs 0.183ms ONCE;\n" +
+                    "leaving it queued costs its share of an O(n log n) sort EVERY frame. In a\n" +
+                    "built-up settlement the queue reached 56,878 candidates: vanilla would have\n" +
+                    "allowed 568 creates a frame, the cap allowed 40, and at the ~10fps that\n" +
+                    "produced the drain rate was 400/s - slower than a walking player queues\n" +
+                    "them. The queue then never clears and the sort bill is permanent, which is\n" +
+                    "the opposite of what the cap is for. The same trap was already measured at\n" +
+                    "spawn (142s stuck waiting on areaReady) and fixed there by lifting the cap\n" +
+                    "until the player exists; this is the in-play half of it.\n" +
+                    "0 = never release (the cap always binds). Higher = tolerate a longer queue.",
+                    new BepInEx.Configuration.AcceptableValueRange<int>(0, 200000)));
+
+            CandidateCensusSeconds = Config.Bind("Optimize", "CandidateCensusSeconds", 15f,
+                new BepInEx.Configuration.ConfigDescription(
+                    "How often to explain the create queue, in seconds, when it is over 500 deep.\n" +
+                    "\n" +
+                    "Sorts every queued ZDO into the reason it has no instance: creatable and\n" +
+                    "waiting for budget, bake-skippable, in a zone not ready for its type\n" +
+                    "(vanilla's own skip), prefab ABSENT from this client, or no prefab set.\n" +
+                    "The queue sat at 24,187 in town and two separate readings of the code got\n" +
+                    "the reason wrong, so it is worth measuring rather than inferring. Costs one\n" +
+                    "walk of the queue per report and nothing in between.\n" +
+                    "0 = off.",
+                    new BepInEx.Configuration.AcceptableValueRange<float>(0f, 300f)));
 
             CreateDestroySkipEnabled = Config.Bind("Optimize", "CreateDestroySkipEnabled", true,
                 "Skip ZNetScene.CreateDestroyObjects when the player hasn't crossed a sector\n" +

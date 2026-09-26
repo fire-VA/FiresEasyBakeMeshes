@@ -1,6 +1,6 @@
 {
     "name":  "FiresEasyBakeMeshes",
-    "version_number":  "1.2.64",
+    "version_number":  "1.2.65",
     "website_url":  "https://github.com/fire-VA/FiresEasyBakeMeshes",
     "description":  "Big builds at normal frame rates: bakes a zone\u0027s structural pieces into combined meshes and GPU instances, and on multiplayer clients stops creating the objects a bake already draws.",
     "dependencies":  [

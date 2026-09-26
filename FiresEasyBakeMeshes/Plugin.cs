@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.64";
+        public const string PluginVersion = "1.2.65";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -89,6 +89,7 @@ namespace FiresEasyBakeMeshes
 
         public static ConfigEntry<bool>  ZSyncStaticSkipEnabled;
         public static ConfigEntry<bool>  RemoteItemZSyncSkipEnabled;
+        public static ConfigEntry<bool>  ZdoBakeVerifyEnabled;
         public static ConfigEntry<bool>  SkipUnchangedScans;
         public static ConfigEntry<bool>  ZSyncStaticSkipFixtures;
         public static ConfigEntry<bool>  ZSyncStaticSkipVerbose;
@@ -572,6 +573,24 @@ namespace FiresEasyBakeMeshes
                     "hear audio pop in/out at the edge of your hearing range. Lower for\n" +
                     "more aggressive savings.",
                     new AcceptableValueRange<float>(10f, 200f)));
+
+            ZdoBakeVerifyEnabled = Config.Bind("Optimize", "ZdoBakeVerifyEnabled", false,
+                "MEASUREMENT ONLY - changes no rendering, moves no vertex, and is off by default.\n" +
+                "\n" +
+                "Object creation is the largest single cost on a streaming client: CreateObject measured\n" +
+                "1,070 ms/s over 5,135 calls in one 2-second window, and the census says 75,089 pieces were\n" +
+                "'unloaded after creation' - created ONLY so the baker could see live pieces on a fresh zone,\n" +
+                "then thrown away.\n" +
+                "\n" +
+                "TrySkipCreation already decides entirely from a ZDO; the one thing missing on a fresh zone is\n" +
+                "that the bake has not landed. So the fix is to produce the bake from ZDOs BEFORE vanilla\n" +
+                "instantiates anything - which is what DeferCreation's own notes concluded after stalling\n" +
+                "vanilla made things worse.\n" +
+                "\n" +
+                "Turning this on derives what a ZDO-only bake WOULD have produced for each zone and reports how\n" +
+                "it differs from the real one. The number that decides whether the idea is safe is EXTRA: a\n" +
+                "piece present in the ZDO answer but absent from the live bake would be WRONGLY SKIPPED, i.e.\n" +
+                "invisible in the world. It must be 0 before any of this touches the render path.");
 
             RemoteItemZSyncSkipEnabled = Config.Bind("Optimize", "RemoteItemZSyncSkipEnabled", true,
                 "Stop lerping dropped items that are already where they belong. A REMOTE ZSyncTransform runs a\n" +

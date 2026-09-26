@@ -675,6 +675,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (state.Baked && state.Dirty) TearDown(state);
                 long tBake = Probe.Start();
                 state.Bake = MeshBaker.Bake(state.Coord, state.Pieces, state.Vegetation);
+                try { ZdoBakeVerifier.Verify(state.Coord, state.Bake); } catch { }
                 Probe.Stop("EasyBake:bake", tBake);
                 state.Baked = true;
                 state.FromCache = false;

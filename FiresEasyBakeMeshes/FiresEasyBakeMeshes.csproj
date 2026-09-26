@@ -99,6 +99,7 @@
     <Compile Include="EasyBake\PieceData.cs" />
     <Compile Include="EasyBake\SkipEligibility.cs" />
     <Compile Include="EasyBake\StandInColliders.cs" />
+    <Compile Include="EasyBake\ZdoBakeVerifier.cs" />
     <Compile Include="EasyBake\RemoteItemZSyncSkip.cs" />
     <Compile Include="Patches\SkipCreationPatches.cs" />
     <Compile Include="Patches\ClutterSystemPatches.cs" />

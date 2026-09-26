@@ -1,0 +1,159 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace FiresEasyBakeMeshes.EasyBake
+{
+    // ── PROVE THE ZDO BAKE BEFORE TRUSTING IT WITH THE RENDER PATH ───────────────────────────────────────
+    //
+    // WHY THIS EXISTS AT ALL. Object creation is the largest single cost in the game on this rig:
+    //
+    //     ZNetScene.CreateObject(per-instance)   1,070 ms/s over 5,135 calls in a 2 s streaming window
+    //     EBM census: 75,089 pieces "unloaded after creation"
+    //
+    // Those 75,089 are created ONLY so the baker can see live pieces on a fresh zone, then thrown away.
+    // TrySkipCreation already decides entirely from a ZDO - PieceIdentity.From(zdo) and
+    // SkipEligibility.ZdoMatches(zdo, ...) - and the single thing missing on a fresh zone is `state.Baked`.
+    // So the fix is not a rewrite: it is producing the bake from ZDOs at zone load, BEFORE vanilla
+    // instantiates anything. DeferCreation's own header already concluded this in writing: "the fix is to
+    // make the BAKE land before vanilla populates the zone, not to stall vanilla until it does."
+    //
+    // WHY A VERIFIER RATHER THAN JUST DOING IT. A wrong bake is invisible until someone looks at the world
+    // and sees missing or misplaced geometry, and this runs on Fire's live test rig. So this pass derives the
+    // ZDO answer alongside the real bake and REPORTS whether they agree. It writes nothing into the render
+    // path, cannot move a vertex, and is off by default.
+    //
+    // WHAT IT COMPARES. PieceTransforms is the dictionary TrySkipCreation reads to decide a piece is already
+    // drawn, so agreement on that dictionary is exactly the property the skip depends on:
+    //   - same set of PieceIdentity keys (a missing key = a piece that would be created unnecessarily;
+    //     an extra key = a piece that would be WRONGLY skipped, which is the dangerous direction)
+    //   - same Position/Rotation/Scale/Look for shared keys
+    //
+    // The known gap is MeshRenderer.HasPropertyBlock(): it is per-instance renderer state and an
+    // un-instantiated piece has none, so a ZDO bake cannot reproduce the live bake's property-block
+    // rejections. This pass counts how often that matters instead of assuming it is rare.
+    internal static class ZdoBakeVerifier
+    {
+        private static int s_zones;
+        private static int s_keysLive;
+        private static int s_keysZdo;
+        private static int s_missingFromZdo;
+        private static int s_extraInZdo;
+        private static int s_posMismatch;
+        private static int s_lookMismatch;
+        private static float s_worstPosDelta;
+
+        internal static void Reset()
+        {
+            s_zones = 0; s_keysLive = 0; s_keysZdo = 0;
+            s_missingFromZdo = 0; s_extraInZdo = 0;
+            s_posMismatch = 0; s_lookMismatch = 0; s_worstPosDelta = 0f;
+        }
+
+        /// <summary>
+        /// Called after a normal bake completes for a zone. Derives what a ZDO-only bake would have produced
+        /// for the same zone and reports the difference. Never mutates <paramref name="live"/>.
+        /// </summary>
+        internal static void Verify(Vector2s coord, MeshBaker.BakeResult live)
+        {
+            if (!FiresEasyBakeMeshesPlugin.ZdoBakeVerifyEnabled.Value) return;
+            if (live == null || live.PieceTransforms == null) return;
+
+            var derived = DeriveFromZdos(coord);
+            if (derived == null) return;
+
+            s_zones++;
+            s_keysLive += live.PieceTransforms.Count;
+            s_keysZdo += derived.Count;
+
+            foreach (var kv in live.PieceTransforms)
+            {
+                if (!derived.TryGetValue(kv.Key, out var mine)) { s_missingFromZdo++; continue; }
+
+                float d = (mine.Position - kv.Value.Position).magnitude;
+                if (d > 0.01f)
+                {
+                    s_posMismatch++;
+                    if (d > s_worstPosDelta) s_worstPosDelta = d;
+                }
+                if (!mine.Look.Equals(kv.Value.Look)) s_lookMismatch++;
+            }
+
+            foreach (var kv in derived)
+                if (!live.PieceTransforms.ContainsKey(kv.Key)) s_extraInZdo++;
+
+            Report();
+        }
+
+        /// <summary>
+        /// The whole point: build PieceTransforms for a zone from ZDOs alone, with nothing instantiated.
+        /// Mirrors the live bake's eligibility so a difference means a real difference, not a different filter.
+        /// </summary>
+        private static Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform> DeriveFromZdos(Vector2s coord)
+        {
+            var zdoMan = ZDOMan.instance;
+            var znet = ZNet.instance;
+            var scene = ZNetScene.instance;
+            if (zdoMan == null || znet == null || scene == null) return null;
+
+            var sector = new List<ZDO>();
+            var distant = new List<ZDO>();
+            try
+            {
+                // Public on ZDOMan, and the reason a ZDO-driven bake is reachable at all: every ZDO in the
+                // zone, with nothing instantiated.
+                zdoMan.FindSectorObjects(coord, ZNet.instance.GetSyncedSimulationDistance(), sector, distant);
+            }
+            catch { return null; }
+
+            var map = new Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform>(sector.Count);
+            for (int i = 0; i < sector.Count; i++)
+            {
+                var zdo = sector[i];
+                if (zdo == null) continue;
+
+                int prefabHash = zdo.GetPrefab();
+                if (prefabHash == 0) continue;
+
+                var info = SkipEligibility.Get(prefabHash);
+                if (!info.Skippable) continue;
+
+                // Same "cannot be drawn by a bake" test the live path applies, and it reads only the ZDO.
+                if (PieceData.MustStayLive(zdo, prefabHash)) continue;
+
+                var identity = MeshBaker.PieceIdentity.From(zdo);
+                map[identity] = new MeshBaker.PieceTransform
+                {
+                    Position = zdo.GetPosition(),
+                    Rotation = zdo.GetRotation(),
+                    Scale = ScaleOf(zdo),
+                    Look = MeshBaker.LookOf(zdo),
+                };
+            }
+            return map;
+        }
+
+        // ZNetView writes the instance scale into the ZDO (ZDOVars.s_scaleHash) and reads it back on create,
+        // so a uniformly scaled piece is recoverable; anything that never wrote one is scale 1.
+        private static Vector3 ScaleOf(ZDO zdo)
+        {
+            var s = zdo.GetVec3(ZDOVars.s_scaleHash, Vector3.one);
+            return s == Vector3.zero ? Vector3.one : s;
+        }
+
+        private static float s_nextReport;
+
+        private static void Report()
+        {
+            float now = Time.unscaledTime;
+            if (now < s_nextReport) return;
+            s_nextReport = now + 30f;
+
+            EasyBakeLog.Info(
+                $"ZDO-bake verify over {s_zones} zone(s): live {s_keysLive} piece(s), ZDO-derived {s_keysZdo}. "
+                + $"MISSING from the ZDO answer {s_missingFromZdo} (those would still be created), "
+                + $"EXTRA in it {s_extraInZdo} (those would be WRONGLY skipped - this is the dangerous number), "
+                + $"position mismatches {s_posMismatch} (worst {s_worstPosDelta:0.000} m), "
+                + $"wear-look mismatches {s_lookMismatch}. A ZDO bake is only safe to trust when EXTRA is 0.");
+        }
+    }
+}

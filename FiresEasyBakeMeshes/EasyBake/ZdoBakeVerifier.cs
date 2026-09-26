@@ -11,11 +11,22 @@ namespace FiresEasyBakeMeshes.EasyBake
     //     EBM census: 75,089 pieces "unloaded after creation"
     //
     // Those 75,089 are created ONLY so the baker can see live pieces on a fresh zone, then thrown away.
-    // TrySkipCreation already decides entirely from a ZDO - PieceIdentity.From(zdo) and
-    // SkipEligibility.ZdoMatches(zdo, ...) - and the single thing missing on a fresh zone is `state.Baked`.
-    // So the fix is not a rewrite: it is producing the bake from ZDOs at zone load, BEFORE vanilla
-    // instantiates anything. DeferCreation's own header already concluded this in writing: "the fix is to
-    // make the BAKE land before vanilla populates the zone, not to stall vanilla until it does."
+    //
+    // ── THE PREMISE THIS FILE WAS WRITTEN ON IS WRONG, AND THIS PASS IS WHAT PROVED IT ────────────────
+    // It used to say: "TrySkipCreation already decides entirely from a ZDO, and the single thing missing on a
+    // fresh zone is state.Baked." MEASURED 2026-09-26 with the radius filter correct and the transforms agreeing
+    // exactly (position mismatches 0, wear-look mismatches 0): live 25,830 pieces, ZDO-derived 38,824,
+    // EXTRA 16,766. The ZDO DATA is exact; the SET is not.
+    //
+    // The reason is MeshBaker.cs:395 - a piece enters PieceTransforms only when `FullyCovered && AnyContribution`
+    // (or when it draws nothing). FullyCovered is a POST-COMBINE property: it depends on which material groups
+    // cleared MinPiecesPerBatch / MinInstancesPerPrefab across the whole zone, on transparency exclusion, and on
+    // per-renderer mesh validity. A ZDO cannot answer it. So a fresh zone is missing the bake's RESULT, not a flag.
+    //
+    // Deriving that result means reimplementing the coverage decision, and a divergence there does not fail
+    // loudly - it marks a piece as already-drawn that nothing draws, i.e. an invisible building. The safe path
+    // is to LEARN per-prefab coverage from real bakes and skip only prefabs with a proven 100% record; see
+    // Tools\OPTIMIZATION_OWNERSHIP.md. Keep EXTRA as the gate either way.
     //
     // WHY A VERIFIER RATHER THAN JUST DOING IT. A wrong bake is invisible until someone looks at the world
     // and sees missing or misplaced geometry, and this runs on Fire's live test rig. So this pass derives the

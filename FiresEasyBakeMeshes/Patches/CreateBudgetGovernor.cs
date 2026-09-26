@@ -195,8 +195,21 @@ namespace FiresEasyBakeMeshes.Patches
             s_frames++;
             if (backlogScaled > s_peakAsked) s_peakAsked = backlogScaled;
 
-            int cap = FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame != null
-                    ? FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value : 0;
+            // ═══ NO CAP BEFORE THE PLAYER EXISTS, 2026-09-25 ════════════════════════════════════════════════════
+            // The cap exists to stop a 240-object frame landing as a 122 ms stall while someone is PLAYING. Before
+            // the player is spawned there is no frame to protect - and the cap is actively harmful there, because
+            // Game.Start will not spawn until ZNetScene.IsAreaReady, and IsAreaReady wants an instance for every
+            // object around the logout point.
+            //
+            // Measured: "RESPAWN WAIT STUCK 142s after Game.Start - waiting on logoutPoint ... areaReady=False"
+            // with "[AreaReady] BLOCKED - 45,428 of 66,968 valid ZDO(s) have no instance". At a cap of 40 and
+            // ~20 fps that backlog needs 57 seconds of pure draining before the spawn can even begin; vanilla's
+            // own backlog rule would have allowed 454 a frame precisely so a dense area fills fast.
+            //
+            // So the cap is lifted until Player.m_localPlayer exists, which is exactly the spawn-in window.
+            int cap = Player.m_localPlayer == null ? 0
+                    : (FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame != null
+                    ? FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value : 0);
             // 0 = off, and the cap can never pull the budget below what the game
             // itself asked for — a loading screen still gets its 100.
             int given = cap <= 0 ? vanilla : Mathf.Min(vanilla, Mathf.Max(nominal, cap));

@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
@@ -36,6 +37,39 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Queue<ZDO> _destroyQueue = new Queue<ZDO>();
         private static readonly HashSet<ZDO> _inQueue = new HashSet<ZDO>();
         private static readonly Stopwatch _sw = new Stopwatch();
+
+        // Reused every tick. This runs inside CreateDestroyObjects, so allocating here would trade a CPU spike
+        // for a GC one. _leavingSectors is a snapshot because the drain below removes instances from the mirror,
+        // which would invalidate an enumerator over its keys.
+        private static readonly HashSet<Vector2s> _loadedZones = new HashSet<Vector2s>();
+        private static readonly List<Vector2s> _leavingSectors = new List<Vector2s>();
+
+        private static FieldInfo s_zonesField;
+        private static bool s_zonesFieldChecked;
+
+        // ZoneSystem.m_zones is private. Returns false when it cannot be read, so the caller falls back to the
+        // full walk rather than silently treating every sector as leaving - which would destroy the world.
+        private static bool TryCollectLoadedZones()
+        {
+            var zoneSystem = ZoneSystem.instance;
+            if (zoneSystem == null) return false;
+
+            if (!s_zonesFieldChecked)
+            {
+                s_zonesField = typeof(ZoneSystem).GetField("m_zones", BindingFlags.NonPublic | BindingFlags.Instance);
+                s_zonesFieldChecked = true;
+                if (s_zonesField == null)
+                    EasyBakeLog.Warn("[DestroySlicer] ZoneSystem.m_zones not found; the destroy scan stays on the full walk.");
+            }
+            if (s_zonesField == null) return false;
+
+            if (!(s_zonesField.GetValue(zoneSystem) is IDictionary zones) || zones.Count == 0) return false;
+
+            _loadedZones.Clear();
+            foreach (var key in zones.Keys) _loadedZones.Add((Vector2s)key);
+            return true;
+        }
+
 
         private static Vector2s CurrentZone()
         {
@@ -87,16 +121,59 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < distant.Count; i++)
                 distant[i].TempRemoveEarmark = num;
 
-            // Step 2: scan m_instances; enqueue new unearmarked ZDOs.
-            // HashSet dedupes against ZDOs already queued in previous ticks.
+            // Step 2: enqueue un-earmarked ZDOs. HashSet dedupes against ZDOs already queued on previous ticks.
+            //
+            // The full m_instances walk is the zone-border spike, and the time budget below never covered it
+            // (_sw.Restart runs after). ScanGate skips most ticks but cannot skip a border crossing, so the walk
+            // lands on the worst frame: 4.4 ms at 48k instances on the dedi client, 56.6 ms/s at 136,688 in
+            // single player.
+            //
+            // A sector with a LOADED ZONE keeps its instances, so only sectors without one can be leaving.
+            // SectorInstanceMirror indexes instances by sector, and the active set comes from ZoneSystem's loaded
+            // zones - 137 of them on the measured world.
+            //
+            // THE ACTIVE SET MUST COME FROM SOMETHING SMALL. Taking it from the near/distant ZDO lists instead
+            // cost a GetSector() and a hash insert per ZDO, and `near` reaches 74,929 at a border: that version
+            // made the worst call 4.37 -> 19.35 ms and was reverted. Loaded zones are O(137), read once a tick.
+            //
+            // Using loaded zones is deliberately CONSERVATIVE: a zone still loaded keeps its objects, so the
+            // worst case is sparing something a moment longer, never destroying something that should live. The
+            // mirror also records a sector at ADD time, so a moved instance is stale until the next rebuild -
+            // hence the full walk whenever the mirror asks for one.
             int enqueuedThisTick = 0;
-            foreach (var kv in instances)
+            bool useIndex = SectorInstanceMirror.HasData
+                            && !SectorInstanceMirror.ConsumeFullScanRequest()
+                            && TryCollectLoadedZones();
+
+            if (useIndex)
             {
-                var zdo = kv.Key;
-                if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                _leavingSectors.Clear();
+                foreach (var sector in SectorInstanceMirror.Sectors)
+                    if (!_loadedZones.Contains(sector)) _leavingSectors.Add(sector);
+
+                for (int i = 0; i < _leavingSectors.Count; i++)
                 {
-                    _destroyQueue.Enqueue(zdo);
-                    enqueuedThisTick++;
+                    if (!SectorInstanceMirror.TryGetSectorZdos(_leavingSectors[i], out var leaving)) continue;
+                    foreach (var zdo in leaving)
+                    {
+                        if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                        {
+                            _destroyQueue.Enqueue(zdo);
+                            enqueuedThisTick++;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                foreach (var kv in instances)
+                {
+                    var zdo = kv.Key;
+                    if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                    {
+                        _destroyQueue.Enqueue(zdo);
+                        enqueuedThisTick++;
+                    }
                 }
             }
             // What this scan found is exactly what a skip would have missed, so it is the audit's answer.

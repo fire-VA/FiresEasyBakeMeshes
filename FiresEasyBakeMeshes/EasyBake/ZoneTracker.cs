@@ -13,6 +13,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             public Vector2s Coord;
             public HashSet<WearNTear> Pieces = new HashSet<WearNTear>();
+            // Trees, shrubs and bushes in this zone. Kept apart from Pieces because they have no WearNTear and
+            // none of what the piece path reads from one: no wear look, no support, no invulnerability question.
+            public readonly HashSet<ZNetView> Vegetation = new HashSet<ZNetView>();
             public float LastChangeUnscaledTime;
             public float ConstructedUnscaledTime;
             public bool Baked;
@@ -115,6 +118,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_standInsOnDemand;
         private static int s_standInZonesReused;
         private static int s_handedBackForBuilding;
+        private static int s_handedBackForDamage;
         private static int s_handedBackForChanges;
         private static int s_handedBackLooks;
         private static int s_joinedLate;
@@ -126,11 +130,34 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly List<ZDO> _handBackScratch = new List<ZDO>();
         private static Vector3 s_sortReference;
 
+        private static void OnVegetationCreated(GameObject go)
+        {
+            if (!FiresEasyBakeMeshesPlugin.SkipVegetation.Value) return;
+            if (!VegetationInstancing.IsSkipCandidate(VegetationInstancing.KindOf(go))) return;
+
+            var view = go.GetComponent<ZNetView>();
+            if (view == null || view.GetZDO() == null) return;
+
+            var coord = ZoneSystem.GetZone(go.transform.position);
+            if (!_zones.TryGetValue(coord, out var state))
+            {
+                state = new ZoneState { Coord = coord, ConstructedUnscaledTime = Time.unscaledTime };
+                _zones.Add(coord, state);
+            }
+            if (!state.Vegetation.Add(view)) return;
+
+            // Deliberately NOT marked dirty. A dirty baked zone is torn down and rebaked, and vegetation streams in
+            // by the hundred, so dirtying here would rebake a forest zone once per tree. A zone that has not baked
+            // yet does not need the flag - it bakes on its own once LastChangeUnscaledTime settles - and one that
+            // already has keeps this tree real until something else rebakes it.
+            state.LastChangeUnscaledTime = Time.unscaledTime;
+        }
+
         public static void OnInstanceCreated(GameObject go)
         {
             if (go == null) return;
             var wnt = go.GetComponent<WearNTear>();
-            if (wnt == null) return;
+            if (wnt == null) { OnVegetationCreated(go); return; }
             bool invulnerable = InvulnerableClassifier.IsInvulnerable(wnt);
             if (!invulnerable && !FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value) return;
             if (HasBakeUnsafeComponent(go)) return;
@@ -221,9 +248,13 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             group.AddLate(wnt.transform.localToWorldMatrix, identity);
             state.Bake.ContributorIdentities.Add(identity);
-            if (invulnerable) state.Bake.PieceTransforms[identity] = MeshBaker.PieceTransform.From(wnt.transform, look);
+            // Both of these were gated on invulnerability, and both have to widen together or a late-joining
+            // damageable piece gets half the treatment: a transform with nothing queued to use it, or a queue
+            // entry ZdoMatches must refuse for want of a transform.
+            bool skippableHere = invulnerable || SkipEligibility.DamageableSkipAllowed;
+            if (skippableHere) state.Bake.PieceTransforms[identity] = MeshBaker.PieceTransform.From(wnt.transform, look);
             MeshBaker.DisableForCacheHit(wnt.gameObject, state.Bake);
-            if (invulnerable && SkipCreationActive()) state.ConvertQueue.Enqueue(wnt);
+            if (skippableHere && SkipCreationActive()) state.ConvertQueue.Enqueue(wnt);
             state.CacheStale = true;
             s_joinedLate++;
         }
@@ -643,7 +674,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 if (state.Baked && state.Dirty) TearDown(state);
                 long tBake = Probe.Start();
-                state.Bake = MeshBaker.Bake(state.Coord, state.Pieces);
+                state.Bake = MeshBaker.Bake(state.Coord, state.Pieces, state.Vegetation);
                 Probe.Stop("EasyBake:bake", tBake);
                 state.Baked = true;
                 state.FromCache = false;
@@ -732,7 +763,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_standInTicks = 0;
             s_standInsOnDemand = 0;
             s_standInZonesReused = 0;
-            s_handedBackForBuilding = 0;
+            s_handedBackForBuilding = 0; s_handedBackForDamage = 0;
             s_handedBackForChanges = 0;
             s_handedBackLooks = 0;
             s_joinedLate = 0;
@@ -797,6 +828,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             zdo.Created = true;
             state.Skipped[zdo] = new SkippedPiece(zdo, identity);
+            BindDamageProxy(state, identity, zdo, info);
             state.LastChangeUnscaledTime = Time.unscaledTime;
             s_skippedAtCreation++;
             return true;
@@ -840,9 +872,66 @@ namespace FiresEasyBakeMeshes.EasyBake
             return false;
         }
 
-        private static bool IsSkipped(ZDO zdo)
+        // ═══ ONLY A PIECE THAT CAN BE HURT GETS A DAMAGE PROXY ════════════════
+        // An invulnerable stand-in is left exactly as it is, on purpose. Giving it an IDestructible would change
+        // what a weapon swing finds on something that has always answered "nothing here" - a behaviour change
+        // for the pieces this mod has been skipping all along, in service of a feature they take no part in.
+        //
+        // For the ones that CAN be hurt, the proxy goes on the object StandInColliders.Build returned, which is
+        // the collider itself for a single-collider piece and the holder for a multi-collider one. Both resolve,
+        // because Projectile.FindHitObject looks with GetComponentInParent<IDestructible>() and then
+        // GetComponent<IDestructible>() on what that found.
+        private static void BindDamageProxy(ZoneState state, MeshBaker.PieceIdentity identity, ZDO zdo, SkipEligibility.PrefabInfo info)
+        {
+            if (info == null || info.AllImmune) return;
+            if (!state.StandIns.TryGetValue(identity, out var standIn) || standIn == null) return;
+            StandInDamageBinding.Bind(standIn, zdo);
+        }
+
+        internal static bool IsSkipped(ZDO zdo)
         {
             return _zones.TryGetValue(ZoneSystem.GetZone(zdo.GetPosition()), out var state) && state.Skipped.ContainsKey(zdo);
+        }
+
+        // ═══ BRING BACK ONE PIECE, BECAUSE SOMETHING IS ABOUT TO DAMAGE IT ════
+        // Damage is owner-authoritative: WearNTear.Damage only routes, and RPC_Damage returns unless
+        // m_nview.IsOwner(). When THIS client owns a piece it never created, the owner-side handler does not
+        // exist, and ZRoutedRpc.HandleRoutedRPC drops the call with no else branch and no log line. So the
+        // instance has to exist before the hit can be replayed into it - see DamageReplay.
+        //
+        // ONE piece, not a neighbourhood. HoldRealPiecesNear(radius) is the build-tool path and would pull in
+        // every piece within reach; a hit needs exactly its own target, and support propagation is the OWNER's
+        // job for everything else - on a dedi the server already has the neighbours live.
+        //
+        // Returns false when the ZDO is not one EBM is holding back, which is the important half: a routed RPC
+        // for a missing instance is a thing that happens in vanilla for its own reasons, and claiming those
+        // would be masking somebody else's behaviour.
+        internal static bool MaterialiseForDamage(ZDO zdo, float holdSeconds)
+        {
+            if (zdo == null) return false;
+            if (!_zones.TryGetValue(ZoneSystem.GetZone(zdo.GetPosition()), out var state)) return false;
+            if (!state.Skipped.TryGetValue(zdo, out var skipped)) return false;
+
+            state.HoldReal = true;
+            state.HoldRealUntil = Mathf.Max(state.HoldRealUntil, Time.unscaledTime + holdSeconds);
+
+            // A whole-zone hand-back in flight drops EVERY stand-in when it lands, so it keeps no identity
+            // list; adding one here would make it drop only this piece's stand-in instead of all of them.
+            bool wholeZoneInFlight = state.AwaitingRecreate != null && state.AwaitingIdentities == null;
+            if (state.AwaitingRecreate == null)
+            {
+                state.AwaitingRecreate = new List<ZDO>(1);
+                state.AwaitingIdentities = new List<MeshBaker.PieceIdentity>(1);
+                state.AwaitingSince = Time.unscaledTime;
+            }
+
+            zdo.Created = false;                 // vanilla's budgeted CreateDestroyObjects picks it up again
+            state.AwaitingRecreate.Add(zdo);
+            if (!wholeZoneInFlight) state.AwaitingIdentities.Add(skipped.Identity);
+            state.Skipped.Remove(zdo);
+            s_handedBackForDamage++;
+            state.LastChangeUnscaledTime = Time.unscaledTime;
+            return true;
         }
 
         // The config was switched off: every skipped piece goes back to vanilla.
@@ -953,7 +1042,15 @@ namespace FiresEasyBakeMeshes.EasyBake
             state.ConvertQueue.Clear();
             foreach (var piece in state.Pieces)
             {
-                if (piece == null || !InvulnerableClassifier.IsInvulnerable(piece)) continue;
+                // THIS FILTER IS THE SECOND SKIP GATE, and missing it makes SkipDamageablePieces look like it
+                // barely works. There are two ways into the skip: TrySkipAtCreation, for a piece whose zone was
+                // already baked when it arrived, and this queue, for a piece that was ALREADY LIVE when its
+                // zone baked. In a town the pieces stream in before their zone settles, so the second path
+                // carries most of them - filtering it to invulnerable only would leave every damageable piece
+                // that predates its bake live forever, whatever ZdoMatches says. The queue only proposes;
+                // ZdoMatches still decides, so widening it cannot skip anything ineligible.
+                if (piece == null) continue;
+                if (!InvulnerableClassifier.IsInvulnerable(piece) && !SkipEligibility.DamageableSkipAllowed) continue;
                 if (state.Bake.ContributorIdentities.Contains(MeshBaker.PieceIdentity.From(piece.gameObject, piece.transform.position)))
                     state.ConvertQueue.Enqueue(piece);
             }
@@ -1043,13 +1140,14 @@ namespace FiresEasyBakeMeshes.EasyBake
                     Object.Destroy(wnt.gameObject);
                     zdo.Created = true;
                     state.Skipped[zdo] = new SkippedPiece(zdo, identity);
+                    BindDamageProxy(state, identity, zdo, info);
                     s_convertedLive++;
                     if (state.FromCache) s_convertedOnCached++; else s_convertedOnFresh++;
                 }
             }
         }
 
-        private static Dictionary<ZDO, ZNetView> SceneInstances()
+        internal static Dictionary<ZDO, ZNetView> SceneInstances()
         {
             var scene = ZNetScene.instance;
             if (scene == null) return null;
@@ -1333,7 +1431,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (now < s_nextSkipReport) return;
             s_nextSkipReport = now + SkipReportSeconds;
-            int total = s_skippedAtCreation + s_convertedLive + s_handedBackForBuilding + s_handedBackForChanges + s_standInZonesReused + s_handedBackLooks + s_joinedLate;
+            int total = s_skippedAtCreation + s_convertedLive + s_handedBackForBuilding + s_handedBackForDamage + s_handedBackForChanges + s_standInZonesReused + s_handedBackLooks + s_joinedLate;
             if (total == s_lastReportedTotal) return;
             s_lastReportedTotal = total;
 
@@ -1368,12 +1466,15 @@ namespace FiresEasyBakeMeshes.EasyBake
                 $"creation, {s_deferredForBake} held for a pending bake, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built in {standInSeconds:F1} s " +
                 $"({microsPerCollider:F0} microseconds each; {s_standInsOnDemand} " +
                 $"built as their pieces arrived, {s_standInZonesReused} zone revisits reused theirs); real pieces " +
-                $"brought back: {s_handedBackForBuilding} for build tools, {s_handedBackForChanges} for removals or changes; " +
+                $"brought back: {s_handedBackForBuilding} for build tools, {s_handedBackForDamage} for incoming damage, {s_handedBackForChanges} for removals or changes; " +
                 $"{s_handedBackLooks} instanced pieces went back to drawing themselves after damage, a look change, burning or a hammer highlight; " +
                 $"{s_joinedLate} pieces that arrived after their zone baked joined its instanced groups.");
 
             string data = PieceData.Report();
             if (data != null) EasyBakeLog.Info(data);
+
+            string damage = DamageReplay.Report();
+            if (damage != null) EasyBakeLog.Info(damage);
         }
 
         // ebm_census: every object this client created, grouped by the first reason it was not skipped, with the prefabs
@@ -1450,7 +1551,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return "building pieces in a zone with no bake (too few pieces, or still settling)";
             var identity = MeshBaker.PieceIdentity.From(zdo);
             bool contributor = state.Bake.ContributorIdentities != null && state.Bake.ContributorIdentities.Contains(identity);
-            if (!invulnerable)
+            // With SkipDamageablePieces on, "kept live on purpose" is a LIE for a damageable contributor: it is
+            // no longer kept live on purpose, it is still live for some reason the mismatch analysis below can
+            // name. Falling through is what makes arm B readable - otherwise every damageable piece that failed
+            // to skip reports as an intentional decision and the reason it actually failed is invisible.
+            if (!invulnerable && !(contributor && SkipEligibility.DamageableSkipAllowed))
                 return contributor
                     ? "damageable pieces drawn by the bake (kept live on purpose, for wear, support and raids)"
                     : "damageable pieces the bake does not draw, " + WhyDamageableNotDrawn(state, zdo, wnt);

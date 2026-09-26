@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.64";
+        public const string PluginVersion = "1.2.62";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -88,11 +88,9 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<float> ZSFXLodDistance;
 
         public static ConfigEntry<bool>  ZSyncStaticSkipEnabled;
-        public static ConfigEntry<bool>  RemoteItemZSyncSkipEnabled;
         public static ConfigEntry<bool>  SkipUnchangedScans;
         public static ConfigEntry<bool>  ZSyncStaticSkipFixtures;
         public static ConfigEntry<bool>  ZSyncStaticSkipVerbose;
-        public static ConfigEntry<bool>  EffectAreaIdleSkipEnabled;
 
         public static ConfigEntry<bool>  ClutterLodEnabled;
         public static ConfigEntry<float> ClutterLodMoveThreshold;
@@ -573,21 +571,6 @@ namespace FiresEasyBakeMeshes
                     "more aggressive savings.",
                     new AcceptableValueRange<float>(10f, 200f)));
 
-            RemoteItemZSyncSkipEnabled = Config.Bind("Optimize", "RemoteItemZSyncSkipEnabled", true,
-                "Stop lerping dropped items that are already where they belong. A REMOTE ZSyncTransform runs a\n" +
-                "full distance check plus lerp every FixedUpdate for the whole session, even on an object that\n" +
-                "has not moved since it landed.\n" +
-                "\n" +
-                "Measured on the Iso rig: 412 ZSyncTransform instances, 308 owned (which exit immediately) and\n" +
-                "104 REMOTE carrying 103-109 ms/s between them. The census named them: 52 MeadStrength,\n" +
-                "26 QueensJam, 18 Fish1, 18 Pukeberries, 17 Blueberries. Dropped items and fish - not building\n" +
-                "pieces, which is why ZSyncStaticSkip never sees them (it requires a Piece component).\n" +
-                "\n" +
-                "Unlike the piece skip this cannot be cached per prefab: the same item is ineligible while it is\n" +
-                "still tumbling and eligible once it settles. A slow sweep re-checks instead, and REVERSES the\n" +
-                "moment the owner moves it - so the worst case is one sweep interval of staleness on an object\n" +
-                "that was not moving. Pieces, parented objects and owned objects are never touched.");
-
             ZSyncStaticSkipEnabled = Config.Bind("Optimize", "ZSyncStaticSkipEnabled", true,
                 "Disable ZSyncTransform on player-built Pieces that never move. ZSyncTransform\n" +
                 "is an IMonoUpdater that ticks every frame on every active instance, even when\n" +
@@ -606,25 +589,6 @@ namespace FiresEasyBakeMeshes
                 "Risk surface: in solo this is essentially free. In multiplayer an admin\n" +
                 "teleport on a static piece won't propagate to other clients until reload.\n" +
                 "Disable this toggle if you hit a sync issue in MP and we'll look at it.");
-
-            EffectAreaIdleSkipEnabled = Config.Bind("Optimize", "EffectAreaIdleSkipEnabled", true,
-                "Take EffectAreas that can never tick out of the MonoUpdaters list. EffectArea is the\n" +
-                "LARGEST IMonoUpdater list in a built-up world - 848 instances in the 2026-09-26 census,\n" +
-                "ahead of LightFlicker 562 and ZSyncTransform 354 - and MonoUpdaters copies the whole\n" +
-                "list every call, so each instance costs a copy slot plus an interface dispatch fifty\n" +
-                "times a second before its body runs.\n" +
-                "\n" +
-                "Most of them do no work at all. EffectArea.CustomFixedUpdate returns unless a character\n" +
-                "is inside, and the character list is only ever filled for a Heat area or one carrying a\n" +
-                "status effect. Every other area - PlayerBase, NoMonsters, PrivateProperty, which is the\n" +
-                "workbench and base-marker population of a settlement - has a permanently empty list, so\n" +
-                "its tick is dead code for the object's whole lifetime.\n" +
-                "\n" +
-                "Only updater-list membership is dropped; the component stays ENABLED, because\n" +
-                "OnTriggerEnter/Exit live on it and Unity does not deliver trigger callbacks to a\n" +
-                "disabled MonoBehaviour - disabling would break the NoMonsters and Burning bookkeeping.\n" +
-                "The static area queries are fed in Awake and by collider overlap, never from the updater\n" +
-                "list, so no game behaviour changes. Heat and status areas are left registered.");
 
             SkipUnchangedScans = Config.Bind("Optimize", "SkipUnchangedScans", true,
                 "Stop re-searching the whole active area for work that is not there. Every pass ZNetScene walks\n" +
@@ -824,7 +788,6 @@ namespace FiresEasyBakeMeshes
 
         private void Update()
         {
-            EasyBake.RemoteItemZSyncSkip.Tick();
             // Kick the disk-cache background preload as soon as the world UID
             // is available. ZNet.GetWorldUID returns 0 until the server world
             // handshake completes; once it's non-zero, the cache directory

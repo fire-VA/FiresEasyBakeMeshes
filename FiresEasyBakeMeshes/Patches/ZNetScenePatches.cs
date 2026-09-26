@@ -25,11 +25,21 @@ namespace FiresEasyBakeMeshes.Patches
                         EasyBakeLog.Info(report);
                         foreach (var line in report.Split('\n')) args.Context?.AddString(line);
                     }));
+                new Terminal.ConsoleCommand("ebm_vegetation",
+                    "FiresEasyBakeMeshes: how much of the live tree, shrub, bush and rock population the instancing path could draw, per prefab (also written to the log).",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        string report = EasyBake.VegetationInstancing.Audit();
+                        EasyBakeLog.Info(report);
+                        foreach (var line in report.Split('\n')) args.Context?.AddString(line);
+                    }));
             }
 
             // Prefab-derived verdicts are rebuilt per scene: mods can register different prefabs each session.
             EasyBake.SkipEligibility.Clear();
             EasyBake.StandInColliders.Clear();
+            EasyBake.StandInDamageBinding.ClearDestructibleTypeCache();
+            EasyBake.VegetationInstancing.ClearPrefabCache();
 
             // The material-registry walk + prewarm both run on the main
             // thread inside ZNetScene.Awake's lifecycle window. Pre-fix:
@@ -172,6 +182,7 @@ namespace FiresEasyBakeMeshes.Patches
             // OnDisable handler removes them from ZSyncTransform.Instances, so
             // the per-frame iteration over that list stops visiting them.
             EasyBake.StaticPieceZSyncSkip.TryDisable(__result);
+            EasyBake.RemoteItemZSyncSkip.Consider(__result);
 
             if (FiresEasyBakeMeshesPlugin.BatchingActive())
                 EasyBake.ZoneTracker.OnInstanceCreated(__result);
@@ -221,7 +232,22 @@ namespace FiresEasyBakeMeshes.Patches
             // active area so keepalive can skip injecting for zones vanilla
             // already covered in currentNearObjects — those would just be
             // duplicate AddRange work.
-            if (FiresEasyBakeMeshesPlugin.ZoneKeepaliveEnabled.Value)
+            // ═══ NOT WHEN THE SKIP IS OFF, 2026-09-25 ════════════════════════════════════════════════════════
+            // Keepalive pins up to (2*Radius+1)^2 zones - 961 at the default radius of 15, a 960 m circle - so
+            // their ZNetViews survive the player crossing a zone boundary. That trade only pays BECAUSE the bake
+            // draws those pieces: what stays pinned is meant to be a cheap stand-in, not a live piece.
+            //
+            // BatchingActive() excludes only a DEDICATED server. On a listen host - someone playing their own
+            // hosted world - it returns true while SkipCreationActive() returns FALSE, because a server treats a
+            // CreateObject that returns null as an invalid prefab and destroys the ZDO. So keepalive was pinning
+            // tens of thousands of FULL LIVE instances and refusing to let RemoveObjects release any of them,
+            // with no bake benefit at all.
+            //
+            // Measured on a hosted clone of the live server: "0 baked pieces skipped, 87,484 created", instances
+            // climbing 86,355 -> 87,080 -> 87,869 while loaded zones went 1,217 -> 1,251, at 5 fps.
+            //
+            // The pin is only ever worth taking where the skip that justifies it is actually running.
+            if (FiresEasyBakeMeshesPlugin.ZoneKeepaliveEnabled.Value && EasyBake.ZoneTracker.SkipCreationActive())
             {
                 var zs = ZoneSystem.instance;
                 var net = ZNet.instance;

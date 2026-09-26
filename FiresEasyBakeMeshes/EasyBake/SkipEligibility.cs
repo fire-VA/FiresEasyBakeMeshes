@@ -56,6 +56,27 @@ namespace FiresEasyBakeMeshes.EasyBake
             "SimpleMeshCombine", "SimpleMeshCombineMaster",
         };
 
+        // Allowed only while VegetationSkipAllowed, which is why they are not in the set above: a prefab's verdict is
+        // cached, so the flag's SettingChanged clears that cache.
+        //
+        // TreeBase and Destructible carry no periodic work (TreeBase has none at all; Destructible's only
+        // InvokeRepeating is DestroyNow, and world vegetation has no TTL), and their RPC_Damage is the same
+        // owner-gated, ZDO-health shape WearNTear uses, so the existing damage replay covers them.
+        //
+        // LodFadeInOut is moot rather than merely harmless: its whole body runs once in Awake, parking the LODGroup's
+        // reference point so an object spawning over 20 m away stays invisible for 0.1-0.3 s instead of popping in.
+        // A skipped object never spawns, so there is no pop to hide.
+        //
+        // DELIBERATELY ABSENT: ZSyncTransform and RandomFlyingBird. Both mean the object MOVES, and an instanced
+        // group holds one static matrix per instance. MineRock5 is absent too - UpdateSupport, per-area health and
+        // UpdateMesh rebuilding per-cell geometry make it a different problem.
+        private static readonly HashSet<Type> VegetationAllowedComponents = new HashSet<Type>
+        {
+            typeof(TreeBase), typeof(Destructible), typeof(LodFadeInOut),
+        };
+
+        private static bool VegetationAllows(Type type) => VegetationSkipAllowed && VegetationAllowedComponents.Contains(type);
+
         private static readonly PrefabInfo NoScene = new PrefabInfo { Blocker = "no scene" };
         private static readonly Dictionary<int, PrefabInfo> _byPrefab = new Dictionary<int, PrefabInfo>();
 
@@ -111,7 +132,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var component = components[i];
                 if (component == null) return NotSkippable("a missing script");
                 var type = component.GetType();
-                if (AllowedComponents.Contains(type) || AllowedComponentNames.Contains(type.Name)) continue;
+                if (AllowedComponents.Contains(type) || AllowedComponentNames.Contains(type.Name) || VegetationAllows(type)) continue;
                 if (wear != null && UnderWearModel(component.transform, wear))
                 {
                     info.LookDependentBlockers.Add(component);
@@ -123,6 +144,35 @@ namespace FiresEasyBakeMeshes.EasyBake
             return info;
         }
 
+        // ═══ PHASE 3: LETTING A DAMAGEABLE PIECE GO UNCREATED ═════════════════
+        // The health check below is the ONLY thing keeping damageable pieces live, and they are the largest
+        // remaining cost: measured in the BlueHills town, 27,809 of ~51,000 created objects (54%) are pieces
+        // the bake ALREADY DRAWS, kept real only so they can take damage, hold structure and be raided.
+        //
+        // What makes it safe to relax rather than reckless:
+        //
+        //  - Damage still lands. It is owner-authoritative and routed, so a remote owner applies it with full
+        //    support, collapse and drop handling whether or not this client has the object. When THIS client
+        //    owns it, DamageReplay catches the hit vanilla would have dropped, materialises that one piece and
+        //    replays the hit into it.
+        //  - A damaged piece stops matching on its own. Applying damage writes health into the ZDO, which bumps
+        //    DataRevision; SkippedPiece.Unchanged then fails, this method runs again, and WearLooks.Resolve
+        //    returns a worn or broken look that no longer equals the bake's, so the piece is created for real.
+        //    No new reaction code.
+        //  - Raids still find it: BaseAI does Physics.OverlapSphere then GetComponentInParent<StaticTarget>(),
+        //    and the overlap already hits stand-in colliders - StandInDamage adds the StaticTarget it looks for.
+        //
+        // WHAT IS NOT PROVEN, and why this defaults OFF: a piece THIS CLIENT owns and has not created runs no
+        // WearNTear Update, so its own rain wear and support check do not tick until something materialises it.
+        // On a dedi the server owns much of the world and is unaffected, but ZDOMan reassigns ownership by
+        // active area, so a walking player picks up ownership of what they pass. Whether that shows up as a
+        // wall that should have collapsed and did not is a question for the rig, not for this comment.
+        internal static bool DamageableSkipAllowed;
+
+        // Trees, shrubs and bushes. Unlike DamageableSkipAllowed there is no wear or support tick to lose:
+        // TreeBase has no periodic work at all and an untimed Destructible has none either.
+        internal static bool VegetationSkipAllowed;
+
         // The live ZDO must still describe the piece the cache drew: invulnerable, the same look, rotation and scale.
         // Position is part of the identity the caller matched on.
         public static bool ZdoMatches(ZDO zdo, PrefabInfo info, MeshBaker.PieceTransform cached)
@@ -130,7 +180,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (!info.Skippable) return false;
             if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) return false;
             if (info.CanShowSnow && SnowReaches(zdo)) return false;
-            if (!info.AllImmune && !(StoredHealth(zdo, info) < 0f)) return false;
+            if (!info.AllImmune && !(StoredHealth(zdo, info) < 0f) && !DamageableSkipAllowed) return false;
             var look = WearLooks.Resolve(info.Prefab, zdo);
             if (look != cached.Look || info.BlockerFor(look) != null) return false;
             if (Quaternion.Angle(zdo.GetRotation(), cached.Rotation) > 0.5f) return false;
@@ -156,7 +206,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
 
             float health = StoredHealth(zdo, info);
-            if (!info.AllImmune && !(health < 0f))
+            if (!info.AllImmune && !(health < 0f) && !DamageableSkipAllowed)
             {
                 detail = $"server health {health:F0}, prefab damage modifiers not all Immune, so only this copy counts as invulnerable";
                 return "its server health is not below zero (invulnerable on this copy only)";

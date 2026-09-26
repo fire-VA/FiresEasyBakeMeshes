@@ -55,7 +55,17 @@ namespace FiresEasyBakeMeshes.EasyBake
         // ZNetView's transform may already be Unity-null by removal time).
         private static readonly Dictionary<ZDO, Vector2s> _zdoSector = new Dictionary<ZDO, Vector2s>();
 
+        // Sector -> the ZDOs in it, INCLUDING distant ones. _countBySector deliberately excludes distant to keep
+        // TryHasInstance identical to vanilla's HaveInstanceInSector; this index must not, because its consumer
+        // (DestroyTimeSlicer) has to see every instance or distant objects would never be destroyed and would
+        // leak silently. Maintained on add/remove only - never per frame.
+        private static readonly Dictionary<Vector2s, HashSet<ZDO>> _zdosBySector = new Dictionary<Vector2s, HashSet<ZDO>>();
+
+        // Which ZDOs were kept out of _countBySector, so removal decrements exactly what addition incremented.
+        private static readonly HashSet<ZDO> _distantZdos = new HashSet<ZDO>();
+
         private static float _lastRebuildTime;
+        private static bool _fullScanRequested = true;
 
         private static FieldInfo s_instancesField;
         private static bool s_instancesFieldChecked;
@@ -66,14 +76,16 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static void OnInstanceAdded(ZDO zdo, ZNetView nview)
         {
             if (zdo == null || nview == null) return;
-            // Distant ZDOs are excluded by vanilla's HaveInstanceInSector filter
-            // (the m_distant check). Mirror them out too so our count matches.
-            if (nview.m_distant) return;
             if (_zdoSector.ContainsKey(zdo)) return; // already tracked
 
             var sector = ZoneSystem.GetZone(nview.transform.position);
             _zdoSector[zdo] = sector;
-            Increment(sector);
+            AddToSector(sector, zdo);
+
+            // Distant ZDOs are excluded by vanilla's HaveInstanceInSector filter (the m_distant check), so they
+            // stay out of the COUNT. They are still indexed above: the destroy scan needs them.
+            if (nview.m_distant) _distantZdos.Add(zdo);
+            else Increment(sector);
         }
 
         public static void OnInstanceRemoved(ZDO zdo)
@@ -81,7 +93,46 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (zdo == null) return;
             if (!_zdoSector.TryGetValue(zdo, out var sector)) return;
             _zdoSector.Remove(zdo);
-            Decrement(sector);
+            RemoveFromSector(sector, zdo);
+            if (!_distantZdos.Remove(zdo)) Decrement(sector);
+        }
+
+        private static void AddToSector(Vector2s sector, ZDO zdo)
+        {
+            if (!_zdosBySector.TryGetValue(sector, out var set))
+            {
+                set = new HashSet<ZDO>();
+                _zdosBySector[sector] = set;
+            }
+            set.Add(zdo);
+        }
+
+        private static void RemoveFromSector(Vector2s sector, ZDO zdo)
+        {
+            if (!_zdosBySector.TryGetValue(sector, out var set)) return;
+            set.Remove(zdo);
+            if (set.Count == 0) _zdosBySector.Remove(sector);
+        }
+
+        /// <summary>Every sector holding a tracked instance. Do not mutate the mirror while iterating this.</summary>
+        public static Dictionary<Vector2s, HashSet<ZDO>>.KeyCollection Sectors => _zdosBySector.Keys;
+
+        public static bool TryGetSectorZdos(Vector2s sector, out HashSet<ZDO> zdos) => _zdosBySector.TryGetValue(sector, out zdos);
+
+        /// <summary>False before the mirror holds anything, so a consumer can fall back to a full walk.</summary>
+        public static bool HasData => _zdoSector.Count > 0;
+
+        /// <summary>
+        /// True once after every rebuild and once at startup. The mirror records an instance's sector when it is
+        /// ADDED, so anything that moves sector afterwards is stale until the next rebuild. A consumer that walks
+        /// this index INSTEAD of m_instances asks here and does one full walk when it answers true, which bounds
+        /// any miss to a single SectorMirrorRebuildSeconds.
+        /// </summary>
+        public static bool ConsumeFullScanRequest()
+        {
+            if (!_fullScanRequested) return false;
+            _fullScanRequested = false;
+            return true;
         }
 
         // out result = true if any tracked instance exists in the sector.
@@ -111,18 +162,22 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             _countBySector.Clear();
             _zdoSector.Clear();
+            _zdosBySector.Clear();
+            _distantZdos.Clear();
             int distantSkipped = 0;
             foreach (var kv in instances)
             {
                 var zdo = kv.Key;
                 var nv = kv.Value;
                 if (nv == null) continue;
-                if (nv.m_distant) { distantSkipped++; continue; }
                 var sector = ZoneSystem.GetZone(nv.transform.position);
                 _zdoSector[zdo] = sector;
+                AddToSector(sector, zdo);
+                if (nv.m_distant) { distantSkipped++; _distantZdos.Add(zdo); continue; }
                 Increment(sector);
             }
             _lastRebuildTime = now;
+            _fullScanRequested = true;
 
             if (FiresEasyBakeMeshesPlugin.SectorMirrorVerbose.Value)
             {
@@ -136,7 +191,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             _countBySector.Clear();
             _zdoSector.Clear();
+            _zdosBySector.Clear();
+            _distantZdos.Clear();
             _lastRebuildTime = 0f;
+            _fullScanRequested = true;
         }
 
         private static void Increment(Vector2s sector)

@@ -254,7 +254,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             public bool DrawsNothing => NearCandidates == 0 && !HadIneligibleEnabled;
         }
 
-        public static BakeResult Bake(Vector2s coord, HashSet<WearNTear> pieces)
+        public static BakeResult Bake(Vector2s coord, HashSet<WearNTear> pieces, HashSet<ZNetView> vegetation)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             int candidates = 0, skippedNonLod0 = 0, skippedPropertyBlock = 0, skippedNonReadable = 0;
@@ -405,13 +405,31 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             // Instanced pieces are suppressed on the same terms: their whole prefab is
             // now drawn by the instanced mesh, so hiding the original redraws nothing.
+            var instancedVegetation = VegetationInstancing.BuildInstanceGroups(vegetation, result.InstanceGroups, result.PieceTransforms);
+            foreach (var view in instancedVegetation)
+            {
+                result.ContributorIdentities.Add(PieceIdentity.From(view.gameObject, view.transform.position));
+                var vegetationSuppression = EasyBakeSuppressedVisuals.SuppressPiece(view.gameObject);
+                if (vegetationSuppression != null) result.SuppressedPieces.Add(vegetationSuppression);
+            }
+
             foreach (var piece in instancedPieces)
             {
                 if (piece == null || piece.gameObject == null) continue;
                 var instancedIdentity = PieceIdentity.From(piece.gameObject, piece.transform.position);
                 result.ContributorIdentities.Add(instancedIdentity);
-                // Only invulnerable pieces get a stand-in transform, which is what skipping and stand-ins key on.
-                if (InvulnerableClassifier.IsInvulnerable(piece))
+                // A stand-in transform is what skipping and stand-ins key on, so a piece with no entry here
+                // CANNOT be skipped however eligible it looks - ZdoMatches needs the cached rotation, scale and
+                // look to compare against, and StandInColliders needs the transform to place colliders at.
+                //
+                // Measured 2026-09-25: with SkipDamageablePieces on but this still gated on invulnerability,
+                // 24,619 pieces reported "baked, but no stand-in transform was recorded" - the single largest
+                // reason, and the feature looked half-broken rather than blocked.
+                //
+                // Damageable pieces reach the bake ONLY as instances, never merged (see the combine candidate
+                // filter above: merged geometry would need a rebake per hit), so this loop is the only place
+                // that can record one for them.
+                if (InvulnerableClassifier.IsInvulnerable(piece) || SkipEligibility.DamageableSkipAllowed)
                     result.PieceTransforms[instancedIdentity] = PieceTransform.From(piece.transform, LookOf(piece));
                 var instancedSuppression = EasyBakeSuppressedVisuals.SuppressPiece(piece.gameObject);
                 if (instancedSuppression != null) result.SuppressedPieces.Add(instancedSuppression);
@@ -665,8 +683,17 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (sample == null || sample.gameObject == null) return false;
             if (WhyCombinerRefuses(prefabHash, sample.gameObject) == null) return false;
 
+            // "Can be skipped" is the test, and what can be skipped widens with SkipDamageablePieces. Left as
+            // invulnerable-only, a prefab the combiner refuses and that has fewer than MinInstancesPerPrefab
+            // copies would form no group, never become a contributor, and so never be skippable however
+            // eligible the pieces themselves are - which is the census reason "damageable pieces the bake does
+            // not draw, fewer copies of its prefab in the zone".
             for (int i = 0; i < candidates.Count; i++)
-                if (candidates[i] != null && InvulnerableClassifier.IsInvulnerable(candidates[i])) return true;
+            {
+                if (candidates[i] == null) continue;
+                if (InvulnerableClassifier.IsInvulnerable(candidates[i])) return true;
+                if (SkipEligibility.DamageableSkipAllowed) return true;
+            }
             return false;
         }
 

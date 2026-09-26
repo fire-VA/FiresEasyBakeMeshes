@@ -92,14 +92,12 @@
     <Compile Include="EasyBake\MeshCacheStore.cs" />
     <Compile Include="EasyBake\ZoneKeepalive.cs" />
     <Compile Include="EasyBake\DestroyTimeSlicer.cs" />
-    <Compile Include="EasyBake\EffectAreaIdleSkip.cs" />
     <Compile Include="EasyBake\SectorInstanceMirror.cs" />
     <Compile Include="EasyBake\StaticPieceZSyncSkip.cs" />
     <Compile Include="EasyBake\Probe.cs" />
     <Compile Include="EasyBake\PieceData.cs" />
     <Compile Include="EasyBake\SkipEligibility.cs" />
     <Compile Include="EasyBake\StandInColliders.cs" />
-    <Compile Include="EasyBake\RemoteItemZSyncSkip.cs" />
     <Compile Include="Patches\SkipCreationPatches.cs" />
     <Compile Include="Patches\ClutterSystemPatches.cs" />
     <Compile Include="Patches\SectorMirrorPatches.cs" />

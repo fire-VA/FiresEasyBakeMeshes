@@ -68,8 +68,54 @@ namespace FiresEasyBakeMeshes.EasyBake
         //   8 â€” tinted grausten merges into combined batches, and item and armor stands are never baked.
         //  12 â€” each piece transform and instanced group carries the wear look it was drawn with, so worn, broken and
         //       hidden pieces bake and skip with their own look.
+        //  14 — the batching thresholds that produced the bake are stored in the header and rechecked on load.
+        //       They decide what a bake CONTAINS - a piece with fewer copies than MinInstancesPerPrefab is left
+        //       out of the instanced group and created for real - but they were not part of the key, so a cache
+        //       built at one setting was served forever at another. Measured 2026-09-25: zones loaded
+        //       "from cache: 2, baked fresh: 0", so lowering a threshold changed nothing and read as a null
+        //       result rather than a stale one. Same class as v2/v3/v4/v6: when the rule changes, the cache is
+        //       wrong and has to rebake.
         private const uint MAGIC = 0x434D4245;
-        private const int VERSION = 13;
+        private const int VERSION = 14;
+
+        // The settings whose values change what a bake contains. Compared as a unit on load; any difference
+        // rejects the cache exactly as a version mismatch does, so only the zones affected by a retune pay to
+        // rebake and nobody has to remember to clear a cache by hand.
+        private static int CurrentBakeSettingsKey()
+        {
+            unchecked
+            {
+                int key = 17;
+                key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingMinPiecesPerZone?.Value ?? -1);
+                key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingMinPiecesPerBatch?.Value ?? -1);
+                key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingMinInstancesPerPrefab?.Value ?? -1);
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled?.Value ?? true) ? 1 : 0);
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingMultiPartPieces?.Value ?? true) ? 1 : 0);
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingDamageablePieces?.Value ?? true) ? 1 : 0);
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingFarTierEnabled?.Value ?? true) ? 1 : 0);
+                key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingFarTierDistance?.Value ?? 0f).GetHashCode();
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingExcludeTransparent?.Value ?? false) ? 1 : 0);
+                // SkipDamageablePieces BELONGS HERE, which is not obvious: it changes nothing about the MESHES,
+                // so the instinct is that a cached bake stays valid across it. But a bake also records
+                // PieceTransforms, and whether a damageable piece gets one depends on this setting - and
+                // PieceTransforms IS cached.
+                //
+                // Measured 2026-09-25: an A/B that turned the setting on between two runs reused the caches
+                // written with it off, so 24,619 pieces reported "baked, but no stand-in transform was
+                // recorded" - the largest single reason - and the feature looked half-broken when it was simply
+                // reading caches that predate it. A piece with no recorded transform cannot be skipped at all,
+                // because ZdoMatches has no cached rotation, scale or look to compare against.
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.SkipDamageablePieces?.Value ?? false) ? 1 : 0);
+                // SkipVegetation belongs here for exactly the same reason, and more strongly: it decides whether
+                // the bake contains vegetation instance groups AND their PieceTransforms at all.
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.SkipVegetation?.Value ?? false) ? 1 : 0);
+                // GetStableHashCode, never string.GetHashCode: the latter is not guaranteed stable across
+                // processes, and an unstable key here would reject every cache on every launch - a permanent
+                // rebake loop that would look like the cache simply never working.
+                key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingExcludedPrefabs?.Value ?? string.Empty).GetStableHashCode();
+                return key;
+            }
+        }
 
         private static string _cacheRoot;
         private static readonly Dictionary<string, Material> _materialsByName = new Dictionary<string, Material>();
@@ -673,6 +719,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             bw.Write(MAGIC);
             bw.Write(VERSION);
+            bw.Write(CurrentBakeSettingsKey());
             // Valheim 1.0's Vector2s holds shorts; the format stores int32, which the reader expects.
             bw.Write((int)coord.x);
             bw.Write((int)coord.y);
@@ -822,6 +869,10 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (magic != MAGIC) throw new InvalidDataException($"bad magic 0x{magic:X8}");
             int version = br.ReadInt32();
             if (version != VERSION) throw new InvalidDataException($"version {version} != {VERSION}");
+            int bakeSettings = br.ReadInt32();
+            if (bakeSettings != CurrentBakeSettingsKey())
+                throw new InvalidDataException(
+                    $"baked under different batching settings ({bakeSettings} != {CurrentBakeSettingsKey()})");
             int zx = br.ReadInt32();
             int zy = br.ReadInt32();
             long worldUid = br.ReadInt64();

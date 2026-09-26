@@ -41,12 +41,15 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_posMismatch;
         private static int s_lookMismatch;
         private static float s_worstPosDelta;
+        private static int s_outsideZone;
+        private static int s_sectorScanned;
 
         internal static void Reset()
         {
             s_zones = 0; s_keysLive = 0; s_keysZdo = 0;
             s_missingFromZdo = 0; s_extraInZdo = 0;
             s_posMismatch = 0; s_lookMismatch = 0; s_worstPosDelta = 0f;
+            s_outsideZone = 0; s_sectorScanned = 0;
         }
 
         /// <summary>
@@ -105,11 +108,32 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             catch { return null; }
 
+            // ── FindSectorObjects IS A RADIUS QUERY, NOT ONE ZONE ─────────────────────────────────────────
+            // Read ZDOMan.FindSectorObjects (1.0.15) before changing this. It calls FindObjects on `coord`,
+            // then loops rings 1..NearSimulationDistance calling FindObjects on EVERY sector in each ring, then
+            // FindDistantObjects out to TotalSimulationDistance. So it returns everything the client simulates,
+            // not the contents of `coord`.
+            //
+            // The first run of this verifier did not filter, and reported: 14 zone(s), live 44,303 piece(s),
+            // ZDO-derived 973,291, EXTRA 929,975 - which reads as "the ZDO bake would wrongly skip a million
+            // pieces" and would have killed the idea. It was this call's radius, nothing else: 973,291/44,303
+            // is 22x, and position mismatches were 0 and wear-look mismatches 0 across every matched key, i.e.
+            // the derived DATA was exact and only the SET was wrong.
+            //
+            // ZoneSystem.GetZone(Vector3) is public static and gives a ZDO's own zone, so the filter needs no
+            // private sector-index machinery. Comparing with Equals rather than == because Vector2s is used
+            // here as a dictionary key and value equality is what that relies on.
+            var zoneSystem = ZoneSystem.instance;
+            if (zoneSystem == null) return null;
+
+            int outsideZone = 0;
             var map = new Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform>(sector.Count);
             for (int i = 0; i < sector.Count; i++)
             {
                 var zdo = sector[i];
                 if (zdo == null) continue;
+
+                if (!coord.Equals(ZoneSystem.GetZone(zdo.GetPosition()))) { outsideZone++; continue; }
 
                 int prefabHash = zdo.GetPrefab();
                 if (prefabHash == 0) continue;
@@ -129,6 +153,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                     Look = MeshBaker.LookOf(zdo),
                 };
             }
+            s_outsideZone += outsideZone;
+            s_sectorScanned += sector.Count;
             return map;
         }
 
@@ -153,7 +179,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 + $"MISSING from the ZDO answer {s_missingFromZdo} (those would still be created), "
                 + $"EXTRA in it {s_extraInZdo} (those would be WRONGLY skipped - this is the dangerous number), "
                 + $"position mismatches {s_posMismatch} (worst {s_worstPosDelta:0.000} m), "
-                + $"wear-look mismatches {s_lookMismatch}. A ZDO bake is only safe to trust when EXTRA is 0.");
+                + $"wear-look mismatches {s_lookMismatch}. A ZDO bake is only safe to trust when EXTRA is 0. "
+                + $"[radius filter: {s_outsideZone} of {s_sectorScanned} scanned ZDO(s) belonged to a NEIGHBOURING "
+                + "zone and were dropped - FindSectorObjects returns everything within simulation distance, so a "
+                + "large number here is normal and a ZERO means the filter is not running]");
         }
     }
 }

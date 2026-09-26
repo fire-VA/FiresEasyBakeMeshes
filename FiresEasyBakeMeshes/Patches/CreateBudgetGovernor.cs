@@ -149,12 +149,16 @@ namespace FiresEasyBakeMeshes.Patches
             if (s_frames == 0) return null;
             double walkMs = s_walkTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double tailMs = s_tailTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double sortMs = s_sortTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             string status =
                 $"CreateObjectsSorted over {s_frames:N0} pass(es): walk {walkMs:N0} ms of up to {s_nearPeak:N0} near, " +
-                $"sort+create {tailMs:N0} ms of up to {s_candPeak:N0} candidate(s), {s_createdSum:N0} created" +
+                $"SORT {sortMs:N0} ms over {s_sortCalls:N0} call(s) of up to {s_sortPeak:N0}, " +
+                $"CREATE {tailMs - sortMs:N0} ms for {s_createdSum:N0} object(s) " +
+                $"(sort+create {tailMs:N0} ms of up to {s_candPeak:N0} candidate(s))" +
                 (s_capped == 0 ? "" : $"; budget held back {s_capped:N0} pass(es) (asked up to {s_peakAsked:N0}, allowed {s_peakGiven:N0})");
             s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
             s_walkTicks = 0; s_tailTicks = 0; s_nearPeak = 0; s_candPeak = 0; s_createdSum = 0;
+            s_sortTicks = 0; s_sortCalls = 0; s_sortPeak = 0;
             return status;
         }
 
@@ -163,7 +167,9 @@ namespace FiresEasyBakeMeshes.Patches
         {
             MethodInfo mathfMax = AccessTools.Method(typeof(Mathf), nameof(Mathf.Max), new[] { typeof(int), typeof(int) });
             MethodInfo ours = AccessTools.Method(typeof(ZNetScene_CreateObjectsSorted_Budget), nameof(Budget));
-            int swapped = 0;
+            MethodInfo listSort = AccessTools.Method(typeof(List<ZDO>), nameof(List<ZDO>.Sort), new[] { typeof(System.Comparison<ZDO>) });
+            MethodInfo timedSort = AccessTools.Method(typeof(ZNetScene_CreateObjectsSorted_Budget), nameof(TimedSort));
+            int swapped = 0, sortSwapped = 0;
 
             foreach (CodeInstruction ci in instructions)
             {
@@ -171,6 +177,18 @@ namespace FiresEasyBakeMeshes.Patches
                 {
                     swapped++;
                     yield return new CodeInstruction(OpCodes.Call, ours);
+                    continue;
+                }
+                // "sort+create" conflated two costs and that ambiguity produced a wrong conclusion twice:
+                // a window with the budget BINDING read 20.8 ms/pass over 63,652 candidates, and a window with it
+                // NOT binding read 26.7 ms/pass over 50,704 - which looks like "the cap is irrelevant" only until
+                // you notice the second window also CREATED 74,498 objects against the first's 19,280. The create
+                // loop lives inside the same bracket as the Sort, so neither number could settle it. One call site,
+                // so this swap is unambiguous, and now the Sort reports alone.
+                if (listSort != null && timedSort != null && ci.Calls(listSort))
+                {
+                    sortSwapped++;
+                    yield return new CodeInstruction(OpCodes.Call, timedSort);
                     continue;
                 }
                 yield return ci;
@@ -181,6 +199,27 @@ namespace FiresEasyBakeMeshes.Patches
             else
                 Log.Warn($"[CreateBudget] expected ONE Mathf.Max in CreateObjectsSorted, swapped {swapped} — " +
                     "the budget expression changed; the governor is not doing what it says and should be re-read against the current game code.");
+
+            if (sortSwapped == 1)
+                Log.Info("[CreateBudget] Sort timer installed; sort and create now report separately.");
+            else
+                Log.Warn($"[CreateBudget] expected ONE List<ZDO>.Sort in CreateObjectsSorted, swapped {sortSwapped} — " +
+                    "sort time will read 0 and 'sort+create' keeps its old conflated meaning. Do not read the split.");
+        }
+
+        // Replaces m_tempCurrentObjects2.Sort(ZDOCompare) so the SORT is timed on its own, separately from the
+        // create loop that follows it. Calls straight through - it cannot change the ordering or the outcome.
+        private static long s_sortTicks;
+        private static int s_sortCalls, s_sortPeak;
+
+        public static void TimedSort(List<ZDO> list, System.Comparison<ZDO> comparison)
+        {
+            long start = s_clock.ElapsedTicks;
+            list.Sort(comparison);
+            s_sortTicks += s_clock.ElapsedTicks - start;
+            s_sortCalls++;
+            int n = list.Count;
+            if (n > s_sortPeak) s_sortPeak = n;
         }
 
         // Replaces Mathf.Max(backlog/100, maxCreatedPerFrame).

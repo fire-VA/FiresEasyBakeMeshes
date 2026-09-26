@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using System.Collections;
@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.68";
+        public const string PluginVersion = "1.2.69";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;

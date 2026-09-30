@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.72";
+        public const string PluginVersion = "1.2.77";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -57,6 +57,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<int>   CreateBudgetPerFrame;
         public static ConfigEntry<int>   CreateBudgetReleaseAbove;
         public static ConfigEntry<float> CandidateCensusSeconds;
+        public static ConfigEntry<int>   CandidateCensusSample;
         public static ConfigEntry<bool>  DeferCreationWhileBaking;
         public static ConfigEntry<bool>  CreationCensusEnabled;
         public static ConfigEntry<bool>  CreateDestroySkipEnabled;
@@ -429,14 +430,47 @@ namespace FiresEasyBakeMeshes
                 new BepInEx.Configuration.ConfigDescription(
                     "How often to explain the create queue, in seconds, when it is over 500 deep.\n" +
                     "\n" +
-                    "Sorts every queued ZDO into the reason it has no instance: creatable and\n" +
-                    "waiting for budget, bake-skippable, in a zone not ready for its type\n" +
-                    "(vanilla's own skip), prefab ABSENT from this client, or no prefab set.\n" +
+                    "Sorts every queued ZDO into the reason it has no instance, and separates the\n" +
+                    "ones vanilla is about to create anyway from the ones EBM is really\n" +
+                    "withholding. Only the DeferCreationWhileBaking hold does the latter, so with\n" +
+                    "that off (the default) the report should say the queue is budget, all of it.\n" +
+                    "It then names why the skip passed each piece over - prefab can never be\n" +
+                    "skipped, not in their zone's bake, no longer matches what was baked, zone\n" +
+                    "holding its real pieces, and so on - which sizes how much of the queue the\n" +
+                    "skip could ever take. Also reported: zones not ready for the type (vanilla's\n" +
+                    "own skip), prefabs ABSENT from this client, and no prefab set.\n" +
+                    "\n" +
+                    "The reason comes from the same predicate the skip decides on, so the two\n" +
+                    "cannot disagree. Before 1.2.73 this asked only whether the prefab CLASS was\n" +
+                    "bake-eligible, which is the first of eight tests, so pieces the skip had\n" +
+                    "already declined were reported as held back when they were waiting on\n" +
+                    "budget - the one number the report exists to give.\n" +
+                    "\n" +
                     "The queue sat at 24,187 in town and two separate readings of the code got\n" +
                     "the reason wrong, so it is worth measuring rather than inferring. Costs one\n" +
-                    "walk of the queue per report and nothing in between.\n" +
+                    "walk of the queue per report and nothing in between; the report says how\n" +
+                    "long that walk took.\n" +
                     "0 = off.",
                     new BepInEx.Configuration.AcceptableValueRange<float>(0f, 300f)));
+
+            CandidateCensusSample = Config.Bind("Optimize", "CandidateCensusSample", 4000,
+                new BepInEx.Configuration.ConfigDescription(
+                    "Most queued ZDOs the census walks per report. Above this it takes every k-th\n" +
+                    "and scales the counts back up.\n" +
+                    "\n" +
+                    "Measured uncapped in town on 1.2.73: 83.8 / 66.5 / 58 / 31.5 ms per report\n" +
+                    "against queues up to 56,568 - a third of a 183 ms frame, spent by the tool\n" +
+                    "whose only job is to explain that frame. The cost does NOT follow queue\n" +
+                    "length: 56,568 entries cost 66.5 ms while a 2,364 queue cost 0.4 ms, because\n" +
+                    "those all short-circuited early. It is the deepest two buckets that cost, so\n" +
+                    "bounding the number walked is what bounds the report.\n" +
+                    "\n" +
+                    "The sample is unbiased: vanilla sorts the candidate list AFTER the budget\n" +
+                    "call the census runs inside, so the list is still in near-walk order and\n" +
+                    "every k-th entry samples the whole queue rather than its nearest slice.\n" +
+                    "Counts become estimates and the report says so, naming the stride.\n" +
+                    "0 = no cap (walk everything, exact counts, the numbers above).",
+                    new BepInEx.Configuration.AcceptableValueRange<int>(0, 200000)));
 
             CreateDestroySkipEnabled = Config.Bind("Optimize", "CreateDestroySkipEnabled", true,
                 "Skip ZNetScene.CreateDestroyObjects when the player hasn't crossed a sector\n" +

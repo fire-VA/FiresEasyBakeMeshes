@@ -163,8 +163,28 @@ namespace FiresEasyBakeMeshes.Patches
         // the same predicates vanilla and we use, and the cheapest question — does the reason even belong to
         // us — is answered before anything is changed. Once every CandidateCensusSeconds so a 24k walk is a
         // rounding error, and only when there is a queue worth explaining.
+        //
+        // ── THE FIRST VERSION OF THIS CENSUS ANSWERED THE WRONG QUESTION ─────────────────────────────────────
+        // It asked SkipEligibility.Get(hash).Skippable and called the result "bake-skippable". That is prefab
+        // CLASS eligibility - the first of eight tests in the skip decision - so it also swallowed every piece
+        // that was class-eligible and then failed one of the seven runtime tests behind it. Those pieces are the
+        // exact opposite of held back: TrySkipCreation looked at each one and declined it, which is WHY it is
+        // still queued, because a real skip sets zdo.Created and a skipped ZDO is never a candidate again. The
+        // bucket read as "EBM is holding these back" while listing pieces EBM had waved through, and it took
+        // them out of the bucket that decides what to do next - creatable, waiting on nothing but budget.
+        //
+        // It now asks ZoneTracker.WouldSkip, the same predicate TrySkipCreation decides on, so the two cannot
+        // drift: a reason can only appear here by existing there. Order mirrors the real pipeline - vanilla's
+        // zone-ready gate runs in the create loop BEFORE CreateObject, so it is tested before the skip, and a
+        // ZDO failing both is filed under the one it reaches first.
+        //
+        // The walk is timed and reports its own cost. Buckets past the class test are not free - the last two
+        // reach PieceIdentity and ZdoMatches - and the honest way to find out whether a diagnostic has become
+        // a hitch in a mod about frame time is to measure it rather than to cap it on a guess.
         private static float s_lastBucket;
         private static readonly Dictionary<int, int> s_stuckByPrefab = new Dictionary<int, int>();
+        private static readonly int[] s_byReason =
+            new int[System.Enum.GetValues(typeof(EasyBake.ZoneTracker.SkipReason)).Length];
 
         internal static void BucketCandidates(List<ZDO> candidates)
         {
@@ -182,18 +202,40 @@ namespace FiresEasyBakeMeshes.Patches
             var zones = ZoneSystem.instance;
             if (scene == null || zones == null) return;
 
-            int noPrefab = 0, absentPrefab = 0, zoneNotReady = 0, wouldSkip = 0, creatable = 0;
+            // ── SAMPLED, BECAUSE THE FULL WALK COST 83.8 ms OF A 183 ms FRAME ───────────────────────────────
+            // Measured in town on 1.2.73: 83.8 / 66.5 / 58 / 31.5 / 22.4 ms against queues up to 56,568 — a
+            // third of the frame, in a diagnostic whose whole job is to explain that frame. The cost does NOT
+            // track queue length: 56,568 entries cost 66.5 ms while a 2,364 queue cost 0.4 ms, because those
+            // 2,364 all short-circuited on `zone awaiting recreate` before reaching PieceIdentity.From. It is
+            // the two deepest buckets that cost — NotInBake reaches PieceIdentity.From, ZdoChanged reaches
+            // ZdoMatches — so capping the WALK is what bounds it, and 1.2.73 deliberately shipped uncapped to
+            // get that number rather than guess it.
+            //
+            // A stride is honest here specifically because of WHERE this runs. Vanilla sorts the candidate
+            // list AFTER the budget call this sits inside, so at this moment the list is still in near-walk
+            // order, not distance order. Every k-th entry is therefore a sample of the whole queue rather than
+            // of its nearest slice, which a head-truncation would have given.
+            int cap = FiresEasyBakeMeshesPlugin.CandidateCensusSample != null
+                ? FiresEasyBakeMeshesPlugin.CandidateCensusSample.Value : 4000;
+            int stride = (cap > 0 && n > cap) ? (n + cap - 1) / cap : 1;
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            int noPrefab = 0, absentPrefab = 0, zoneNotReady = 0, nullZdo = 0, sampled = 0;
+            System.Array.Clear(s_byReason, 0, s_byReason.Length);
             s_stuckByPrefab.Clear();
 
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < n; i += stride)
             {
+                sampled++;
                 var zdo = candidates[i];
-                if (zdo == null) continue;
+                if (zdo == null) { nullZdo++; continue; }
 
                 int hash = zdo.GetPrefab();
                 if (hash == 0) { noPrefab++; continue; }
 
                 // Absent from THIS client's ZNetScene: uncreatable here, and only a server ever cleans it up.
+                // Resolved here rather than inside WouldSkip so the hash list below still works when skipping is
+                // switched off entirely, and so the CreateObject path does not pay for a label only this reads.
                 if (scene.GetPrefab(hash) == null)
                 {
                     absentPrefab++;
@@ -204,29 +246,110 @@ namespace FiresEasyBakeMeshes.Patches
                 // Vanilla's own `continue` in the create loop — it never even calls CreateObject for these.
                 if (!zones.IsZoneReadyForType(zdo.GetSector(), zdo.Type)) { zoneNotReady++; continue; }
 
-                // Ours: a piece a bake will draw, held back until the bake lands. Bounded by an expiry, so it
-                // should not accumulate — if it dominates, that expiry is not working.
-                if (EasyBake.SkipEligibility.Get(hash).Skippable) { wouldSkip++; continue; }
-
-                creatable++;
+                EasyBake.ZoneTracker.WouldSkip(zdo, out var reason);
+                s_byReason[(int)reason]++;
             }
+            clock.Stop();
 
-            Log.Info($"[Candidates] {n:N0} ZDO(s) queued with no instance: " +
-                     $"{creatable:N0} creatable and just waiting for budget, " +
-                     $"{wouldSkip:N0} bake-skippable, " +
-                     $"{zoneNotReady:N0} in a zone not ready for their type (vanilla skips these every pass), " +
-                     $"{absentPrefab:N0} whose prefab is ABSENT from this client, " +
-                     $"{noPrefab:N0} with no prefab set.");
+            s_scale = sampled > 0 ? (double)n / sampled : 1.0;
+
+            // ── "OURS" MEANS THE PIECE IS NOT GOING TO BE CREATED, NOT THAT THE SKIP LOOKED AT IT ────────────
+            // Every reason below except one ends in TrySkipCreation returning FALSE, and false means vanilla goes
+            // on to create the piece exactly as if this mod were not installed. A build hold, a zone holding its
+            // real pieces, a pending hand-back, a piece that no longer matches its bake - the skip declined all
+            // of them, so they are queued for budget like anything else. Grouping them as "held back by EBM"
+            // would be the very mistake this census was rewritten to stop making, one level up.
+            //
+            // The single reason that really withholds a piece is the defer, and only while
+            // DeferCreationWhileBaking is on - which it is not by default, for reasons measured in DeferCreation.
+            // So with the defer off this line should read zero held back, and the queue is budget, all of it.
+            int bakePending = Reason(EasyBake.ZoneTracker.SkipReason.ZoneBakePending);
+            bool deferHolds = EasyBake.DeferCreation.Enabled;
+            int heldByUs = deferHolds ? bakePending : 0;
+            int waitingOnBudget = Reason(EasyBake.ZoneTracker.SkipReason.SkipInactive)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.PrefabNotSkippable)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.BuildHold)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.ZoneUnknown)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.AwaitingRecreate)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.ZoneHoldingReal)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.NotInBake)
+                                + Reason(EasyBake.ZoneTracker.SkipReason.ZdoChanged)
+                                + (deferHolds ? 0 : bakePending);
+
+            // ── THE BAKE ABSORBS THESE FOR FREE, AND THAT IS THE POINT OF THE MOD ───────────────────────────
+            // A skip returns null from CreateObject, so vanilla's create loop neither counts it against the
+            // budget nor breaks on it:
+            //     if (CreateObject(item) != null) { created++; if (created >= num) break; }
+            // Only a REAL creation spends budget. So the queue splits into the part that costs 0.183 ms each
+            // and a budget slot, and the part the bake takes for nothing — and the second is the number that
+            // says how much work EBM is actually removing from the frame.
+            int freeToSkip = Reason(EasyBake.ZoneTracker.SkipReason.WouldBeSkipped);
+            string sample = stride == 1 ? "" : $", 1-in-{stride} sample of {sampled:N0} scaled up";
+
+            Log.Info($"[Candidates] {n:N0} ZDO(s) queued with no instance, bucketed in {clock.Elapsed.TotalMilliseconds:0.0} ms{sample}: " +
+                     $"{waitingOnBudget:N0} need a real create (0.183 ms and a budget slot each), " +
+                     $"{freeToSkip:N0} the bake absorbs FREE when the loop reaches them, " +
+                     $"{heldByUs:N0} withheld by EBM's defer, " +
+                     $"{Scale(zoneNotReady):N0} in a zone not ready for their type (vanilla skips these every pass), " +
+                     $"{Scale(absentPrefab):N0} whose prefab is ABSENT from this client, " +
+                     $"{Scale(noPrefab):N0} with no prefab set" +
+                     (nullZdo == 0 ? "" : $", {Scale(nullZdo):N0} null") + ".");
+
+            // Why the skip passed each one over, in the order the stages are evaluated. This does not change who
+            // creates them - vanilla does - it sizes how much of the queue the skip could ever take, which is the
+            // only actionable thing in the breakdown.
+            Log.Info($"[Candidates] why the skip passed them over: " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.SkipInactive):N0} skipping inactive this session, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.PrefabNotSkippable):N0} prefab can never be skipped, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.BuildHold):N0} near a build tool, " +
+                     $"{bakePending:N0} zone's bake has not landed" + (deferHolds ? " (withheld)" : "") + ", " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.ZoneUnknown):N0} zone has no bake and no cache, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.AwaitingRecreate):N0} zone awaiting recreate, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.ZoneHoldingReal):N0} zone holding its real pieces, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.NotInBake):N0} not in their zone's bake, " +
+                     $"{Reason(EasyBake.ZoneTracker.SkipReason.ZdoChanged):N0} no longer match what was baked.");
+
+            // ── THE WARNING THAT USED TO BE HERE WAS WRONG, AND IT FIRED 12 TIMES SAYING SO ─────────────────
+            // 1.2.73 warned that a queued ZDO which WouldSkip accepts "was skipped and did not stay skipped".
+            // It fired at 29,851 of a 56,568 queue — 53% — and read as the skip collapsing. It is not. The
+            // invariant it asserted is checked at a point in the frame where it cannot hold:
+            //
+            //     int num = Mathf.Max(count / 100, maxCreatedPerFrame);   <- this census runs INSIDE this call
+            //     m_tempCurrentObjects2.Sort(ZDOCompare);
+            //     foreach (ZDO item in m_tempCurrentObjects2) { ... CreateObject(item) ... }
+            //
+            // The census is called from the budget transpiler, which replaces that Mathf.Max — so it runs
+            // BEFORE the sort and BEFORE a single CreateObject of this frame. Every candidate it sees is
+            // unprocessed BY CONSTRUCTION. zdo.Created cannot have been set yet, so "would be skipped and is
+            // still queued" is the normal, expected state of every skippable piece at that instant, and the
+            // warning was structurally guaranteed to fire whenever the bake had anything to absorb.
+            //
+            // The same reading also explains why it was not merely noisy but backwards: those 29,851 were the
+            // mod WORKING — a fifty-three percent share of the queue that costs no budget at all. It is now
+            // reported as that, on the line above.
+            //
+            // Left as a comment rather than deleted: this is the second time in two versions that an asserted
+            // invariant produced a confident false alarm in this file, both times by ignoring where in the
+            // frame the question is asked. A third instrument here should state its observation point first.
 
             if (absentPrefab > 0)
             {
                 var sb = new System.Text.StringBuilder();
                 sb.Append($"[Candidates] {s_stuckByPrefab.Count:N0} distinct ABSENT prefab hash(es) — these can NEVER be " +
-                          "created on this client and are re-offered every frame forever:");
+                          "created on this client and are re-offered every frame forever" +
+                          (stride == 1 ? ":" : $" (seen in a 1-in-{stride} sample, so rare hashes may be missing entirely):"));
                 foreach (var kv in s_stuckByPrefab.OrderByDescending(k => k.Value).Take(12))
-                    sb.Append($"\n    {kv.Value,7:N0}  hash {kv.Key}");
+                    sb.Append($"\n    {Scale(kv.Value),7:N0}  hash {kv.Key}");
                 Log.Warn(sb.ToString());
             }
         }
+
+        // How much of the queue one walked entry stands for. 1.0 when the whole queue was walked.
+        private static double s_scale = 1.0;
+
+        /// <summary>A sampled count scaled back to the whole queue; exact when the walk was not strided.</summary>
+        private static int Scale(int v) => s_scale <= 1.0 ? v : (int)(v * s_scale + 0.5);
+
+        private static int Reason(EasyBake.ZoneTracker.SkipReason reason) => Scale(s_byReason[(int)reason]);
     }
 }

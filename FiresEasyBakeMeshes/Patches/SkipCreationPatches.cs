@@ -32,9 +32,53 @@ namespace FiresEasyBakeMeshes.Patches
         [HarmonyPostfix]
         public static void Postfix(Vector3 point, ref bool __result)
         {
-            if (__result) return;
-            try { if (EasyBake.ZoneTracker.IsAreaReadyCountingSkipped(point)) __result = true; }
+            if (__result) { RespawnNet.Ready(); return; }
+            try { if (EasyBake.ZoneTracker.IsAreaReadyCountingSkipped(point)) { __result = true; RespawnNet.Ready(); return; } }
             catch { }
+            RespawnNet.Check(point, ref __result);
+        }
+    }
+
+    // ═══ A RESPAWN MUST NOT WAIT FOREVER ON AN AREA THAT NEVER READS READY (2026-09-29, R75) ════════════════════
+    // Game.FindSpawnPoint (a death respawn, and the login spawn) waits on ZNetScene.IsAreaReady at the spawn point with no
+    // timeout. On the test rig it stayed false for good with the 3x3 fully instanced ("1165 ZDO(s) ... 0 missing an instance")
+    // and the player sat on the loading screen until the game was killed. Whatever the cause, a player must get in: while
+    // the game is waiting to respawn, after WaitSeconds of "not ready" the area counts as ready (logged once per wait).
+    // The lead (R76): a teleport waits the same way (Player.UpdateTeleport asks IsAreaReady at the target with no timeout;
+    // a portal hang is a loading screen for good too), so the local player's teleport gets the same net.
+    internal static class RespawnNet
+    {
+        private const float WaitSeconds = 30f;
+        private static float s_since = -1f;
+        private static bool s_forced;
+
+        internal static void Check(Vector3 point, ref bool ready)
+        {
+            string what = Waiting();
+            if (what == null) { s_since = -1f; s_forced = false; return; }
+            float now = Time.realtimeSinceStartup;
+            if (s_since < 0f) s_since = now;
+            if (now - s_since < WaitSeconds) return;
+            if (!s_forced)
+            {
+                s_forced = true;
+                EasyBakeLog.Warn($"{what}: the area at ({point.x:0}, {point.z:0}) not 'ready' after {WaitSeconds:0} s " +
+                                 $"(zone loaded {ZoneSystem.instance != null && ZoneSystem.instance.IsZoneLoaded(point)}); going ahead anyway");
+            }
+            ready = true;
+        }
+
+        // Ready on its own: the next wait starts fresh.
+        internal static void Ready()
+        {
+            if (Waiting() == null) { s_since = -1f; s_forced = false; }
+        }
+
+        // What is waiting on the area: the respawn (a death or the login spawn), the local player's teleport, or nothing.
+        private static string Waiting()
+        {
+            if (Game.instance != null && Game.instance.WaitingForRespawn()) return "respawn";
+            return Player.m_localPlayer != null && Player.m_localPlayer.IsTeleporting() ? "teleport" : null;
         }
     }
 

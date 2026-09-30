@@ -279,7 +279,10 @@ namespace FiresEasyBakeMeshes.Patches
             // own backlog rule would have allowed 454 a frame precisely so a dense area fills fast.
             //
             // So the cap is lifted until Player.m_localPlayer exists, which is exactly the spawn-in window.
-            int cap = Player.m_localPlayer == null ? 0
+            // 2026-09-29 (R76, the lead): a teleport's loading screen is the same window. The bot waited ~25 s on 157 vanilla
+            // vegetation ZDOs with no instance at an admintools place ("areaReady=False zoneLoaded=True"); the player exists
+            // then, so the cap held. Lifted while the local player is teleporting as well.
+            int cap = Player.m_localPlayer == null || Player.m_localPlayer.IsTeleporting() ? 0
                     : (FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame != null
                     ? FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value : 0);
 

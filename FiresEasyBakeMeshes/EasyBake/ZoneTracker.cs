@@ -422,12 +422,15 @@ namespace FiresEasyBakeMeshes.EasyBake
             Vector3 pos = zdo.GetPosition();
             if (!_zones.TryGetValue(ZoneSystem.GetZone(pos), out var state)) return;
             state.Skipped.Remove(zdo);
+            // R85 (the lead: "line of sight blocked by [EasyBake/Zone_-14_-4/standins]" on test area ONE): a destroyed piece's
+            // stand-in collider was only dropped when the zone had a current bake with contributors, so the drill courses'
+            // removed walls left invisible colliders behind. The stand-in goes first, whatever the bake's state.
+            var identity = MeshBaker.PieceIdentity.From(zdo);
+            DropStandIn(state, identity);
             if (!state.Baked || state.Bake == null) return;
             var ids = state.Bake.ContributorIdentities;
             if (ids == null || ids.Count == 0) return;
 
-            var identity = MeshBaker.PieceIdentity.From(zdo);
-            DropStandIn(state, identity);
             state.Bake.PieceTransforms?.Remove(identity);
             if (!ids.Remove(identity)) return;   // not part of the combined mesh
 
@@ -800,8 +803,109 @@ namespace FiresEasyBakeMeshes.EasyBake
             return FiresEasyBakeMeshesPlugin.SkipOnHost != null && FiresEasyBakeMeshesPlugin.SkipOnHost.Value;
         }
 
+        // ═══ ONE SKIP DECISION, ASKED TWO WAYS ═══════════════════════════════════════════════════════════
+        // TrySkipCreation is the only thing that decides whether a piece stays uncreated, and the candidate
+        // census has to report that same decision. It used to ask its own cheaper question instead - "is this
+        // prefab CLASS bake-eligible?" - and that answered something else entirely. Prefab eligibility is the
+        // FIRST of eight tests, so every piece that passed it and failed a later one was filed as
+        // "bake-skippable" when the truth was the opposite: TrySkipCreation had already looked at that piece
+        // and declined it. That is precisely WHY it was still in the queue - a real skip sets zdo.Created, so
+        // a skipped piece is never a candidate again. The bucket that claimed "EBM is holding these back" was
+        // listing pieces EBM had waved through, and it was taking them out of the only bucket that mattered:
+        // creatable, waiting on nothing but budget.
+        //
+        // So the decision lives here once and both callers ask it. WouldSkip touches nothing - no zone is
+        // constructed, no defer timer starts, no counter moves - which is what makes it safe to call tens of
+        // thousands of times from a census, and why TrySkipCreation keeps every side effect on its own side of
+        // the call instead of passing a mode flag down.
+        //
+        // Declared in evaluation order. Prefab-hash and prefab-absent are deliberately NOT here: SkipEligibility
+        // already answers both as PrefabNotSkippable, and re-asking ZNetScene would put a second dictionary
+        // lookup on the CreateObject path to sharpen a label only the census reads. The census resolves those
+        // two itself, before it asks.
+        internal enum SkipReason
+        {
+            /// <summary>No reason: the bake draws this piece and a stand-in stands in for it.</summary>
+            WouldBeSkipped = 0,
+            NoZdo,
+            /// <summary>Skipping is off this session: config, batching, or a host that has not opted in.</summary>
+            SkipInactive,
+            /// <summary>The prefab does something a combined mesh and a collider cannot stand in for.</summary>
+            PrefabNotSkippable,
+            /// <summary>A build tool is out within reach, so the piece is deliberately kept real.</summary>
+            BuildHold,
+            /// <summary>EBM knows the zone and its bake has not landed yet.</summary>
+            ZoneBakePending,
+            /// <summary>No zone state and no cached bake to build one from - normal on a first visit.</summary>
+            ZoneUnknown,
+            /// <summary>The zone is handing pieces back and the real ones do not exist yet.</summary>
+            AwaitingRecreate,
+            /// <summary>The zone is holding its real pieces: a rebake, a teardown, or a tool nearby.</summary>
+            ZoneHoldingReal,
+            /// <summary>The bake landed and does not contain this piece.</summary>
+            NotInBake,
+            /// <summary>The piece no longer matches what was baked - damaged, re-looked, rotated or rescaled.</summary>
+            ZdoChanged,
+        }
+
+        /// <summary>
+        /// The skip decision with no side effects. True means the bake draws this piece; on false
+        /// <paramref name="reason"/> is the stage that said no.
+        /// </summary>
+        internal static bool WouldSkip(ZDO zdo, out SkipReason reason) => WouldSkip(zdo, out reason, out _, out _);
+
+        // The same decision, also handing back what a caller that acts on a true needs, so the winning path does
+        // not rebuild the identity and look the dictionary entry up a second time.
+        private static bool WouldSkip(ZDO zdo, out SkipReason reason,
+                                      out MeshBaker.PieceIdentity identity, out MeshBaker.PieceTransform cached)
+        {
+            identity = default;
+            cached = default;
+
+            if (zdo == null) { reason = SkipReason.NoZdo; return false; }
+            if (!SkipCreationActive()) { reason = SkipReason.SkipInactive; return false; }
+
+            var info = SkipEligibility.Get(zdo.GetPrefab());
+            if (!info.Skippable) { reason = SkipReason.PrefabNotSkippable; return false; }
+
+            Vector3 position = zdo.GetPosition();
+            if (s_buildingNearby && InBuildHold(position)) { reason = SkipReason.BuildHold; return false; }
+
+            var zoneCoord = ZoneSystem.GetZone(position);
+            if (!_zones.TryGetValue(zoneCoord, out var state))
+            {
+                // Peek, never construct. EnsureZoneFromCache materialises a cached bake as a side effect, and
+                // this is asked about every queued ZDO in a single frame. Nothing is lost by peeking in the case
+                // that matters: ConstructCachedZonesInRange builds every cached zone in range from Update, so a
+                // zone that HAS a cache and is near enough to be creating pieces is already in _zones. A cache
+                // that exists and was still not constructed is worth telling apart from a zone nobody has baked,
+                // which is the whole difference between these two reasons.
+                reason = FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value
+                         && MeshCacheStore.TryGetPreloaded(zoneCoord, out _)
+                    ? SkipReason.ZoneBakePending
+                    : SkipReason.ZoneUnknown;
+                return false;
+            }
+            if (!state.Baked || state.Bake == null) { reason = SkipReason.ZoneBakePending; return false; }
+            // A handed-back piece skipped again before it exists would have its stand-in dropped when the hand-back ends.
+            if (state.AwaitingRecreate != null) { reason = SkipReason.AwaitingRecreate; return false; }
+            if (state.HoldReal && (state.HoldWholeZone || !s_buildingNearby)) { reason = SkipReason.ZoneHoldingReal; return false; }
+
+            identity = MeshBaker.PieceIdentity.From(zdo);
+            if (!state.Bake.PieceTransforms.TryGetValue(identity, out cached)) { reason = SkipReason.NotInBake; return false; }
+            if (!SkipEligibility.ZdoMatches(zdo, info, cached)) { reason = SkipReason.ZdoChanged; return false; }
+
+            reason = SkipReason.WouldBeSkipped;
+            return true;
+        }
+
         // ZNetScene.CreateObject prefix. True means the piece stays uncreated: its cached bake draws it and its
         // stand-in collider already exists.
+        //
+        // The verdict is WouldSkip's. What stays here is everything WouldSkip must not do: building the zone from
+        // its cache, running the defer timer, and the bookkeeping a real skip owes the rest of the mod. The cheap
+        // tests ahead of that are a pre-filter and not a second opinion - they are what keeps EnsureZoneFromCache,
+        // the one side effect on this path, off the many ZDOs that were never skip candidates to begin with.
         public static bool TrySkipCreation(ZDO zdo)
         {
             if (zdo == null || !SkipCreationActive()) return false;
@@ -828,16 +932,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return false;
             }
             DeferCreation.OnZoneBaked(zoneCoord);
-            // A handed-back piece skipped again before it exists would have its stand-in dropped when the hand-back ends.
-            if (state.AwaitingRecreate != null) return false;
-            if (state.HoldReal && (state.HoldWholeZone || !s_buildingNearby)) return false;
 
-            var identity = MeshBaker.PieceIdentity.From(zdo);
-            if (!state.Bake.PieceTransforms.TryGetValue(identity, out var cached)) return false;
-            if (!SkipEligibility.ZdoMatches(zdo, info, cached))
-            {
-                return false;
-            }
+            if (!WouldSkip(zdo, out _, out var identity, out var cached)) return false;
+
             PieceData.Sample(zdo, prefabHash);
             EnsureStandIn(state, identity, cached);
 
@@ -1061,6 +1158,22 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_standInTicks += Stopwatch.GetTimestamp() - started;
         }
 
+        private static int s_standInsNoPiece;
+        private static readonly List<ZDO> _liveScratch = new List<ZDO>();
+
+        // The identities of the pieces in this zone that this client holds a ZDO for right now.
+        private static HashSet<MeshBaker.PieceIdentity> LiveIdentities(ZoneState state)
+        {
+            var set = new HashSet<MeshBaker.PieceIdentity>();
+            var zdoMan = ZDOMan.instance;
+            if (zdoMan == null) return set;
+            _liveScratch.Clear();
+            zdoMan.FindSectorObjects(state.Coord, new SimulationDistance(0, 0), _liveScratch);
+            for (int i = 0; i < _liveScratch.Count; i++)
+                if (_liveScratch[i] != null && _liveScratch[i].IsValid()) set.Add(MeshBaker.PieceIdentity.From(_liveScratch[i]));
+            return set;
+        }
+
         private static void QueueStandIns(ZoneState state)
         {
             state.StandInQueue.Clear();
@@ -1120,11 +1233,17 @@ namespace FiresEasyBakeMeshes.EasyBake
                     var state = _zoneScratch[z];
                     if (state.StandInRoot == null)
                         state.StandInRoot = new GameObject($"[EasyBake/Zone_{state.Coord.x}_{state.Coord.y}/standins]");
+                    // R86 (the lead: bodies stalled 90 s "on StandInCollider" on test area ONE after 1.2.76): the queue is built
+                    // from the zone's SAVED bake, which still lists pieces removed while the zone was not tracked (the drill
+                    // courses' walls), so their colliders came back every session. A stand-in is only built for a piece whose
+                    // ZDO this client holds; one that arrives later gets its stand-in on arrival (EnsureStandIn).
+                    HashSet<MeshBaker.PieceIdentity> live = LiveIdentities(state);
                     while (state.StandInQueue.Count > 0)
                     {
                         if (stopwatch.Elapsed.TotalMilliseconds >= budget) return;
                         var identity = state.StandInQueue.Dequeue();
                         if (state.StandIns.ContainsKey(identity)) continue;
+                        if (!live.Contains(identity)) { s_standInsNoPiece++; continue; }
                         if (!state.Bake.PieceTransforms.TryGetValue(identity, out var transform)) continue;
                         state.StandIns[identity] = StandInColliders.Build(state.StandInRoot.transform, identity, transform, out int colliders);
                         s_standInColliders += colliders;
@@ -1506,7 +1625,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     : "Cached zones are pre-constructing ahead of population as intended."));
             EasyBakeLog.Info(
                 $"[Skip] {skippedNow} baked pieces are not created right now, in {zones} zones. So far: {s_skippedAtCreation} skipped at " +
-                $"creation, {s_deferredForBake} held for a pending bake, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built in {standInSeconds:F1} s " +
+                $"creation, {s_deferredForBake} held for a pending bake, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built in {standInSeconds:F1} s ({s_standInsNoPiece} skipped: no live piece, a stale bake) " +
                 $"({microsPerCollider:F0} microseconds each; {s_standInsOnDemand} " +
                 $"built as their pieces arrived, {s_standInZonesReused} zone revisits reused theirs); real pieces " +
                 $"brought back: {s_handedBackForBuilding} for build tools, {s_handedBackForDamage} for incoming damage, {s_handedBackForChanges} for removals or changes; " +

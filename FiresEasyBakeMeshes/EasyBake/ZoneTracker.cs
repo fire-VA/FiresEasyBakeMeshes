@@ -18,6 +18,10 @@ namespace FiresEasyBakeMeshes.EasyBake
             public readonly HashSet<ZNetView> Vegetation = new HashSet<ZNetView>();
             public float LastChangeUnscaledTime;
             public float ConstructedUnscaledTime;
+            // 1.2.83: when this zone came due to bake, its pieces went to the front of the classify queue (-1 = not yet).
+            public float ClassifyAskedAt = -1f;
+            // 1.2.85: when its instance-group prep started (the bake waits for it up to ClassifyWaitSeconds from here).
+            public float PrepAskedAt = -1f;
             public bool Baked;
             // True when this zone's bake came from the on-disk cache rather than
             // being built here. It is the difference between a revisit and a
@@ -90,6 +94,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private const float RecreateTimeoutSeconds = 20f;
         private const float EmptyZoneGraceSeconds = 10f;
         private const float CacheValidationQuietSeconds = 10f;
+        private const float ClassifyWaitSeconds = 3f;   // 1.2.83: the longest a due zone waits for its pieces' classification
         private const double StandInBudgetMs = 4.0;
         private const double LoadingStandInBudgetMs = 12.0;
         private const double ConvertBudgetMs = 2.0;
@@ -187,6 +192,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
             }
             if (!state.Pieces.Add(wnt)) return;
+            MeshBaker.QueueClassify(wnt);   // 1.2.82: classified ahead of the bake under a frame budget
 
             state.LastChangeUnscaledTime = Time.unscaledTime;
 
@@ -394,7 +400,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             InvulnerableClassifier.Forget(wnt);
             foreach (var state in _zones.Values)
             {
-                if (state.Pieces.Remove(wnt))
+                if (state.Pieces.Remove(wnt) && MeshBaker.ForgetClassed(wnt))
                 {
                     state.LastChangeUnscaledTime = Time.unscaledTime;
                     // Deliberately NOT marking dirty here — GameObject destruction
@@ -443,7 +449,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (!instanceGroups[i].TryRemove(identity)) continue;
                 state.CacheStale = true;
                 if (FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
-                    EasyBakeLog.Info($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): instanced piece removed — dropped without rebake.");
+                    EasyBakeLog.Debug($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): instanced piece removed — dropped without rebake.");
                 return;
             }
 
@@ -456,7 +462,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 HoldRealPieces(state, 0f);
             }
             if (FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
-                EasyBakeLog.Info($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): batched piece removed for real — rebake queued.");
+                EasyBakeLog.Debug($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): batched piece removed for real — rebake queued.");
         }
 
 
@@ -510,6 +516,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (!state.ZoneActive || !state.Baked) continue;
                 var bake = state.Bake;
                 if (bake == null || bake.InstanceGroups.Count == 0) continue;
+                if (!bake.Ready) continue;   // its pieces aren't all silenced yet (time-sliced suppression): no double draw
 
                 InstancedDraw.NoteZone();
                 for (int i = 0; i < bake.InstanceGroups.Count; i++)
@@ -523,6 +530,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         public static void Update()
         {
+            MeshBaker.PumpSuppression();
+            MeshBaker.PumpClassify();
             float now = Time.unscaledTime;
             float settleDelay = FiresEasyBakeMeshesPlugin.BatchingSettleDelaySeconds.Value;
             int minPerZone = FiresEasyBakeMeshesPlugin.BatchingMinPiecesPerZone.Value;
@@ -565,7 +574,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (state.Baked && state.Bake != null && state.Bake.Parent != null)
                         state.Bake.Parent.SetActive(false);
                     if (state.CacheStale && state.Baked && !state.Dirty) SaveZone(state);
+                    MeshBaker.ForgetPrep(state.Pieces);
                     state.Pieces.Clear();
+                    MeshBaker.DropPending(state.Bake);
                     state.Bake?.SuppressedPieces?.Clear();
                     ReleaseSkipped(state, parkStandIns: true);
                     state.ZoneActive = false;
@@ -674,6 +685,26 @@ namespace FiresEasyBakeMeshes.EasyBake
                     continue;
                 }
                 if (state.Skipped.Count > 0) { HoldRealPieces(state, 0f); continue; }
+
+                // 1.2.83 ([fgn] BlueHills: "classified ahead 0, at bake 513" - the shared queue had not reached this zone): a
+                // zone due to bake first puts its pieces at the front of the classify queue, and the bake waits for them under
+                // the same frame budget, at most ClassifyWaitSeconds, so the classification isn't done inside the bake frame.
+                if (FiresEasyBakeMeshesPlugin.ClassifyBudgetMs.Value > 0f)
+                {
+                    if (state.ClassifyAskedAt < 0f || state.LastChangeUnscaledTime > state.ClassifyAskedAt)   // new pieces since: ask again
+                    {
+                        state.ClassifyAskedAt = now;
+                        MeshBaker.ForgetPrep(state.Pieces);   // 1.2.84: a prep from before the new pieces is stale
+                        if (MeshBaker.ClassifyFirst(state.Pieces) > 0) continue;
+                    }
+                    if (MeshBaker.UrgentClassifyPending && now - state.ClassifyAskedAt < ClassifyWaitSeconds) continue;
+                    // 1.2.84: then its instance groups are built ahead under the same budget, inside the same wait.
+                    // 1.2.85 ([fgn] round 112023: six zones baked with "not finished (0/N walked)"): the prep's own wait counts from
+                    // when it starts, not from the classify ask, so a prep that starts late still gets its time.
+                    if (MeshBaker.PrepareGroups(state.Pieces)) state.PrepAskedAt = now;
+                    if (!MeshBaker.GroupsReady(state.Pieces) && now - state.PrepAskedAt < ClassifyWaitSeconds) continue;
+                }
+                state.ClassifyAskedAt = -1f;
 
                 if (state.Baked && state.Dirty) TearDown(state);
                 long tBake = Probe.Start();
@@ -1295,7 +1326,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (!SkipEligibility.ZdoMatches(zdo, info, cached)) continue;
                     EnsureStandIn(state, identity, cached);
 
-                    state.Pieces.Remove(wnt);
+                    state.Pieces.Remove(wnt); MeshBaker.ForgetClass(wnt);
                     instances.Remove(zdo);
                     SectorInstanceMirror.OnInstanceRemoved(zdo);
                     view.ResetZDO();
@@ -1616,14 +1647,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             // loads, before vanilla reaches the pieces, so its converted count
             // SHOULD be ~0. If it is not, the pre-construct is losing the race
             // and that is a real bug rather than a cold cache.
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"[Revisit] zones baked this period: {s_zonesFromCache} from cache, {s_zonesBakedFresh} fresh. " +
                 $"Pieces built-then-unloaded: {s_convertedOnCached} on CACHED zones (want ~0 — the bake should have " +
                 $"landed first), {s_convertedOnFresh} on FRESH zones (unavoidable; the baker needs the live pieces). " +
                 (s_convertedOnCached > s_convertedOnFresh / 4 && s_zonesFromCache > 0
                     ? "CACHED zones are still paying the build-then-destroy cost — the pre-construct is not winning the race."
                     : "Cached zones are pre-constructing ahead of population as intended."));
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"[Skip] {skippedNow} baked pieces are not created right now, in {zones} zones. So far: {s_skippedAtCreation} skipped at " +
                 $"creation, {s_deferredForBake} held for a pending bake, {s_convertedLive} unloaded after creation, {s_standInColliders} stand-in colliders built in {standInSeconds:F1} s ({s_standInsNoPiece} skipped: no live piece, a stale bake) " +
                 $"({microsPerCollider:F0} microseconds each; {s_standInsOnDemand} " +
@@ -1633,10 +1664,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 $"{s_joinedLate} pieces that arrived after their zone baked joined its instanced groups.");
 
             string data = PieceData.Report();
-            if (data != null) EasyBakeLog.Info(data);
+            if (data != null) EasyBakeLog.Debug(data);
 
             string damage = DamageReplay.Report();
-            if (damage != null) EasyBakeLog.Info(damage);
+            if (damage != null) EasyBakeLog.Debug(damage);
         }
 
         // ebm_census: every object this client created, grouped by the first reason it was not skipped, with the prefabs
@@ -1836,9 +1867,10 @@ namespace FiresEasyBakeMeshes.EasyBake
             return false;
         }
 
-        // Never baked, instanced or skipped; these pieces always keep their own renderers.
+        // Never baked, instanced or skipped; these pieces always keep their own renderers. 1.2.85: also another mod's prefab that
+        // would not look the same baked (ModdedPrefabGate).
         internal static bool IsExcludedFromBaking(GameObject go)
-            => FiresCore.Bridge.MeshBakeBridge.IsExcludedFromBaking(go) || IsExcludedPrefab(go);
+            => FiresCore.Bridge.MeshBakeBridge.IsExcludedFromBaking(go) || IsExcludedPrefab(go) || ModdedPrefabGate.Refuses(go);
 
         private static HashSet<string> s_excludedPrefabs;
 

@@ -21,7 +21,23 @@ namespace FiresEasyBakeMeshes
         public static ManualLogSource Source => _log;
 
         public static void Info(string msg)  { if (_log != null) _log.LogMessage(Fit(msg)); }
-        public static void Debug(string msg) { if (_log != null) _log.LogInfo(Fit(msg)); }
+        // 1.2.85 (Fire: "we should not be adding more noisy info logs ... put them as debug logs and set our configs to see them";
+        // the team, 19:05: BepInEx's own LogLevels stay as they are, a global Debug wakes every mod's spam): Debug lines follow
+        // Core's [Logging] Log Level (FiresLogger.DebugEnabled, Core 0.2.279+, read by name). On (the rigs: Debug), they go out
+        // at Info, a level BepInEx already shows; off (players), nothing is written. A Core without the flag counts as off.
+        public static void Debug(string msg) { if (_log != null && DebugOn()) _log.LogInfo(Fit(msg)); }
+
+        private static System.Func<bool> s_debugOn;
+
+        private static bool DebugOn()
+        {
+            if (s_debugOn == null)
+            {
+                var getter = HarmonyLib.AccessTools.PropertyGetter(HarmonyLib.AccessTools.TypeByName("FiresCore.Logging.FiresLogger"), "DebugEnabled");
+                s_debugOn = getter != null ? (System.Func<bool>)System.Delegate.CreateDelegate(typeof(System.Func<bool>), getter) : () => false;
+            }
+            try { return s_debugOn(); } catch { return false; }
+        }
         public static void Warn(string msg)  { if (_log != null) _log.LogWarning(Fit(msg)); }
         public static void Error(string msg) { if (_log != null) _log.LogError(Fit(msg)); }
 

@@ -76,7 +76,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         //       result rather than a stale one. Same class as v2/v3/v4/v6: when the rule changes, the cache is
         //       wrong and has to rebake.
         private const uint MAGIC = 0x434D4245;
-        private const int VERSION = 14;
+        //  15 - (1.2.85) a batch's material is found by name, shader and main texture (MaterialKey), not by name alone, and
+        //       another mod's prefab bakes only past ModdedPrefabGate; a v14 zone may hold a modded look under a shared name.
+        private const int VERSION = 15;
 
         // The settings whose values change what a bake contains. Compared as a unit on load; any difference
         // rejects the cache exactly as a version mismatch does, so only the zones affected by a retune pay to
@@ -113,6 +115,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 // processes, and an unstable key here would reject every cache on every launch - a permanent
                 // rebake loop that would look like the cache simply never working.
                 key = key * 31 + (FiresEasyBakeMeshesPlugin.BatchingExcludedPrefabs?.Value ?? string.Empty).GetStableHashCode();
+                key = key * 31 + ModdedPrefabGate.SettingsKey();   // 1.2.85: which modded prefabs may bake
                 return key;
             }
         }
@@ -273,13 +276,32 @@ namespace FiresEasyBakeMeshes.EasyBake
                 for (int m = 0; m < mats.Length; m++)
                     RegisterMaterial(mats[m]);
             }
+            // 1.2.88: a bake records the shared variation material a MaterialVariation(World) copy came from; register those too.
+            foreach (var mat in MaterialVariants.VariationMaterials(root))
+                RegisterMaterial(mat);
         }
 
         private static void RegisterMaterial(Material mat)
         {
             if (mat == null || string.IsNullOrEmpty(mat.name)) return;
-            if (!_materialsByName.ContainsKey(mat.name))
-                _materialsByName[mat.name] = mat;
+            string key = MaterialKey(mat);
+            if (!_materialsByName.ContainsKey(key))
+                _materialsByName[key] = mat;
+        }
+
+        // 1.2.85 ([ghost]: bundle material names collide across mods - "Wood", "Material", "default" - and a FAP mock slot
+        // carries vanilla's name because it IS vanilla's): a cached batch names its material by name, shader and main
+        // texture, so two different looks that share a name never stand in for each other.
+        internal const char MaterialKeySeparator = '\u001f';
+
+        internal static string MaterialKey(Material mat) => MaterialKey(mat, mat != null ? mat.name : null);
+
+        // The key mat would have under another name (MaterialVariants looks up an "(Instance)" copy's source by its stripped name).
+        internal static string MaterialKey(Material mat, string name)
+        {
+            if (mat == null) return "";
+            Texture main = mat.HasProperty("_MainTex") ? mat.GetTexture("_MainTex") : null;
+            return name + MaterialKeySeparator + (mat.shader != null ? mat.shader.name : "") + MaterialKeySeparator + (main != null ? main.name : "");
         }
 
         // A cached zone's materials come from the prefabs of the pieces that fed it, so indexing those few prefabs
@@ -303,7 +325,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (batches == null) return null;
             for (int i = 0; i < batches.Count; i++)
-                if (FindMaterial(batches[i].MaterialName) == null) return batches[i].MaterialName;
+                if (FindMaterial(batches[i].MaterialName) == null) return batches[i].MaterialName.Replace(MaterialKeySeparator, '/');
             return null;
         }
 
@@ -463,7 +485,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (missing != null)
             {
                 _preloaded.TryRemove(data.Coord, out _);
-                EasyBakeLog.Warn($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): cached material '{missing}' is not loaded; baking the zone fresh instead.");
+                // Debug since 1.2.88: nothing is lost, the zone bakes fresh from its live pieces and the cache file is rewritten.
+                EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): cached material '{missing}' is not loaded; baking the zone fresh instead.");
                 return null;
             }
 
@@ -536,7 +559,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var mat = FindMaterial(b.MaterialName);
                 if (mat == null) continue;
 
-                string batchName = b.MaterialName + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
+                string batchName = b.MaterialName.Split(MaterialKeySeparator)[0] + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
                 var mesh = new Mesh { name = $"EasyBakeCached_{data.Coord.x}_{data.Coord.y}_{batchName}" };
                 if (b.IndexFormatUInt32) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
                 mesh.SetVertices(b.Vertices);
@@ -684,7 +707,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 var batch = batches[i];
                 var mr = batch.Combined != null ? batch.Combined.GetComponent<MeshRenderer>() : null;
-                var matName = mr != null && mr.sharedMaterial != null ? mr.sharedMaterial.name : "";
+                var matName = mr != null ? MaterialKey(mr.sharedMaterial) : "";
                 var mesh = batch.Mesh;
                 if (mesh == null) continue;
 
@@ -791,7 +814,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void WriteBatch(BinaryWriter bw, MeshBaker.BatchInstance batch)
         {
             var mr = batch.Combined?.GetComponent<MeshRenderer>();
-            var matName = mr?.sharedMaterial?.name ?? "";
+            var matName = MaterialKey(mr?.sharedMaterial);
             var matBytes = Encoding.UTF8.GetBytes(matName);
             bw.Write(matBytes.Length);
             bw.Write(matBytes);

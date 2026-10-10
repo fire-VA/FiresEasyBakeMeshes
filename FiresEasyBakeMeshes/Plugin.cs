@@ -15,7 +15,7 @@ namespace FiresEasyBakeMeshes
     {
         public const string PluginGUID = "com.Fire.FiresEasyBakeMeshes";
         public const string PluginName = "FiresEasyBakeMeshes";
-        public const string PluginVersion = "1.2.77";
+        public const string PluginVersion = "1.2.89";
         private const string StatusSource = "EBM";
 
         public static ConfigEntry<bool> PluginEnabled;
@@ -26,6 +26,8 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<int>   BatchingMinPiecesPerZone;
         public static ConfigEntry<int>   BatchingMinPiecesPerBatch;
         public static ConfigEntry<float> BatchingSettleDelaySeconds;
+        public static ConfigEntry<float> SuppressBudgetMs;
+        public static ConfigEntry<float> ClassifyBudgetMs;
         public static ConfigEntry<bool>  BatchingFarTierEnabled;
         public static ConfigEntry<float> BatchingFarTierDistance;
         public static ConfigEntry<bool>  BatchingInstancingEnabled;
@@ -37,6 +39,7 @@ namespace FiresEasyBakeMeshes
         public static ConfigEntry<bool>  BatchingVerbose;
         public static ConfigEntry<bool>  BatchingExcludeTransparent;
         public static ConfigEntry<string> BatchingExcludedPrefabs;
+        public static ConfigEntry<string> BatchingModdedPrefabs, BatchingModdedPrefabAllowlist;
         public static ConfigEntry<bool>  SkipBakedPieceObjects;
         public static ConfigEntry<bool>  SkipOnHost;
         public static ConfigEntry<bool>  SkipDamageablePieces;
@@ -190,6 +193,21 @@ namespace FiresEasyBakeMeshes
                     "happen while you are standing in the zone watching it.",
                     new AcceptableValueRange<float>(48f, 512f)));
 
+            ClassifyBudgetMs = Config.Bind("Batching", "ClassifyBudgetMs", 2f,
+                new ConfigDescription(
+                    "Milliseconds per frame spent sorting a zone's pieces for instancing while they arrive,\n" +
+                    "before the zone bakes. A big base's sorting was most of its bake frame (60+ ms);\n" +
+                    "done ahead, the bake only re-sorts pieces that changed since. 0 = all at bake time.",
+                    new AcceptableValueRange<float>(0f, 50f)));
+
+            SuppressBudgetMs = Config.Bind("Batching", "SuppressBudgetMs", 3f,
+                new ConfigDescription(
+                    "Milliseconds per frame spent hiding the original pieces a bake replaces.\n" +
+                    "A big base hides tens of thousands of pieces; doing it all in the bake's\n" +
+                    "frame was a 100-200 ms hitch. The combined mesh appears once all of its\n" +
+                    "pieces are hidden, so nothing draws twice. 0 = all in one frame (old behaviour).",
+                    new AcceptableValueRange<float>(0f, 50f)));
+
             BatchingSettleDelaySeconds = Config.Bind("Batching", "SettleDelaySeconds", 1.5f,
                 new ConfigDescription(
                     "Wait this long after the last piece is added or removed in a zone\n" +
@@ -208,6 +226,15 @@ namespace FiresEasyBakeMeshes
                 "per pane, a merged mesh sorts once for the whole batch. Excluded pieces\n" +
                 "stay live and render normally.");
 
+            BatchingModdedPrefabs = Config.Bind("Batching", "ModdedPrefabs", EasyBake.ModdedPrefabGate.Checked,
+                new ConfigDescription(
+                    "Other mods' pieces: Checked = bake one only when everything it draws uses the game's own shaders, with no\n" +
+                    "keyword the game never sets, no texture array and no per-object material values (else it keeps its own\n" +
+                    "renderers, logged once: \"[EBM] skipped <prefab> (<mod>): <reason>\"); Skip = never bake another mod's piece;\n" +
+                    "Bake = bake them like vanilla pieces (before 1.2.85). Relog to rebake zones already baked.",
+                    new AcceptableValueList<string>(EasyBake.ModdedPrefabGate.Checked, EasyBake.ModdedPrefabGate.Skip, EasyBake.ModdedPrefabGate.Bake)));
+            BatchingModdedPrefabAllowlist = Config.Bind("Batching", "ModdedPrefabAllowlist", "",
+                "Comma-separated prefab names (exact) of other mods' pieces that bake whatever the ModdedPrefabs checks say.");
             BatchingExcludedPrefabs = Config.Bind("Batching", "ExcludedPrefabs", "",
                 "Comma-separated prefab names (exact, case-sensitive) that are never baked, instanced or skipped:\n" +
                 "they always keep their own renderers. Add a prefab here when the bake draws it wrong. Mods can\n" +
@@ -499,13 +526,18 @@ namespace FiresEasyBakeMeshes
                 "the single largest per-frame cost; this short-circuit reclaims roughly\n" +
                 "30 ms/sec. Disable only if a mod conflict requires vanilla behavior.");
 
-            ZoneKeepaliveEnabled = Config.Bind("Optimize", "ZoneKeepaliveEnabled", true,
-                "Pin baked zones in ZNetScene.m_instances when the player walks outside\n" +
-                "the active ring, instead of letting vanilla destroy and re-Instantiate\n" +
-                "them on the next zone-cross. Eliminates the multi-hundred-ms hitches\n" +
-                "from cache-mesh reconstruction + mass re-Instantiate when moving around\n" +
-                "town. Memory cost scales with KeepaliveRadius; CPU cost is near zero\n" +
-                "with the WearNTear short-circuit also enabled.");
+            // 1.2.86 (Fire, 10-05, from a player): off by default. An existing cfg keeps the value it already has.
+            ZoneKeepaliveEnabled = Config.Bind("Optimize", "ZoneKeepaliveEnabled", false,
+                "Keep baked zones loaded after you walk out of them, instead of letting\n" +
+                "the game unload them and load them again when you come back.\n" +
+                "COST: every pinned zone's objects stay in memory and stay live, up to\n" +
+                "(2 x ZoneKeepaliveRadius + 1)^2 zones (961 at radius 15) for\n" +
+                "ZoneKeepaliveSeconds after you leave. That is more RAM, and the game\n" +
+                "keeps working on objects you are no longer near.\n" +
+                "TURN ON for a big base or town you walk in and out of all the time,\n" +
+                "where re-entering a zone hitches for hundreds of ms while it rebuilds,\n" +
+                "and you have memory to spare. Leave off otherwise. Only works on a\n" +
+                "client where baking skips object creation (never on a server).");
 
             ZoneKeepaliveRadius = Config.Bind("Optimize", "ZoneKeepaliveRadius", 15,
                 new ConfigDescription(
@@ -822,6 +854,9 @@ namespace FiresEasyBakeMeshes
                     EasyBakeLog.Info($"{PluginName} disabled via config â€” patches removed, subsystem state reset.");
                 }
             };
+
+            EasyBakeLog.Debug($"[Keepalive] ZoneKeepaliveEnabled = {ZoneKeepaliveEnabled.Value} (default off since 1.2.86), radius "
+                + $"{ZoneKeepaliveRadius.Value} zone(s), {ZoneKeepaliveSeconds.Value:0} s after leaving");
 
             if (PluginEnabled.Value)
                 ApplyPatches();

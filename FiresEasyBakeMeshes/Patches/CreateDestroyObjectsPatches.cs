@@ -169,7 +169,7 @@ namespace FiresEasyBakeMeshes.Patches
                 if (FiresEasyBakeMeshesPlugin.CreateDestroySkipVerbose.Value
                     && (now - _lastReportTime) > 5f)
                 {
-                    EasyBakeLog.Info(
+                    EasyBakeLog.Debug(
                         $"[CDS] Skipped {_skippedSinceReport} CreateDestroyObjects ticks " +
                         $"in last {now - _lastReportTime:F1}s " +
                         $"(center={center.x},{center.y}, zones={zoneCount}, instances={instanceCount}, zdos={zdoCount}).");

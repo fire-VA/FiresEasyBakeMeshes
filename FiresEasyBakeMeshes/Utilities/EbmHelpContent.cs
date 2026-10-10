@@ -20,7 +20,8 @@ namespace FiresEasyBakeMeshes.Utilities
         private static void BuildOverview(FiresCore.Help.HelpContentWriter w)
         {
             w.Header("What Easy Bake Does");
-            w.Paragraph("Fires Easy Bake Meshes is a silent performance mod — no UI, no commands. You " +
+            w.Paragraph("Fires Easy Bake Meshes is a silent performance mod — no UI, and two read-only report commands " +
+                "(ebm_census, ebm_vegetation). You " +
                 "experience it as smoother frames, especially around large builds and when crossing zone " +
                 "borders.");
             w.Divider();
@@ -39,15 +40,15 @@ namespace FiresEasyBakeMeshes.Utilities
                 "swaps to it past [Batching] FarTierDistanceMeters (default 64m, which is far enough " +
                 "that the swap never happens while you are standing in that zone).");
             w.Bullet("Disk cache — baked meshes persist per world and reload ~4x faster next session.");
-            w.Bullet("Zone keepalive — recently-visited baked zones stay pinned briefly instead of being " +
+            w.Bullet("Zone keepalive (OFF by default since 1.2.86; [Optimize] ZoneKeepaliveEnabled) — when on, recently-visited baked zones stay pinned briefly instead of being " +
                 "destroyed and rebuilt when you cross back.");
             w.Bullet("A set of steady-state CPU trims: time-sliced object destruction, wear-and-tear " +
                 "short-circuits for invulnerable pieces, distance-LOD on light flicker/sound/clutter " +
                 "updates, and static-piece sync skips.");
             w.Divider();
 
-            w.Paragraph("Everything is local to your machine and can be switched off live — " +
-                "[General] PluginEnabled in F8 applies without a restart.");
+            w.Paragraph("Everything is local to your machine and can be switched off with " +
+                "[General] PluginEnabled (F8); it takes effect after a restart (the patches are applied at start).");
         }
 
         private static void BuildTuning(FiresCore.Help.HelpContentWriter w)

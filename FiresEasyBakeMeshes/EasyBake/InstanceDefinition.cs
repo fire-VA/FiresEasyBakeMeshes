@@ -61,11 +61,27 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static readonly HashSet<string> s_farOffsetLogged = new HashSet<string>();
 
+        // 1.2.85 (an external report via Fire: another mod's textures broke with EBM installed): EBM no longer sets
+        // enableInstancing on a prefab's own shared material, which changed that material for every renderer in the game
+        // (another mod's, or vanilla's through a mod's mock slot). A material that doesn't already instance is drawn through
+        // EBM's own copy of it, made once per material.
+        private static readonly Dictionary<Material, Material> s_instancingCopies = new Dictionary<Material, Material>();
+
+        private static Material InstancingMaterial(Material material)
+        {
+            if (material.enableInstancing) return material;
+            if (s_instancingCopies.TryGetValue(material, out Material copy) && copy != null) return copy;
+            copy = new Material(material) { name = material.name + " (EBM instancing)", enableInstancing = true };
+            s_instancingCopies[material] = copy;
+            return copy;
+        }
+
         public static bool TryBuild(GameObject prefab, WearLook look, out InstanceDefinition definition, out string rejectReason)
         {
             definition = null;
             rejectReason = null;
             if (prefab == null) { rejectReason = "null prefab"; return false; }
+            if (ModdedPrefabGate.Refuses(prefab, out string modded)) { rejectReason = "modded prefab: " + modded; return false; }
 
             // Only MeshRenderers are silenced when a piece is suppressed, so only they have to be
             // redrawn here; particles and anything else keep drawing themselves as they always did.
@@ -120,14 +136,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (material == null) { rejectReason = "null material"; return false; }
                     if (parts.Count == MaxParts) { rejectReason = "more than " + MaxParts + " parts"; return false; }
 
-                    material.enableInstancing = true;
                     parts.Add(new InstancePart
                     {
                         NearMesh = nearMesh,
                         FarMesh = ResolveFarMesh(prefab, look, renderer, nearMesh, material, m),
                         SubMesh = m,
                         FromFirst = i == 0 ? Matrix4x4.identity : firstInverse * offset,
-                        RenderParams = new RenderParams(material)
+                        RenderParams = new RenderParams(InstancingMaterial(material))
                         {
                             shadowCastingMode = renderer.shadowCastingMode,
                             receiveShadows = renderer.receiveShadows,

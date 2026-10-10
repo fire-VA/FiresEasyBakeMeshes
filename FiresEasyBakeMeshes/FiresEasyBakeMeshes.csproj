@@ -85,8 +85,11 @@
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\VegetationInstancing.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
+    <Compile Include="EasyBake\MaterialVariants.cs" />
+    <Compile Include="EasyBake\BakeProfile.cs" />
     <Compile Include="EasyBake\EasyBakeSuppressedVisuals.cs" />
     <Compile Include="EasyBake\InstanceDefinition.cs" />
+    <Compile Include="EasyBake\ModdedPrefabGate.cs" />
     <Compile Include="EasyBake\ZoneInstanceGroup.cs" />
     <Compile Include="EasyBake\InstancedDraw.cs" />
     <Compile Include="EasyBake\MeshCacheStore.cs" />

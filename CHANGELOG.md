@@ -1,3 +1,9 @@
+* v1.2.89 - updates and fixes
+  - fixes and optimizations
+
+* v1.2.86 - updates and optimizations for Valheim 1.0
+  - smoother big bases, and zone keep-alive is now off by default (turn it on for a base you walk in and out of)
+
 * v1.2.77 - updates and optimizations for Valheim 1.0
   - smoother loading into big bases
 

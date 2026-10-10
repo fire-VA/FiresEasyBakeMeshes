@@ -33,6 +33,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             public List<BatchInstance> FarBatches = new List<BatchInstance>();
             public bool ShowingFarTier;
             public List<EasyBakeSuppressedVisuals> SuppressedPieces = new List<EasyBakeSuppressedVisuals>();
+            // Time-sliced suppression (BlueHills profile, Fire 09-30: suppress was 55 % of the bake, one zone 193 ms in a
+            // frame). Bake queues the pieces to silence here; PumpSuppression works them off under a per-frame budget.
+            // Until the last is silenced the bake is not Ready: its Parent stays inactive and its instance groups don't
+            // draw, so the originals keep drawing and nothing is ever drawn twice.
+            public readonly List<GameObject> PendingSuppress = new List<GameObject>();
+            public bool Ready = true;
             // Identity of every piece that fed at least one batch. Used on zone
             // reload to recognise the same pieces returning and disable their
             // renderers without rebaking.
@@ -258,9 +264,11 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             int candidates = 0, skippedNonLod0 = 0, skippedPropertyBlock = 0, skippedNonReadable = 0;
+            BakeProfile.BeginZone();
 
             var result = new BakeResult();
             var instancedPieces = BuildInstanceGroups(pieces, result.InstanceGroups);
+            BakeProfile.Mark(BakeProfile.Phase.InstanceGroups);
 
             EnsureBakeMarkers();
             s_collectMarker.Begin();
@@ -284,6 +292,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
 
             s_collectMarker.End();
+            BakeProfile.Mark(BakeProfile.Phase.Collect);
 
             var byBatchKey = new Dictionary<BatchKey, List<MeshContribution>>();
             for (int p = 0; p < pieceInfos.Count; p++)
@@ -327,10 +336,12 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (!covered && info.AnyContribution) partialPieces++;
             }
 
+            BakeProfile.Mark(BakeProfile.Phase.GroupCover);
             var parent = new GameObject($"[EasyBake/Zone_{coord.x}_{coord.y}]");
             parent.transform.position = Vector3.zero;
             parent.isStatic = true;
             result.Parent = parent;
+            BakeProfile.Mark(BakeProfile.Phase.Objects, gameObjects: 1);
 
             // A covered piece keeps its LOD1 geometry for the far tier only if that
             // geometry lands in the very same batches its LOD0 geometry feeds. Anything
@@ -370,6 +381,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 GroupContributions(info.FarContributions, farCovered);
             }
 
+            BakeProfile.Mark(BakeProfile.Phase.GroupCover);
             s_combineMarker.Begin();
             totalContributions = BuildTierBatches(coord, parent, materialized, nearCovered, result.Batches, farTier: false);
             BuildTierBatches(coord, parent, materialized, farCovered, result.FarBatches, farTier: true);
@@ -385,6 +397,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // We also record an identity (prefab hash + cm-quantised world pos) so that
             // when this zone unloads + reloads later, the new piece instances can be
             // matched against the cache and re-suppressed without rebaking.
+            BakeProfile.Mark(BakeProfile.Phase.Other);
             s_suppressMarker.Begin();
             result.ContributorIdentities = new HashSet<PieceIdentity>();
             for (int p = 0; p < pieceInfos.Count; p++)
@@ -394,29 +407,38 @@ namespace FiresEasyBakeMeshes.EasyBake
                 bool drawn = info.FullyCovered && info.AnyContribution;
                 if (!drawn && !info.DrawsNothing) continue;
 
-                var identity = PieceIdentity.From(info.Source.gameObject, info.Source.transform.position);
+                var sourceZdo = ZdoOf(info.Source); var identity = sourceZdo != null ? PieceIdentity.From(sourceZdo) : PieceIdentity.From(info.Source.gameObject, info.Source.transform.position);
                 result.ContributorIdentities.Add(identity);
-                result.PieceTransforms[identity] = PieceTransform.From(info.Source.transform, info.Look);
+                // 1.2.83: a static piece classified at this ZDO revision already holds its placement (read ahead of the bake).
+                if (sourceZdo != null && s_classes.TryGetValue(info.Source, out PieceClass known) && known.Static && known.Eligible
+                    && known.Revision == sourceZdo.DataRevision)
+                {
+                    var placed = known.Transform;
+                    placed.Look = info.Look;
+                    result.PieceTransforms[identity] = placed;
+                }
+                else result.PieceTransforms[identity] = PieceTransform.From(info.Source.transform, info.Look);
                 if (!drawn) continue;
 
-                var suppression = EasyBakeSuppressedVisuals.SuppressPiece(info.Source.gameObject);
-                if (suppression != null) result.SuppressedPieces.Add(suppression);
+                result.PendingSuppress.Add(info.Source.gameObject);
             }
 
             // Instanced pieces are suppressed on the same terms: their whole prefab is
             // now drawn by the instanced mesh, so hiding the original redraws nothing.
+            BakeProfile.Mark(BakeProfile.Phase.Suppress);
             var instancedVegetation = VegetationInstancing.BuildInstanceGroups(vegetation, result.InstanceGroups, result.PieceTransforms);
+            BakeProfile.Mark(BakeProfile.Phase.Vegetation);
             foreach (var view in instancedVegetation)
             {
                 result.ContributorIdentities.Add(PieceIdentity.From(view.gameObject, view.transform.position));
-                var vegetationSuppression = EasyBakeSuppressedVisuals.SuppressPiece(view.gameObject);
-                if (vegetationSuppression != null) result.SuppressedPieces.Add(vegetationSuppression);
+                result.PendingSuppress.Add(view.gameObject);
             }
 
             foreach (var piece in instancedPieces)
             {
-                if (piece == null || piece.gameObject == null) continue;
-                var instancedIdentity = PieceIdentity.From(piece.gameObject, piece.transform.position);
+                if (piece == null) continue;
+                bool known = s_instancedInfo.TryGetValue(piece, out var info2);
+                var instancedIdentity = known ? info2.Identity : PieceIdentity.From(piece.gameObject, piece.transform.position);
                 result.ContributorIdentities.Add(instancedIdentity);
                 // A stand-in transform is what skipping and stand-ins key on, so a piece with no entry here
                 // CANNOT be skipped however eligible it looks - ZdoMatches needs the cached rotation, scale and
@@ -429,15 +451,18 @@ namespace FiresEasyBakeMeshes.EasyBake
                 // Damageable pieces reach the bake ONLY as instances, never merged (see the combine candidate
                 // filter above: merged geometry would need a rebake per hit), so this loop is the only place
                 // that can record one for them.
-                if (InvulnerableClassifier.IsInvulnerable(piece) || SkipEligibility.DamageableSkipAllowed)
-                    result.PieceTransforms[instancedIdentity] = PieceTransform.From(piece.transform, LookOf(piece));
-                var instancedSuppression = EasyBakeSuppressedVisuals.SuppressPiece(piece.gameObject);
-                if (instancedSuppression != null) result.SuppressedPieces.Add(instancedSuppression);
+                // 1.2.83: the classification's own copies (read ahead of the bake) for a static piece.
+                if ((known ? info2.Invulnerable : InvulnerableClassifier.IsInvulnerable(piece)) || SkipEligibility.DamageableSkipAllowed)
+                    result.PieceTransforms[instancedIdentity] = known && info2.Static ? info2.Transform
+                        : PieceTransform.From(piece.transform, known ? info2.Key.Look : LookOf(piece));
+                result.PendingSuppress.Add(piece.gameObject);
             }
 
             s_suppressMarker.End();
+            BakeProfile.Mark(BakeProfile.Phase.Suppress);
 
             sw.Stop();
+            BakeProfile.EndZone(coord, pieces.Count, candidates, totalContributions, result.Batches.Count + result.FarBatches.Count);
             BakeSummary.RecordFreshBake(result.Batches.Count, sw.ElapsedMilliseconds);
             if ((result.Batches.Count > 0 && FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
                 || FiresEasyBakeMeshesPlugin.BatchingVerbose.Value)
@@ -449,7 +474,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     $"far tier {result.FarBatches.Count} batches ({piecesWithFarGeometry} pieces with real LOD1 geometry), " +
                     $"instanced {result.InstanceGroups.Count} prefab groups covering {instancedPieces.Count} pieces, " +
                     (result.InstanceGroups.Count == 0 ? $"instancing rejections: {InstanceDefinitionCache.DescribeRejections()}, " : "") +
-                    $"suppressed {result.SuppressedPieces.Count} pieces, " +
+                    $"queued {result.PendingSuppress.Count} pieces to suppress (time-sliced), " +
                     $"left {partialPieces} partial pieces vanilla (un-bakeable parts), " +
                     $"cached {result.ContributorIdentities?.Count ?? 0} identities in {sw.ElapsedMilliseconds}ms.");
             }
@@ -458,12 +483,65 @@ namespace FiresEasyBakeMeshes.EasyBake
                 UnityEngine.Object.Destroy(parent);
                 result.Parent = null;
             }
+            if (result.PendingSuppress.Count > 0)
+            {
+                result.Ready = false;
+                if (result.Parent != null) result.Parent.SetActive(false);
+                s_pendingBakes.Add(result);
+            }
             return result;
+        }
+
+        private static readonly List<BakeResult> s_pendingBakes = new List<BakeResult>();
+
+        // Once a frame (ZoneTracker.Update): silence queued pieces until the frame's budget is spent. A bake whose last
+        // piece is silenced turns Ready and shows its combined meshes (and its instance groups start drawing).
+        public static void PumpSuppression()
+        {
+            if (s_pendingBakes.Count == 0) return;
+            float budgetMs = FiresEasyBakeMeshesPlugin.SuppressBudgetMs.Value;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            int done = 0;
+            while (s_pendingBakes.Count > 0)
+            {
+                var result = s_pendingBakes[0];
+                var pending = result.PendingSuppress;
+                while (pending.Count > 0)
+                {
+                    if (budgetMs > 0f && done > 0 && clock.Elapsed.TotalMilliseconds >= budgetMs) break;
+                    int last = pending.Count - 1;
+                    var go = pending[last];
+                    pending.RemoveAt(last);
+                    done++;
+                    if (go == null) continue;
+                    var suppression = EasyBakeSuppressedVisuals.SuppressPiece(go);
+                    if (suppression != null) result.SuppressedPieces.Add(suppression);
+                }
+                if (pending.Count > 0) break;
+                s_pendingBakes.RemoveAt(0);
+                if (!result.Ready)
+                {
+                    result.Ready = true;
+                    if (result.Parent != null) result.Parent.SetActive(true);
+                }
+            }
+            BakeProfile.NoteSuppressSlice(clock.ElapsedTicks, done, s_pendingBakes.Count);
+        }
+
+        // A bake torn down or unloaded before its queue ran out: nothing more to silence (what was silenced is restored by
+        // Restore as before).
+        internal static void DropPending(BakeResult result)
+        {
+            if (result == null) return;
+            result.PendingSuppress.Clear();
+            s_pendingBakes.Remove(result);
+            result.Ready = true;
         }
 
         public static void Restore(BakeResult result)
         {
             if (result == null) return;
+            DropPending(result);
 
             if (result.SuppressedPieces != null)
             {
@@ -633,6 +711,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 var material = s_bakeMaterials[s];
                 if (material == null) continue;
+                material = MaterialVariants.SharedSource(mr, material);   // 1.2.88: one batch per variant, nameable in the cache
                 var batchKey = BatchKey.From(mr, material);
                 if (recordKeysInto != null) recordKeysInto.Add(batchKey);
                 into.Add(new MeshContribution
@@ -802,22 +881,46 @@ namespace FiresEasyBakeMeshes.EasyBake
         // MinInstancesPerPrefab times or cannot be combined at all, becomes a GPU-instanced group, and those pieces are held
         // back so the combine path skips them. The rest fall through to combining, where they still batch by material with
         // everything else.
+        private static readonly Dictionary<WearNTear, PieceClass> s_instancedInfo =
+            new Dictionary<WearNTear, PieceClass>();
+
         private static HashSet<WearNTear> BuildInstanceGroups(HashSet<WearNTear> pieces, List<ZoneInstanceGroup> into)
         {
+            s_instancedInfo.Clear();
+            if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return new HashSet<WearNTear>();
+            // 1.2.84: the groups built ahead of the bake (PumpGroups) are handed over when the zone hasn't changed since; the bake
+            // only checks each piece is alive at the revision it was grouped at.
+            if (TakePrepared(pieces, into, out HashSet<WearNTear> ready)) return ready;
             var instanced = new HashSet<WearNTear>();
-            if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return instanced;
 
             var candidatesByKey = new Dictionary<InstanceKey, List<WearNTear>>();
+            int cached = 0, inline = 0;
+            long inlineTicks = 0;
+            long loopStart = BakeProfile.Now();
             foreach (var wnt in pieces)
             {
-                if (wnt == null || wnt.gameObject == null) continue;
+                // 1.2.83: one native liveness check (a live WearNTear always has its GameObject; the second check was a
+                // second native call per piece).
+                if (wnt == null) continue;
                 var zdo = ZdoOf(wnt);
                 if (zdo == null) continue;
-                if (!InvulnerableClassifier.IsInvulnerable(wnt)
-                    && (!FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value || !ShowsHealthyState(wnt))) continue;
-                if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) continue;
-
-                var key = new InstanceKey(zdo.GetPrefab(), LookOf(zdo));
+                // 1.2.82 (BlueHills F/G: instance grouping ~75 % of the worst zone, 60-63 ms in one frame): the per-piece
+                // classification was worked out while the zone's pieces arrived (PumpClassify, a per-frame budget, during the
+                // settle delay); a piece whose ZDO changed since (its data revision) is classified again here.
+                if (s_classes.TryGetValue(wnt, out PieceClass c) && c.Revision == zdo.DataRevision) cached++;
+                else
+                {
+                    long t = BakeProfile.Now();
+                    c = Classify(wnt, zdo);
+                    s_classes[wnt] = c;
+                    inline++;
+                    inlineTicks += BakeProfile.Now() - t;
+                }
+                if (!c.Eligible) continue;
+                var key = c.Key;
+                // 1.2.80: each piece's identity and look worked out once and reused by Bake's instanced loop; 1.2.83: the whole
+                // classification (matrix, transform, invulnerability) for the group build and the suppress bookkeeping.
+                s_instancedInfo[wnt] = c;
                 if (!InstanceDefinitionCache.TryGet(key, out _)) continue;
 
                 if (!candidatesByKey.TryGetValue(key, out var list))
@@ -828,6 +931,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 list.Add(wnt);
             }
 
+            long groupStart = BakeProfile.Now();
             int minInstances = FiresEasyBakeMeshesPlugin.BatchingMinInstancesPerPrefab.Value;
             foreach (var entry in candidatesByKey)
             {
@@ -840,14 +944,257 @@ namespace FiresEasyBakeMeshes.EasyBake
                 for (int i = 0; i < entry.Value.Count; i++)
                 {
                     var piece = entry.Value[i];
-                    group.Add(piece.transform.localToWorldMatrix,
-                        PieceIdentity.From(piece.gameObject, piece.transform.position));
+                    var pc = s_instancedInfo[piece];
+                    group.Add(pc.Static ? pc.Matrix : piece.transform.localToWorldMatrix, pc.Identity);
                     instanced.Add(piece);
                 }
                 group.RecomputeBounds();
                 into.Add(group);
             }
+            long end = BakeProfile.Now();
+            BakeProfile.NoteClassify(cached, inline);
+            BakeProfile.NoteInstanceSplit(groupStart - loopStart - inlineTicks, inlineTicks, end - groupStart);
             return instanced;
+        }
+
+        // ── Instance groups built ahead of the bake (1.2.84) ─────────────────────────────────────────────────────────
+        // [fgn]'s BlueHills round on 1.2.83: (-17,11) still spent "instance = loop 26.5 + at-bake classify 0.1 + groups 17.3 ms"
+        // in the bake frame with every piece classified ahead. A zone due to bake (ZoneTracker, after its classification) gets a
+        // ZonePrep: its pieces copied once, then walked under the classify budget (PumpClassify's frame time) into buckets and,
+        // when all are walked, into finished ZoneInstanceGroups and the instanced set. The bake takes them when the zone's piece
+        // count is the same and every grouped piece is still alive at the ZDO revision it was grouped at; otherwise it groups the
+        // usual way. A prep is dropped once taken, and on unload.
+        private sealed class ZonePrep
+        {
+            public WearNTear[] Items;
+            public int Next;
+            public readonly Dictionary<InstanceKey, List<WearNTear>> ByKey = new Dictionary<InstanceKey, List<WearNTear>>();
+            public readonly Dictionary<WearNTear, PieceClass> Info = new Dictionary<WearNTear, PieceClass>();
+            public List<ZoneInstanceGroup> Groups;
+            public HashSet<WearNTear> Instanced;
+            public int Cached, Inline;
+            public bool Done => Groups != null;
+        }
+
+        private static readonly Dictionary<HashSet<WearNTear>, ZonePrep> s_preps = new Dictionary<HashSet<WearNTear>, ZonePrep>();
+
+        // True when a prep was started now (1.2.85: the zone's wait for it counts from here).
+        internal static bool PrepareGroups(HashSet<WearNTear> pieces)
+        {
+            if (pieces == null || !FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value || s_preps.ContainsKey(pieces)) return false;
+            var items = new WearNTear[pieces.Count];
+            pieces.CopyTo(items);
+            s_preps[pieces] = new ZonePrep { Items = items };
+            return true;
+        }
+
+        internal static bool GroupsReady(HashSet<WearNTear> pieces) => pieces != null && s_preps.TryGetValue(pieces, out var p) && p.Done;
+
+        internal static void ForgetPrep(HashSet<WearNTear> pieces) { if (pieces != null) s_preps.Remove(pieces); }
+
+        // One slice of the preps, inside PumpClassify's budget (after its urgent queue): true while work is left.
+        private static void PumpGroups(System.Diagnostics.Stopwatch clock, float budgetMs)
+        {
+            if (s_preps.Count == 0) return;
+            foreach (var prep in s_preps.Values)
+            {
+                if (prep.Done) continue;
+                while (prep.Next < prep.Items.Length)
+                {
+                    if (clock.Elapsed.TotalMilliseconds >= budgetMs) return;
+                    var wnt = prep.Items[prep.Next++];
+                    if (wnt == null) continue;
+                    var zdo = ZdoOf(wnt);
+                    if (zdo == null) continue;
+                    if (s_classes.TryGetValue(wnt, out PieceClass c) && c.Revision == zdo.DataRevision) prep.Cached++;
+                    else { c = Classify(wnt, zdo); s_classes[wnt] = c; prep.Inline++; }
+                    if (!c.Eligible) continue;
+                    prep.Info[wnt] = c;
+                    if (!InstanceDefinitionCache.TryGet(c.Key, out _)) continue;
+                    if (!prep.ByKey.TryGetValue(c.Key, out var list)) prep.ByKey[c.Key] = list = new List<WearNTear>();
+                    list.Add(wnt);
+                }
+                // All walked: the groups themselves (as the bake would build them), in one go (a fraction of the walk).
+                var groups = new List<ZoneInstanceGroup>();
+                var instanced = new HashSet<WearNTear>();
+                int minInstances = FiresEasyBakeMeshesPlugin.BatchingMinInstancesPerPrefab.Value;
+                foreach (var entry in prep.ByKey)
+                {
+                    if (entry.Value.Count < minInstances && !OnlyInstancingCanDraw(entry.Key.PrefabHash, entry.Value)) continue;
+                    if (!InstanceDefinitionCache.TryGet(entry.Key, out InstanceDefinition definition)) continue;
+                    var group = new ZoneInstanceGroup { PrefabHash = entry.Key.PrefabHash, Look = entry.Key.Look, Definition = definition };
+                    foreach (var piece in entry.Value)
+                    {
+                        var pc = prep.Info[piece];
+                        group.Add(pc.Static ? pc.Matrix : piece.transform.localToWorldMatrix, pc.Identity);
+                        instanced.Add(piece);
+                    }
+                    group.RecomputeBounds();
+                    groups.Add(group);
+                }
+                prep.Instanced = instanced;
+                prep.Groups = groups;
+                return;
+            }
+        }
+
+        // The bake's side: the prepared groups when they still hold for this zone (see ZonePrep).
+        private static bool TakePrepared(HashSet<WearNTear> pieces, List<ZoneInstanceGroup> into, out HashSet<WearNTear> instanced)
+        {
+            instanced = null;
+            if (!s_preps.TryGetValue(pieces, out var prep)) return false;
+            s_preps.Remove(pieces);
+            long start = BakeProfile.Now();
+            string why = null;
+            if (!prep.Done) why = $"not finished ({prep.Next}/{prep.Items.Length} walked)";
+            else if (prep.Items.Length != pieces.Count) why = $"the zone changed ({prep.Items.Length} -> {pieces.Count} pieces)";
+            else
+            {
+                // 1.2.85 ([fgn] BlueHills round 20261001-112023: (-17,10) 97.2 ms, "a grouped piece changed or went"): the owner writes
+                // support and health into piece ZDOs all the time, so in a 9000-piece zone one revision has nearly always moved. A piece
+                // whose revision moved is classified again here; the prep holds while it still classifies to the same group (eligible,
+                // same key); a piece gone, or one that changed group, falls back to grouping at bake.
+                int moved = 0;
+                foreach (var kv in prep.Info)
+                {
+                    PieceClass c = kv.Value;
+                    if (kv.Key == null || c.Zdo == null || !c.Zdo.IsValid()) { why = "a grouped piece went"; break; }
+                    if (c.Zdo.DataRevision == c.Revision) continue;
+                    PieceClass now = Classify(kv.Key, c.Zdo);
+                    s_classes[kv.Key] = now;
+                    moved++;
+                    if (!now.Eligible || !now.Key.Equals(c.Key)) { why = $"a grouped piece changed group ({Utils.GetPrefabName(kv.Key.gameObject)})"; break; }
+                    // Same group: the prepared matrix and identity still hold (a static piece doesn't move; its identity is its ZDO's).
+                    c.Revision = now.Revision;
+                }
+                if (why == null) BakeProfile.NotePreparedRechecked(moved);
+            }
+            if (why != null) { BakeProfile.NotePrepared(false, why); return false; }
+            foreach (var kv in prep.Info) s_instancedInfo[kv.Key] = kv.Value;
+            into.AddRange(prep.Groups);
+            instanced = prep.Instanced;
+            BakeProfile.NoteClassify(prep.Cached, prep.Inline);
+            BakeProfile.NoteInstanceSplit(BakeProfile.Now() - start, 0, 0);
+            BakeProfile.NotePrepared(true, null);
+            return true;
+        }
+
+        // ── Per-piece classification, worked out ahead of the bake (1.2.82) ─────────────────────────────────────────
+        // 1.2.84: a class (it was a struct of ~180 bytes, copied on every dictionary read and write in the bake's loops), holding
+        // the ZDO it was classified from so a prepared group can be checked without a component lookup.
+        internal sealed class PieceClass
+        {
+            public ZDO Zdo;
+            public bool Eligible;          // an instancing candidate (invulnerable, or damageable showing its healthy look; not live)
+            public InstanceKey Key;
+            public PieceIdentity Identity;
+            public uint Revision;          // the ZDO's data revision when classified; any change re-classifies at bake
+            // 1.2.83 ([fgn] BlueHills (-17,11): 54 ms of instance grouping with 88 % classified ahead, ~4.8 us a piece, and
+            // 34.8 ms of suppress bookkeeping in the bake frame, both mostly native transform reads): a static piece's
+            // placement is read once, here, ahead of the bake. Static = nothing under a Rigidbody (a ship's pieces move);
+            // a static piece's transform is set at creation and never synced after, so the copy stays right.
+            public bool Static;
+            public Matrix4x4 Matrix;
+            public PieceTransform Transform;   // the stand-in transform the suppress loop records (with the look)
+            public bool Invulnerable;
+        }
+
+        private static readonly Dictionary<WearNTear, PieceClass> s_classes = new Dictionary<WearNTear, PieceClass>();
+        private static readonly Queue<WearNTear> s_classQueue = new Queue<WearNTear>();
+        private static int s_classSweepAt = 65536;
+
+        private static PieceClass Classify(WearNTear wnt, ZDO zdo)
+        {
+            var c = new PieceClass { Revision = zdo.DataRevision, Zdo = zdo };
+            c.Eligible = (InvulnerableClassifier.IsInvulnerable(wnt)
+                          || (FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value && ShowsHealthyState(wnt)))
+                         && !PieceData.MustStayLive(zdo, zdo.GetPrefab());
+            if (!c.Eligible) return c;
+            long lookStart = BakeProfile.Now();
+            c.Key = new InstanceKey(zdo.GetPrefab(), LookOf(zdo));
+            BakeProfile.NoteInstanceLook(lookStart);
+            c.Identity = PieceIdentity.From(zdo);
+            c.Invulnerable = InvulnerableClassifier.IsInvulnerable(wnt);
+            c.Static = wnt.GetComponentInParent<Rigidbody>() == null;
+            if (c.Static)
+            {
+                Transform t = wnt.transform;
+                c.Matrix = t.localToWorldMatrix;
+                c.Transform = PieceTransform.From(t, c.Key.Look);
+            }
+            return c;
+        }
+
+        // A piece joined a zone (ZoneTracker): classified later under the frame budget.
+        internal static void QueueClassify(WearNTear wnt)
+        {
+            if (wnt != null && FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) s_classQueue.Enqueue(wnt);
+        }
+
+        internal static void ForgetClass(WearNTear wnt)
+        {
+            if (wnt != null) s_classes.Remove(wnt);
+        }
+
+        // ForgetClass inside a condition that must stay true (the piece was in the zone).
+        internal static bool ForgetClassed(WearNTear wnt)
+        {
+            ForgetClass(wnt);
+            return true;
+        }
+
+        // Once a frame (ZoneTracker.Update): classify queued pieces until [Batching] ClassifyBudgetMs is spent; drop entries of
+        // pieces that were destroyed once the table has doubled.
+        public static void PumpClassify()
+        {
+            if (s_classes.Count > s_classSweepAt)
+            {
+                var dead = new List<WearNTear>();
+                foreach (var key in s_classes.Keys) if (key == null) dead.Add(key);
+                foreach (var key in dead) s_classes.Remove(key);
+                s_classSweepAt = Mathf.Max(65536, s_classes.Count * 2);
+            }
+            if (s_classQueue.Count == 0 && s_classUrgent.Count == 0 && s_preps.Count == 0) return;
+            float budgetMs = FiresEasyBakeMeshesPlugin.ClassifyBudgetMs.Value;
+            if (budgetMs <= 0f) { s_classQueue.Clear(); s_classUrgent.Clear(); s_preps.Clear(); return; }   // 0 = the old behaviour: all of it at bake time
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            int done = 0;
+            // 1.2.83: a zone due to bake (ClassifyFirst) is served first; 1.2.84: then its prepared groups (PumpGroups); then the
+            // shared queue with what is left of the budget.
+            while (s_classUrgent.Count > 0 && (done == 0 || clock.Elapsed.TotalMilliseconds < budgetMs))
+                if (ClassifyOne(s_classUrgent.Dequeue())) done++;
+            if (s_classUrgent.Count == 0 && clock.Elapsed.TotalMilliseconds < budgetMs) PumpGroups(clock, budgetMs);
+            while (s_classQueue.Count > 0 && (done == 0 || clock.Elapsed.TotalMilliseconds < budgetMs))
+                if (ClassifyOne(s_classQueue.Dequeue())) done++;
+            BakeProfile.NoteClassifySlice(clock.ElapsedTicks, done, s_classQueue.Count + s_classUrgent.Count);
+        }
+
+        private static bool ClassifyOne(WearNTear wnt)
+        {
+            if (wnt == null) return false;
+            var zdo = ZdoOf(wnt);
+            if (zdo == null) return false;
+            if (s_classes.TryGetValue(wnt, out PieceClass c) && c.Revision == zdo.DataRevision) return false;
+            s_classes[wnt] = Classify(wnt, zdo);
+            return true;
+        }
+
+        // 1.2.83: a zone due to bake puts its pieces in front of the shared queue; the pump skips the ones already classified at
+        // their current revision. Returns how many were queued (0 = nothing to wait for).
+        private static readonly Queue<WearNTear> s_classUrgent = new Queue<WearNTear>();
+        internal static bool UrgentClassifyPending => s_classUrgent.Count > 0;
+
+        internal static int ClassifyFirst(HashSet<WearNTear> pieces)
+        {
+            if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return 0;
+            int n = 0;
+            foreach (var wnt in pieces)
+            {
+                if ((object)wnt == null) continue;
+                s_classUrgent.Enqueue(wnt);
+                n++;
+            }
+            return n;
         }
 
         // Mirrors WearNTear.SetHealthVisual: above 75% health a piece shows its healthy look, the only one a damageable
@@ -862,9 +1209,16 @@ namespace FiresEasyBakeMeshes.EasyBake
             return wnt.m_new == null || wnt.m_new.activeSelf;
         }
 
+        // 1.2.81 ([fgn], BlueHills: the bake's per-piece cost is mostly component lookups): vanilla's WearNTear already holds
+        // its ZNetView (m_nview, set in Awake), so the ZDO comes from that field instead of a GetComponent per call. ZdoOf runs
+        // several times per piece (instance grouping, collect, edits check, look); GetComponent remains the fallback.
+        private static readonly HarmonyLib.AccessTools.FieldRef<WearNTear, ZNetView> WearView =
+            HarmonyLib.AccessTools.FieldRefAccess<WearNTear, ZNetView>("m_nview");
+
         internal static ZDO ZdoOf(WearNTear wnt)
         {
-            var view = wnt.GetComponent<ZNetView>();
+            ZNetView view = WearView(wnt);
+            if (view == null) view = wnt.GetComponent<ZNetView>();
             return view != null ? view.GetZDO() : null;
         }
 
@@ -927,11 +1281,14 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
 
                 string batchName = batchKey.BuildBatchName() + (farTier ? FarTierNameSuffix : string.Empty);
+                bool wide = NeedsUInt32(contributions);
+                BakeProfile.Mark(BakeProfile.Phase.CombineArrays);
                 var combined = new Mesh { name = $"EasyBake_{coord.x}_{coord.y}_{batchName}" };
-                if (NeedsUInt32(contributions))
+                if (wide)
                     combined.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
                 combined.CombineMeshes(combineArr, mergeSubMeshes: true, useMatrices: true);
                 combined.RecalculateBounds();
+                BakeProfile.Mark(BakeProfile.Phase.CombineNative, meshes: 1, sourceMeshes: contributions.Count, vertices: combined.vertexCount);
 
                 var go = new GameObject($"Batch_{batchName}");
                 go.transform.parent = parent.transform;
@@ -945,6 +1302,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 into.Add(new BatchInstance { Combined = go, Mesh = combined });
                 totalContributions += contributions.Count;
+                BakeProfile.Mark(BakeProfile.Phase.Objects, gameObjects: 1);
             }
             return totalContributions;
         }

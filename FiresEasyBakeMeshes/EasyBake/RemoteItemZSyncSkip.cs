@@ -40,16 +40,37 @@ namespace FiresEasyBakeMeshes.EasyBake
             public Rigidbody Body;
             public bool Disabled;
             public Vector3 DisabledAt;
+            public bool WasKinematic;   // 1.2.123: the body state before the skip pinned it
         }
 
         private static readonly List<Watched> s_watched = new List<Watched>();
+        // 1.2.257 (per-object create allocations, item 4): a Watched that leaves the list goes to a bounded pool (cleared first, so it holds no
+        // Unity object), and the next dropped item reuses it. Only s_watched ever holds one; main thread only, as before.
+        private const int PoolMax = 256;
+        private static readonly Stack<Watched> s_pool = new Stack<Watched>(16);
+        internal static long AllocsAvoided;   // Watched objects reused instead of made
+        private static void Free(Watched w)
+        {
+            w.Sync = null; w.View = null; w.Body = null; w.Disabled = false; w.DisabledAt = default(Vector3); w.WasKinematic = false;
+            if (s_pool.Count < PoolMax) s_pool.Push(w);
+        }
         private static float s_nextSweep;
         private static int s_disabledNow;
         private static int s_reenabled;
+        private static int s_drifted;
         private static float s_nextReport;
+
+        private static void ReenableAll()
+        {
+            for (int i = 0; i < s_watched.Count; i++)
+                if (s_watched[i].Disabled && s_watched[i].Sync != null) Reenable(s_watched[i]);
+            s_disabledNow = 0;
+        }
 
         internal static void Reset()
         {
+            ReenableAll();
+            for (int i = 0; i < s_watched.Count; i++) Free(s_watched[i]);
             s_watched.Clear();
             s_disabledNow = 0;
             s_reenabled = 0;
@@ -76,18 +97,22 @@ namespace FiresEasyBakeMeshes.EasyBake
             var view = go.GetComponent<ZNetView>();
             if (view == null || !view.IsValid()) return;
 
-            s_watched.Add(new Watched
-            {
-                Sync = sync,
-                View = view,
-                Body = go.GetComponent<Rigidbody>(),
-                Disabled = false,
-            });
+            Watched w;
+            if (s_pool.Count > 0) { w = s_pool.Pop(); AllocsAvoided++; } else w = new Watched();
+            w.Sync = sync;
+            w.View = view;
+            w.Body = go.GetComponent<Rigidbody>();
+            w.Disabled = false;
+            s_watched.Add(w);
         }
 
         internal static void Tick()
         {
-            if (!FiresEasyBakeMeshesPlugin.RemoteItemZSyncSkipEnabled.Value) return;
+            if (!FiresEasyBakeMeshesPlugin.RemoteItemZSyncSkipEnabled.Value)
+            {
+                if (s_disabledNow > 0) ReenableAll();   // 1.2.167 ([generator] B8): turned off with items still held
+                return;
+            }
             float now = Time.unscaledTime;
             if (now < s_nextSweep) return;
             s_nextSweep = now + SweepSeconds;
@@ -99,6 +124,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     s_watched.RemoveAt(i);
                     if (w.Disabled) s_disabledNow--;
+                    Free(w);
                     continue;
                 }
 
@@ -116,12 +142,20 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     // The owner moved it - hand control back and let vanilla lerp it home.
                     if ((zdo.GetPosition() - w.DisabledAt).sqrMagnitude > MovedEpsilonSqr) Reenable(w);
+                    // 1.2.123: and if OUR copy left the spot (anything moved it locally), vanilla lerps it back to the owner's position
+                    else if ((w.Sync.transform.position - w.DisabledAt).sqrMagnitude > MovedEpsilonSqr) { Reenable(w); s_drifted++; }
                     continue;
                 }
 
                 if (!AtRest(w)) continue;
 
                 w.Sync.enabled = false;
+                // 1.2.123 (Fire 10-26: "item drops float away like they have no gravity"): for a REMOTE object vanilla ClientSync turns
+                // gravity off and zeroes + sleeps the body every FixedUpdate, which is what pins it. With the sync off nothing pinned it any
+                // more, so the first bump (walking into it, another drop) sent it drifting weightless, and the owner's ZDO never moved, so
+                // the skip never handed it back. The body is now made kinematic while the skip holds it (vanilla's pin, without the
+                // per-frame cost) and restored on hand-back.
+                if (w.Body != null) { w.WasKinematic = w.Body.isKinematic; w.Body.linearVelocity = Vector3.zero; w.Body.angularVelocity = Vector3.zero; w.Body.isKinematic = true; }
                 w.Disabled = true;
                 w.DisabledAt = zdo.GetPosition();
                 s_disabledNow++;
@@ -132,6 +166,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void Reenable(Watched w)
         {
+            if (w.Body != null) w.Body.isKinematic = w.WasKinematic;   // 1.2.123: vanilla's own state back before its sync runs
             w.Sync.enabled = true;
             w.Disabled = false;
             s_disabledNow--;
@@ -154,9 +189,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (now < s_nextReport) return;
             s_nextReport = now + 30f;
             if (s_disabledNow == 0 && s_reenabled == 0) return;
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"Remote item ZSync skip: {s_disabledNow} settled remote item(s) not lerping, {s_watched.Count} watched, "
-                + $"{s_reenabled} handed back after the owner moved them.");
+                + $"{s_reenabled} handed back after the owner moved them, {s_drifted} put back after drifting locally.");
         }
     }
 }

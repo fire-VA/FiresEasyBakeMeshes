@@ -96,6 +96,21 @@ namespace FiresEasyBakeMeshes.Patches
         }
         private static bool s_standDownLogged;
 
+        // 1.2.214 ([visual], lead: "no CreateDestroyObjects status line printed tonight"): every 30 s (Debug) how many eligible passes the skip
+        // took vs ran, and the instance / ZDO counts that kept it from engaging (both change every tick during a town fill)
+        private static int s_cdsEligible, s_cdsSkippedAtLast; private static float s_cdsSayAt; private static int s_cdsInstLast, s_cdsZdoLast, s_cdsInstChanges, s_cdsZdoChanges;
+        private static void CdsCensus(int inst, int zdos)
+        {
+            s_cdsEligible++;
+            if (inst != s_cdsInstLast) s_cdsInstChanges++; if (zdos != s_cdsZdoLast) s_cdsZdoChanges++;
+            s_cdsInstLast = inst; s_cdsZdoLast = zdos;
+            if (Time.unscaledTime < s_cdsSayAt || !EasyBakeLog.DebugOn()) return;
+            s_cdsSayAt = Time.unscaledTime + 30f;
+            int skipped = _skippedSinceReport - s_cdsSkippedAtLast; s_cdsSkippedAtLast = _skippedSinceReport;
+            EasyBakeLog.Debug($"[CDS] census 30 s: {s_cdsEligible} eligible CreateDestroyObjects pass(es), about {skipped} skipped; the instance count changed on {s_cdsInstChanges} and the ZDO count on {s_cdsZdoChanges} of them (now {inst} instances, {zdos} ZDOs)");
+            s_cdsEligible = 0; s_cdsInstChanges = 0; s_cdsZdoChanges = 0;
+        }
+
         [HarmonyPrefix]
         public static bool Prefix(ZNetScene __instance, bool __runOriginal)
         {
@@ -104,12 +119,11 @@ namespace FiresEasyBakeMeshes.Patches
                 if (!s_standDownLogged)
                 {
                     s_standDownLogged = true;
-                    EasyBakeLog.Info("[CDS] Another mod already replaces ZNetScene.CreateDestroyObjects; the create/destroy skip stands down.");
+                    EasyBakeLog.Debug("[CDS] Another mod already replaces ZNetScene.CreateDestroyObjects; the create/destroy skip stands down.");
                 }
                 return false;
             }
             if (!FiresEasyBakeMeshesPlugin.PluginEnabled.Value) return true;
-            if (!FiresEasyBakeMeshesPlugin.CreateDestroySkipEnabled.Value) return true;
 
             // VAGhetto's ServerAuthorityPatches owns the dedicated-server path.
             // Stay out of it.
@@ -124,11 +138,16 @@ namespace FiresEasyBakeMeshes.Patches
             if (Player.m_localPlayer == null) return true;
             if (Player.m_localPlayer.IsTeleporting()) return true;
 
+            // 1.2.250: the idle / event-driven object area (from FGN's ClientCleanupThrottle) has its own keys and goes first: one owner of this pass.
+            if (EasyBake.EbmObjectArea.TrySkip(__instance)) return false;
+
+            if (!FiresEasyBakeMeshesPlugin.CreateDestroySkipEnabled.Value) return true;
+
             var zs = ZoneSystem.instance;
             if (zs == null) return true;
 
             Vector3 refPos = ZNet.instance.GetReferencePosition();
-            Vector2s center = ZoneSystem.GetZone(refPos);
+            Vector2s center = EasyBake.EbmZones.Of(refPos);
             int zoneCount = GetZoneCount(zs);
             if (zoneCount < 0) return true; // reflection failed — fall through
             int instanceCount = GetInstanceCount(__instance);
@@ -142,6 +161,7 @@ namespace FiresEasyBakeMeshes.Patches
             var zdoMan = ZDOMan.instance;
             if (zdoMan == null) return true; // between scenes — fall through
             int zdoCount = zdoMan.NrOfObjects();
+            CdsCensus(instanceCount, zdoCount);   // 1.2.214
 
             float now = Time.unscaledTime;
             float maxSkipSeconds = FiresEasyBakeMeshesPlugin.CreateDestroySkipMaxSeconds.Value;
@@ -154,7 +174,12 @@ namespace FiresEasyBakeMeshes.Patches
             // which asks a cheaper question in a safer place, reached 95%. Back to the world-wide count, which is one
             // O(1) read and answers "something changed" nearly always - so this skip is effectively off, and that is
             // the honest state of it rather than a signal maintained at 50,000 writes a second to say the same thing.
-            bool contentChanged = zdoCount != _lastZdoCount;
+            // 1.2.173 [Optimize] CreateDestroyDirtyFlag: the world-wide count is replaced by events that say the active lists or the work
+            // owed may have changed (ZdoEventDirty). The forced pass each CreateDestroySkipMaxSeconds stays, so another mod's direct write
+            // waits at most that long, and each forced pass that finds work missed by the flag is counted.
+            bool useFlag = FiresEasyBakeMeshesPlugin.CreateDestroyDirtyFlag.Value;
+            bool contentChanged = useFlag ? ZdoEventDirty.Dirty : zdoCount != _lastZdoCount;
+            if (useFlag && ttlExpired && !contentChanged) { ZdoEventDirty.NoteForcedQuietPass(); ZdoEventDirty.ForcedQuietNext(); }
 
             bool stateChanged = center.x != _lastCenter.x
                              || center.y != _lastCenter.y
@@ -167,7 +192,7 @@ namespace FiresEasyBakeMeshes.Patches
                 _skippedSinceReport++;
                 _skippedSinceStatus++;
                 if (FiresEasyBakeMeshesPlugin.CreateDestroySkipVerbose.Value
-                    && (now - _lastReportTime) > 5f)
+                    && (now - _lastReportTime) > 60f)   // 1.2.98: was 5 s (51 lines a session)
                 {
                     EasyBakeLog.Debug(
                         $"[CDS] Skipped {_skippedSinceReport} CreateDestroyObjects ticks " +
@@ -179,6 +204,7 @@ namespace FiresEasyBakeMeshes.Patches
                 return false;
             }
 
+            ZdoEventDirty.Dirty = false;   // the pass about to run answers everything marked so far; its postfix sets it again if work is left
             _lastCenter = center;
             _lastZoneCount = zoneCount;
             _lastInstanceCount = instanceCount;
@@ -232,8 +258,72 @@ namespace FiresEasyBakeMeshes.Patches
             _lastInstanceCount = -1;
             _lastZdoCount = -1;
             _lastVanillaTime = -1000f;
+            ZdoEventDirty.Dirty = true;
             _skippedSinceReport = 0;
             _lastReportTime = 0f;
         }
+    }
+
+    // 1.2.173: what can change the create / destroy pass's answer, as events: a ZDO entering or leaving a sector (new, received, moved, destroyed),
+    // EBM handing a piece back (the five Created = false sites + ConvertLivePieces in ZoneTracker), and work the last pass left behind.
+    // Zone, instance count and player moves are already compared in the prefix.
+    internal static class ZdoEventDirty
+    {
+        internal static bool Dirty = true;
+        private static bool s_forcedQuiet, s_announced;
+        private static int s_forced, s_missed;
+        private static float s_nextLine;
+
+        internal static void Mark() => Dirty = true;
+        internal static void NoteForcedQuietPass() => s_forced++;
+
+        // The flag said quiet and a forced pass ran: anything still uncreated is work the flag missed.
+        internal static void AfterPass(System.Collections.Generic.List<ZDO> near, System.Collections.Generic.List<ZDO> distant, bool destroyOwed)
+        {
+            if (!FiresEasyBakeMeshesPlugin.CreateDestroyDirtyFlag.Value || !FiresEasyBakeMeshesPlugin.CreateDestroySkipEnabled.Value) return;
+            if (ZNet.instance == null || ZNet.instance.IsDedicated()) return;   // the walk below is only for the client skip
+            bool owed = destroyOwed || AnyUncreated(near) || AnyUncreated(distant);
+            if (owed) { if (s_forcedQuiet) s_missed++; Dirty = true; }
+            s_forcedQuiet = false;
+            if (!s_announced) { s_announced = true; EasyBakeLog.Info("[CDS] quiet passes are skipped by event (CreateDestroyDirtyFlag), a real pass still runs at least once a second"); }
+            float now = Time.unscaledTime;
+            if (now >= s_nextLine)
+            {
+                s_nextLine = now + 60f;
+                EasyBakeLog.Debug($"[CDS] dirty flag, last 60 s: {s_forced} forced quiet pass(es), {s_missed} found work the flag missed");
+                s_forced = 0; s_missed = 0;
+            }
+        }
+
+        internal static void ForcedQuietNext() => s_forcedQuiet = true;
+
+        private static bool AnyUncreated(System.Collections.Generic.List<ZDO> list)
+        {
+            for (int i = 0; i < list.Count; i++) if (!list[i].Created) return true;
+            return false;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class ZdoEventDirty_SectorPatches
+    {
+        private static System.Collections.Generic.IEnumerable<MethodBase> TargetMethods()
+        {
+            yield return AccessTools.Method(typeof(ZDOMan), "AddToSector");
+            yield return AccessTools.Method(typeof(ZDOMan), "InitialAddToSector");
+            yield return AccessTools.Method(typeof(ZDOMan), "RemoveFromSector");
+        }
+
+        [HarmonyPostfix]
+        public static void Postfix() => ZdoEventDirty.Dirty = true;
+    }
+
+    // Runs even when FGN's prefix replaces the method's body.
+    [HarmonyPatch(typeof(ZNetScene), "CreateObjects")]
+    public static class ZdoEventDirty_CreateObjectsPatch
+    {
+        [HarmonyPostfix]
+        public static void Postfix(System.Collections.Generic.List<ZDO> currentNearObjects, System.Collections.Generic.List<ZDO> currentDistantObjects)
+            => ZdoEventDirty.AfterPass(currentNearObjects, currentDistantObjects, EasyBake.DestroyTimeSlicer.Pending);
     }
 }

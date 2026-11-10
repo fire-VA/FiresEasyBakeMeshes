@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
@@ -33,6 +33,9 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+    </Reference>
     <Reference Include="0Harmony">
       <HintPath>..\..\..\customspawnsmod\lib\0Harmony.dll</HintPath>
       <Private>False</Private>
@@ -58,40 +61,163 @@
       <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
       <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="System" />
-    <Reference Include="System.Core" />
-    <!-- FiresUnifiedCore — hosts PrewarmCoroutine (FiresCore.Async.PrewarmCoroutine).
-         Loaded at runtime via BepInDependency on Plugin.cs. -->
-    <Reference Include="FiresUnifiedCore">
-      <HintPath>..\..\FiresUnifiedCore\FiresUnifiedCore\bin\Release\FiresUnifiedCore.dll</HintPath>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="EasyBake\Far\EbmFarJobs.cs" />
+    <Compile Include="EasyBake\Far\EbmFarWorldEvents.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingDigest.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingDraw.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingDrawHandoff.cs" />
+    <Compile Include="EasyBake\Far\FarCapPool.cs" />
+    <Compile Include="EasyBake\Far\FarIndexRanges.cs" />
+    <Compile Include="EasyBake\Far\FarZoneGrid.cs" />
+    <Compile Include="EasyBake\Far\FarGroundProbe.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingMerge.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingNet.cs" />
+    <Compile Include="EasyBake\Far\FarBuildings.cs" />
+    <Compile Include="EasyBake\Far\FarBuildingSources.cs" />
+    <Compile Include="EasyBake\Far\FarCache.cs" />
+    <Compile Include="EasyBake\Far\FarCacheWorld.cs" />
+    <Compile Include="EasyBake\Far\FarLightKinds.cs" />
+    <Compile Include="EasyBake\Far\FarLights.cs" />
+    <Compile Include="EasyBake\Far\FarRunner.cs" />
+    <Compile Include="EasyBake\Far\FarSnow.cs" />
+    <Compile Include="EasyBake\Far\ImpostorAssets.cs" />
+    <Compile Include="EasyBake\Far\ImpostorAtlas.cs" />
+    <Compile Include="EasyBake\Far\ImpostorBaker.cs" />
+    <Compile Include="EasyBake\Far\ImpostorDiskCache.cs" />
+    <Compile Include="EasyBake\Far\ImpostorDraw.cs" />
+    <Compile Include="EasyBake\Far\ImpostorDxt.cs" />
+    <Compile Include="EasyBake\Far\ImpostorEngine.cs" />
+    <Compile Include="EasyBake\Far\ImpostorHandOff.cs" />
+    <Compile Include="EasyBake\Far\ImpostorKinds.cs" />
+    <Compile Include="EasyBake\Far\ImpostorPool.cs" />
+    <Compile Include="EasyBake\Far\ImpostorTestCommand.cs" />
+    <Compile Include="EasyBake\Far\ImpostorTypes.cs" />
+    <EmbeddedResource Include="EasyBake\Far\firescoreimpostor" />
     <Compile Include="Plugin.cs" />
+    <Compile Include="CoreLink.cs" />
+    <Compile Include="VedrLink.cs" />
+    <Compile Include="EasyBake\IdleGates.cs" />
+    <Compile Include="EasyBake\EbmParticleIdle.cs" />
+    <Compile Include="EasyBake\EbmBakeMemRelease.cs" />
+    <Compile Include="EasyBake\EbmHandoffWarm.cs" />
+    <Compile Include="EasyBake\ZoneTrackerBakeProof.cs" />
+    <Compile Include="EasyBake\WearLooks.cs" />
+    <Compile Include="EasyBake\PrewarmCoroutine.cs" />
+    <Compile Include="EasyBake\EbmSafety.cs" />
+    <Compile Include="EasyBake\FgnLink.cs" />
+    <Compile Include="PlayerFacingConfig.cs" />
     <Compile Include="EasyBakeLog.cs" />
+    <Compile Include="Patches\StationInteractProbe.cs" />
+    <Compile Include="EasyBake\SnowFeed.cs" />
+    <Compile Include="EasyBake\EbmZones.cs" />
+    <Compile Include="EasyBake\ExposureCache.cs" />
+    <Compile Include="EasyBake\ShelterProbe.cs" />
+    <Compile Include="EasyBake\RainShelter.cs" />
+    <Compile Include="EasyBake\EbmStandIn.cs" />
+    <Compile Include="EasyBake\WetOverride.cs" />
+    <Compile Include="EasyBake\PerformanceProfile.cs" />
+    <Compile Include="EasyBake\LightBudget.cs" />
     <Compile Include="Utilities\FiresEasyBakeBanner.cs" />
     <Compile Include="Utilities\EbmHelpContent.cs" />
     <Compile Include="Utilities\BakeSummary.cs" />
     <Compile Include="EasyBake\InvulnerableClassifier.cs" />
     <Compile Include="EasyBake\StandInDamage.cs" />
     <Compile Include="EasyBake\DamageReplay.cs" />
-    <Compile Include="EasyBake\DeferCreation.cs" />
     <Compile Include="EasyBake\ScanGate.cs" />
     <Compile Include="EasyBake\ZoneTracker.cs" />
     <Compile Include="EasyBake\VegetationInstancing.cs" />
+    <Compile Include="EasyBake\RockReport.cs" />
+    <Compile Include="EasyBake\IntactRockLod.cs" />
     <Compile Include="EasyBake\MeshBaker.cs" />
+    <Compile Include="EasyBake\EbmTrace.cs" />
+    <Compile Include="EasyBake\UnloadStressTest.cs" />
+    <Compile Include="EasyBake\MaterialVariants.cs" />
     <Compile Include="EasyBake\BakeProfile.cs" />
+    <Compile Include="EasyBake\BakeFrameSplit.cs" />
     <Compile Include="EasyBake\EasyBakeSuppressedVisuals.cs" />
     <Compile Include="EasyBake\InstanceDefinition.cs" />
+    <Compile Include="EasyBake\InstanceCull.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirect.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectCascades.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSpheres.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectPhases.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectPresize.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSlots.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectGrass.cs" />
+    <Compile Include="EasyBake\Indirect\EbmGrassFarCost.cs" />
+    <Compile Include="EasyBake\Indirect\EbmGrassStepGate.cs" />
+    <Compile Include="EasyBake\Indirect\EbmRenderCensus.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSkyDepth.cs" />
+    <Compile Include="EasyBake\Indirect\EbmShadowCensus.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectCpuTrim.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSyncCleanup.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSyncTimer.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectStagedSync.cs" />
+    <Compile Include="EasyBake\Indirect\IndirectCrashGuard.cs" />
+    <Compile Include="EasyBake\WearNTearAwakeBlock.cs" />
+    <Compile Include="EasyBake\ShellPieces.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectLightsSwept.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectCascadeStride.cs" />
+    <Compile Include="EasyBake\EbmPatchSafety.cs" />
+    <Compile Include="EasyBake\FillTracker.cs" />
+    <Compile Include="EasyBake\StreamPacer.cs" />
+    <Compile Include="EasyBake\SectorArrivals.cs" />
+    <Compile Include="EasyBake\EbmObjectArea.cs" />
+    <Compile Include="EasyBake\EbmTeleportCreateGate.cs" />
+    <Compile Include="EasyBake\EbmDistantPrefabs.cs" />
+    <Compile Include="EasyBake\EbmPieceTypeAudit.cs" />
+    <Compile Include="EasyBake\EbmZoneLoadDiag.cs" />
+    <Compile Include="EasyBake\EbmHeapCensus.cs" />
+    <Compile Include="EasyBake\EbmMeshCheck.cs" />
+    <Compile Include="EasyBake\EbmSelfCost.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectReceivers.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectViews.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectOnePass.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectLocalShadows.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectAssets.cs" />
+    <Compile Include="EasyBake\Indirect\IndirectCells.cs" />
+    <Compile Include="EasyBake\Indirect\IndirectStats.cs" />
+    <Compile Include="EasyBake\Indirect\IndirectLooks.cs" />
+    <Compile Include="EbmApi.cs" />
+    <Compile Include="EasyBake\EbmMeshSimplify.cs" />
+    <Compile Include="EasyBake\EbmSnowStore.cs" />
+    <Compile Include="EasyBake\Indirect\IndirectBatches.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoverageCensus.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoveragePatches.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoverageRules.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\PrefabCoverage.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoverageReach.cs" />
+    <Compile Include="EasyBake\Indirect\CasterCensus.cs" />
+    <Compile Include="EasyBake\Indirect\PhysicsCensus.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectIntegrity.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectMeshContent.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectDiag.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectVertexCheck.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectGpuValidator.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectCascadeEmpty.cs" />
+    <Compile Include="EasyBake\EbmSnowCaps.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoveredObject.cs" />
     <Compile Include="EasyBake\ModdedPrefabGate.cs" />
     <Compile Include="EasyBake\ZoneInstanceGroup.cs" />
     <Compile Include="EasyBake\InstancedDraw.cs" />
     <Compile Include="EasyBake\MeshCacheStore.cs" />
+    <Compile Include="FiresCachePaths.cs" />
     <Compile Include="EasyBake\ZoneKeepalive.cs" />
     <Compile Include="EasyBake\DestroyTimeSlicer.cs" />
     <Compile Include="EasyBake\EffectAreaIdleSkip.cs" />
@@ -107,6 +233,7 @@
     <Compile Include="Patches\ClutterSystemPatches.cs" />
     <Compile Include="Patches\SectorMirrorPatches.cs" />
     <Compile Include="Patches\LightFlickerPatches.cs" />
+    <Compile Include="Patches\LightSettingsAndFogPatches.cs" />
     <Compile Include="Patches\ZSFXPatches.cs" />
     <Compile Include="Patches\ZNetScenePatches.cs" />
     <Compile Include="Patches\WearNTearPatches.cs" />

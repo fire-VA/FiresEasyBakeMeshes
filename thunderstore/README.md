@@ -1,91 +1,111 @@
 # Fires Easy Bake Meshes
 
-**Big builds, normal frame rates.** Easy Bake takes the parts of a base that never change and stops your
-machine from treating each one as a separate object: it merges what it can into one mesh per zone, draws the
-rest as GPU instances, and on a multiplayer client it stops creating the objects altogether once something
-else is drawing them.
+**Big builds, normal frame rates.** Easy Bake takes the parts of a base that never change and draws them in a much
+cheaper way, so huge bases and towns stop dragging your frame rate down. Install it and your bases get faster -
+there is nothing to learn.
 
-Measured on one town of about 135,000 objects, standing in the same spot:
+The world itself is untouched - the server still holds every piece. Only your own game draws them more cheaply.
 
-| | objects loaded | frame time |
-|---|---|---|
-| without Easy Bake | 117,517 | 186 ms (5 FPS) |
-| with Easy Bake | 42,220 | 19-22 ms (45-52 FPS) |
+Easy Bake works on its own. It doesn't need Fires Unified Core or any other Fires mod, and it doesn't rely on
+Fires Fixes or Fires Ghetto Networking either. Other mods can connect to it if they want to, but nothing is required.
 
-The world itself is untouched — the server still holds every piece, your client just stops rebuilding three
-quarters of it.
+## What's new in 1.2.262
 
-There is no UI and nothing to learn. Install it and the base gets faster.
+Changes since 1.2.159, in plain words:
 
-## What it does
+- **No other mod needed.** Easy Bake no longer needs Fires Unified Core. Anything that used to come from another mod
+  now either lives inside Easy Bake or is skipped quietly when that mod isn't there.
+- **Its own building look.** Easy Bake now has its own shader for building pieces. Baked pieces keep the wet look in
+  rain, snow in winter and the dry look under a roof without needing a separate snow or weather mod.
+- **Distant bases show up sooner.** Other players' builds beyond the loaded area are drawn by Easy Bake as simple
+  far versions. They now appear within the first seconds after you load in or teleport, instead of popping in later.
+  Far buildings are white only where snow has really built up (Mountains, Deep North, or a snowy season), not in summer.
+- **Smoother object loading.** Easy Bake now paces how fast objects are created around you, based on how quickly your
+  own machine is running. It keeps up while you walk, ride or fly, and after a teleport. This job used to belong to
+  Fires Ghetto Networking; that mod steps aside on its own when Easy Bake is doing it.
+- **Snow on baked pieces behaves like snow on normal ones.** Snow builds up the same way, pieces under a roof stay
+  dry, and rain and snow stop indoors while you're sheltered. Each piece waits a moment for its real snow amount
+  instead of using the area's average.
+- **Stretched or broken pieces are fixed.** These showed up mostly with shadows on. Easy Bake now checks every mesh
+  it builds or loads once, and a bad one is left out (and named in the log) instead of being drawn wrong.
+- **Big cities load much faster.** In very large towns, saved bakes were thrown away and rebuilt while pieces were
+  still arriving from the server, which could take minutes. That no longer happens.
+- **Fewer hitches.** A short freeze once a minute is now spread out over many frames, another one every 30 seconds
+  is gone, and rocks, trees and item stands are no longer redone over and over while you stand still in a town.
+- **Safer alongside other mods.** If something from another mod throws an error inside Easy Bake, you get one
+  warning and Easy Bake carries on in its own way. A graphics driver crash on the new drawing path turns that path
+  off for the rest of the session instead of crashing again.
+- **Turning it off really turns it off.** The main on/off switch now also stops the rain hider, the wet look, the
+  shelter check, the light budget and the item skip, and puts back what they changed.
+- **New optional extras, off unless you turn them on:** a new way of drawing baked buildings, rocks and trees where
+  the graphics card picks what is in view and draws it in a few large batches ("Indirect Renderer"), and untouched
+  rocks sharing one model per rock type with a simpler one in the distance ("Bake Intact Rocks"; the first hit gives
+  the rock its normal model back).
 
-- **Mesh batching.** Structural pieces in a zone that share a material are combined into one mesh, turning
-  hundreds of draw calls into a handful. Colliders, building and interaction are untouched.
-- **GPU instancing.** Prefabs that come down to one mesh and material - palisades, floor tiles, stakewalls,
-  grausten - are drawn as instances instead, which duplicates no vertices and lets a single removed piece
-  drop out without rebuilding the zone. Pieces made of several meshes, like vines and tiled roofs, are drawn
-  the same way.
-- **Skipped piece objects (multiplayer clients).** A piece that a bake already draws does not need to exist
-  as an object at all. Easy Bake leaves it uncreated and puts a stand-in collider in its place, so you can
-  still walk on it, build against it and stand on it. This is where most of the frame time comes back.
-- **Real pieces come back when you need them.** Take out a build tool and everything within reach of it is
-  created again, so snapping, highlighting and removing work normally. Damage, removal or a change to a piece
-  hands that piece straight back.
-- **Distance tier.** A baked zone keeps a second mesh built from each piece's own LOD1 geometry and swaps to
-  it past 64 m, far enough that it never happens while you are standing in that zone.
-- **Nothing off screen is drawn.** Instanced pieces behind you are skipped for that frame, with their boxes
-  stretched along the sun first so their shadows still land on what you can see.
-- **Disk cache.** Baked zones are stored per world and reload from disk next session instead of being rebuilt.
-- **Prefab prewarm.** Every prefab is instantiated once while the game loads, paying the hidden first-spawn
-  shader cost up front instead of hitching at a zone border.
-- **Steady-state trims.** Time-sliced object destruction, wear-and-tear short circuits for pieces that cannot
-  be damaged, distance LOD on light flicker, sound and clutter updates, and sync skips for static pieces.
+**One slower first load after updating.** The saved bake format changed, so every area is baked fresh once the
+first time you load in. After that it loads from disk as before. Your world save is not touched.
+
+## What you get
+
+- **Smoother big bases.** Walls, floors, roofs and other plain building pieces are merged and drawn together.
+- **Building works normally.** Take out the hammer and the real pieces around you come back, so snapping,
+  highlighting and removing work as usual. A piece that is hit, burns or is changed goes back to normal at once.
+- **Faster loading.** Baked areas are saved and load from disk next time.
+- **Distant bases.** Builds beyond the loaded area are drawn as simple far versions, so the horizon isn't empty.
+- **Less stutter** when crossing into new areas and in large bases.
 
 ## What is never touched
 
-Anything that does something stays a real object: doors, chests, item and armor stands, glass, shields,
-mine rocks, workbenches and station extensions, signs, fireplaces, beds, wards, portals, ladders, chairs and
-anything that gives comfort. Pieces that can be damaged stay in the world too - they are drawn by the bake,
-but rain wear, support and raids run on them exactly as before, and a piece goes back to drawing itself the
-moment it is hit, burns or is highlighted by a hammer.
+Anything you interact with stays a normal object: doors, chests, item stands, workbenches, fires, beds, wards,
+portals, signs, ladders, chairs, feasts, fuel-burning pieces like hanging braziers, and creatures. Glass is left
+alone, and map makers' edits are respected (the full readme has the details). Rain wear, support and raids work as
+before on pieces that can take damage.
 
-Per-piece edits are respected as well. Edits that only change how a piece looks are baked exactly as they
-show: infinite health, the new, worn or broken look, and invisible pieces, which bake as nothing but keep their
-collider, just as players without the mod see them. Any other edit to a piece's data (hover text, sounds,
-effects, a swapped model, anything a map maker changed with data edits or Structure Tweaks) keeps that piece a
-real object, so hand-edited maps behave exactly as they were built.
+## How to use
 
-## Requirements
+Just install it. By default you only see three settings; everything else is under **Advanced**:
 
-- BepInEx
-- FiresUnifiedCore 0.2.296 or newer
-- Client side. Skipping piece objects only happens when you are a client on a server; on a host or a
-  single-player world the pieces are created, because that machine is the one simulating them (the
-  experimental SkipOnHost setting turns skipping on there too; try it on a world you can afford to lose).
+- the on/off switch
+- baking on/off
+- **ExcludedPrefabs** - add any piece that ever looks wrong (for example `stone_floor_2x2`) and it is left alone
 
-## Settings
+You can change them in `BepInEx/config`, in your mod manager's config editor, or in an in-game config window
+(with Fires Unified Core installed, that's the Fires config window on F1 or Esc > Mod Settings).
 
-Everything is under `[Batching]` in `BepInEx/config/com.Fire.FiresEasyBakeMeshes.cfg`, and the defaults are
-what the numbers above were measured with. The ones worth knowing:
+Console commands (handy when a base feels heavier than it should; they change nothing):
 
-- **SkipBakedPieceObjects** - the big one. Off means pieces are still drawn by the bake but always created.
-- **BuildToolRadiusMeters** (24) - how far around you real pieces come back while a build tool is out.
-- **InstancingEnabled**, **MinInstancesPerPrefab** (10) - how many copies of a prefab a zone needs before
-  they are drawn as instances.
-- **FarTierDistanceMeters** (64) - where a zone swaps to its distance mesh.
-- **SkipInstancesOutOfView** - leave instanced pieces out of a frame when they are behind you.
-- **DamageablePieces** - also draw pieces that can be damaged. They are never skipped, only drawn.
-- **ExcludeTransparentPieces** - glass and other transparent pieces are left alone, because merged
-  transparency sorts once for the whole batch and would draw through walls.
-- **PluginEnabled** under `[General]` switches the whole mod off live, without a restart.
+- `ebm_census` - lists what's loaded around you and why it wasn't sped up
+- `ebm_vegetation` - the same for plants and trees
+- `ebm_why` - tells you what Easy Bake is doing with the piece you are looking at
 
-## Console
+For trying settings out, `ebm_indirect on|off|status` and `ebm_opt <setting> on|off|status|list` switch a setting
+for this session only, without writing it to your config.
 
-`ebm_census` lists every object loaded around you and why each one was not baked away, grouped by reason with
-the most common prefabs behind each. Useful when a base feels heavier than it should.
+## Install
+
+- **For players' games.** Install it on each player's machine. That's where all the drawing happens.
+- **On a server** it only enforces its config; it doesn't draw or bake anything there.
+- The biggest gains are when you play on a server. On a single-player world or when hosting, pieces are still
+  drawn faster, but not skipped.
+- The package includes a second file, `ebm_indirect`, next to the DLL. Keep the two together. It is only used by the
+  optional Indirect Renderer.
+
+## Requires
+
+- BepInExPack for Valheim. Nothing else.
 
 ## Compatibility
 
-Works alongside Infinity Hammer (its placement ghosts and selections see the real pieces), Valheim Community
-Patches and FiresGhettoNetworking. Any mod that reads or writes pieces through their ZDO is unaffected: the
-data is never touched, only whether your own machine builds an object for it.
+- Works on its own and doesn't rely on any other mod, including the other Fires performance mods (Fires Fixes and
+  Fires Ghetto Networking). You can run any of them alone or together.
+- Works alongside Infinity Hammer and Valheim Community Patches. Mods that read or change pieces are unaffected -
+  the piece data is never touched.
+- With the weather mod Vedr installed, Easy Bake leaves the indoor wet look to Vedr.
+
+## Full readme
+
+Every feature, setting and what stays a real object: [full readme on GitHub](https://github.com/fire-VA/FiresEasyBakeMeshes#readme).
+
+## Screenshots
+
+<!-- ![A large base drawn by Easy Bake, seen from a distance](HOSTED_URL/FiresEasyBakeMeshes/01_ebm_base.png) -->

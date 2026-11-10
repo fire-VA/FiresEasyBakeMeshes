@@ -105,7 +105,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             float now = Time.unscaledTime;
             if (now - _lastReportTime < 30f) return;
             _lastReportTime = now;
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"[ZSync-skip] evaluated={_evaluatedCount} disabled={_disabledCount} " +
                 $"prefabs-classified={_prefabEligible.Count} (cumulative)");
         }

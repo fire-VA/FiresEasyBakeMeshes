@@ -160,7 +160,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // is 22x, and position mismatches were 0 and wear-look mismatches 0 across every matched key, i.e.
             // the derived DATA was exact and only the SET was wrong.
             //
-            // ZoneSystem.GetZone(Vector3) is public static and gives a ZDO's own zone, so the filter needs no
+            // EbmZones.Of(Vector3) is public static and gives a ZDO's own zone, so the filter needs no
             // private sector-index machinery. Comparing with Equals rather than == because Vector2s is used
             // here as a dictionary key and value equality is what that relies on.
             var zoneSystem = ZoneSystem.instance;
@@ -173,7 +173,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var zdo = sector[i];
                 if (zdo == null) continue;
 
-                if (!coord.Equals(ZoneSystem.GetZone(zdo.GetPosition()))) { outsideZone++; continue; }
+                if (!coord.Equals(EbmZones.Of(zdo.GetPosition()))) { outsideZone++; continue; }
 
                 int prefabHash = zdo.GetPrefab();
                 if (prefabHash == 0) continue;
@@ -214,7 +214,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (now < s_nextReport) return;
             s_nextReport = now + 30f;
 
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"ZDO-bake verify over {s_zones} zone(s): live {s_keysLive} piece(s), ZDO-derived {s_keysZdo}. "
                 + $"MISSING from the ZDO answer {s_missingFromZdo} (those would still be created), "
                 + $"EXTRA in it {s_extraInZdo} (those would be WRONGLY skipped - this is the dangerous number), "

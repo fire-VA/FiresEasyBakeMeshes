@@ -90,11 +90,12 @@ namespace FiresEasyBakeMeshes.Patches
                 if (!s_standDownLogged)
                 {
                     s_standDownLogged = true;
-                    EasyBakeLog.Info("[SectorMirror] Another mod already answers ZNetScene.HaveInstanceInSector; the sector mirror stands down.");
+                    EasyBakeLog.Debug("[SectorMirror] Another mod already answers ZNetScene.HaveInstanceInSector; the sector mirror stands down.");
                 }
                 return false;
             }
             if (!FiresEasyBakeMeshesPlugin.SectorMirrorEnabled.Value) return true;
+            if (!FiresEasyBakeMeshesPlugin.BatchingActive()) return true;   // 1.2.167 ([generator] B2): the mirror is only kept while batching runs
             if (EasyBake.SectorInstanceMirror.TryHasInstance(sector, out bool hasInstance))
             {
                 __result = hasInstance;

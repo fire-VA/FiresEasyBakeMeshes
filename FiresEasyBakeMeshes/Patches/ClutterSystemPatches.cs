@@ -113,7 +113,7 @@ namespace FiresEasyBakeMeshes.Patches
                       + _ctPassNoPlayer + _ctPassFreefly + _ctPassDisabled;
             if (total == 0) return;
             int skipPct = (_ctSkipped * 100) / total;
-            EasyBakeLog.Info(
+            EasyBakeLog.Debug(
                 $"[ClutterLod] {total} calls in last ~5s — skipped {_ctSkipped} ({skipPct}%), " +
                 $"passed: moved={_ctPassMoved} ttl={_ctPassTTL} forceRebuild={_ctPassForceRebuild} " +
                 $"noPlayer={_ctPassNoPlayer} freefly={_ctPassFreefly} disabled={_ctPassDisabled}");

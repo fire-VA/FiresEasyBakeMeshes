@@ -126,7 +126,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 if ((now - _lastVerboseReportTime) > 5f)
                 {
-                    EasyBakeLog.Info(
+                    EasyBakeLog.Debug(
                         $"[Keepalive] {_entries.Count} zones pinned at " +
                         $"center=({playerCenter.x},{playerCenter.y}), radius={maxRadius}. " +
                         $"This tick: refreshed={_refreshScratch.Count}, pruned={_pruneScratch.Count}.");

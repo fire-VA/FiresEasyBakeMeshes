@@ -1,6 +1,6 @@
 using System.Collections.Generic;
 using System.Text;
-using FiresCore.Pieces;
+
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -52,7 +52,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (_kindByPrefab.TryGetValue(prefabHash, out var cached)) return cached;
 
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(prefabHash) : null;
             var kind = KindOf(prefab);
 
             _kindByPrefab[prefabHash] = kind;
@@ -89,7 +89,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 int prefabHash = entry.Key.GetPrefab();
                 if (!tallies.TryGetValue(prefabHash, out var tally))
                 {
-                    var prefab = scene.GetPrefab(prefabHash);
+                    var prefab = FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(prefabHash);
                     tally = new PrefabTally
                     {
                         Name = prefab != null ? prefab.name : entry.Value.gameObject.name,
@@ -105,7 +105,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
                 tally.Instances++;
 
-                var zone = ZoneSystem.GetZone(entry.Key.GetPosition());
+                var zone = EbmZones.Of(entry.Key.GetPosition());
                 var zones = perZone[prefabHash];
                 zones.TryGetValue(zone, out int inZone);
                 zones[zone] = inZone + 1;
@@ -215,7 +215,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             var renderers = prefab.GetComponentsInChildren<MeshRenderer>(true);
             int visible = 0;
             for (int i = 0; i < renderers.Length; i++)
-                if (renderers[i] != null && renderers[i].enabled) visible++;
+                if (renderers[i] != null && (renderers[i].enabled || FiresEasyBakeMeshes.EasyBake.Indirect.Coverage.CoveredObject.HiddenByCoverage(renderers[i]))) visible++;
             return visible;
         }
 

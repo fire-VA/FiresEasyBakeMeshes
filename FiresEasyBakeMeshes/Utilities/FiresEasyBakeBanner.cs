@@ -1,5 +1,5 @@
 using System;
-using FiresCore.Logging;
+
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes
@@ -21,7 +21,7 @@ namespace FiresEasyBakeMeshes
             try
             {
                 EmitHeader("Fires Easy Bake Meshes Loading...");
-                Banner.Print(ToSegments(s_bigLines));
+                CoreLink.PrintBanner(ToSegments(s_bigLines));
             }
             catch (Exception ex)
             {
@@ -36,7 +36,7 @@ namespace FiresEasyBakeMeshes
             try
             {
                 EmitHeader("Fires Easy Bake Meshes Loaded.");
-                Banner.Print(s_compactLines);
+                CoreLink.PrintBanner(s_compactLines);
             }
             catch (Exception ex)
             {
@@ -53,48 +53,48 @@ namespace FiresEasyBakeMeshes
             else Debug.Log($"[FiresEasyBakeMeshes] {text}");
         }
 
-        private static Banner.Segment[][] ToSegments((string text, ConsoleColor color)[] lines)
+        private static CoreLink.Segment[][] ToSegments((string text, ConsoleColor color)[] lines)
         {
-            var result = new Banner.Segment[lines.Length][];
+            var result = new CoreLink.Segment[lines.Length][];
             for (int i = 0; i < lines.Length; i++)
-                result[i] = new[] { new Banner.Segment(lines[i].text, lines[i].color) };
+                result[i] = new[] { new CoreLink.Segment(lines[i].text, lines[i].color) };
             return result;
         }
 
         // Compact banner — oven under heat squiggles over a status frame. 31-char
         // frame body (3 lead + ╔ + 26 ═ + ╗); 🧱 is a surrogate pair, but the console
         // ADVANCES ONE column for it (no VS16), however wide the font paints the glyph, so this row pads it as one cell.
-        private static readonly Banner.Segment[][] s_compactLines =
+        private static readonly CoreLink.Segment[][] s_compactLines =
         {
-            new[] { new Banner.Segment("                ) ) )",        ConsoleColor.Yellow) },
-            new[] { new Banner.Segment("               ( ( (",         ConsoleColor.DarkYellow) },
-            new[] { new Banner.Segment("            ┌───────────┐",    ConsoleColor.DarkGray) },
+            new[] { new CoreLink.Segment("                ) ) )",        ConsoleColor.Yellow) },
+            new[] { new CoreLink.Segment("               ( ( (",         ConsoleColor.DarkYellow) },
+            new[] { new CoreLink.Segment("            ┌───────────┐",    ConsoleColor.DarkGray) },
             new[]
             {
-                new Banner.Segment("            │ ",       ConsoleColor.DarkGray),
-                new Banner.Segment("▌ ▣ ▣ ▣ ▐",            ConsoleColor.Red),
-                new Banner.Segment(" │",                   ConsoleColor.DarkGray),
+                new CoreLink.Segment("            │ ",       ConsoleColor.DarkGray),
+                new CoreLink.Segment("▌ ▣ ▣ ▣ ▐",            ConsoleColor.Red),
+                new CoreLink.Segment(" │",                   ConsoleColor.DarkGray),
             },
-            new[] { new Banner.Segment("            └───────────┘",    ConsoleColor.DarkGray) },
-            new[] { new Banner.Segment("   ╔══════════════════════════╗", ConsoleColor.DarkGray) },
+            new[] { new CoreLink.Segment("            └───────────┘",    ConsoleColor.DarkGray) },
+            new[] { new CoreLink.Segment("   ╔══════════════════════════╗", ConsoleColor.DarkGray) },
             new[]
             {
-                new Banner.Segment("   ║   ",              ConsoleColor.DarkGray),
-                new Banner.Segment("[",                    ConsoleColor.Gray),
-                new Banner.Segment("██████████████████",   ConsoleColor.Green),
-                new Banner.Segment("]",                    ConsoleColor.Gray),
-                new Banner.Segment("   ║",                 ConsoleColor.DarkGray),
+                new CoreLink.Segment("   ║   ",              ConsoleColor.DarkGray),
+                new CoreLink.Segment("[",                    ConsoleColor.Gray),
+                new CoreLink.Segment("██████████████████",   ConsoleColor.Green),
+                new CoreLink.Segment("]",                    ConsoleColor.Gray),
+                new CoreLink.Segment("   ║",                 ConsoleColor.DarkGray),
             },
             new[]
             {
-                new Banner.Segment("   ║        ",         ConsoleColor.DarkGray),
-                new Banner.Segment("🧱 OVEN HOT",          ConsoleColor.Yellow),
-                new Banner.Segment("        ║",             ConsoleColor.DarkGray),
+                new CoreLink.Segment("   ║        ",         ConsoleColor.DarkGray),
+                new CoreLink.Segment("🧱 OVEN HOT",          ConsoleColor.Yellow),
+                new CoreLink.Segment("        ║",             ConsoleColor.DarkGray),
             },
-            new[] { new Banner.Segment("   ╚══════════════════════════╝", ConsoleColor.DarkGray) },
-            new[] { new Banner.Segment("    FIRES EASY BAKE MESHES",   ConsoleColor.Cyan) },
-            new Banner.Segment[0],
-            new[] { new Banner.Segment("   Fires Easy Bake Meshes Loaded", ConsoleColor.Magenta) },
+            new[] { new CoreLink.Segment("   ╚══════════════════════════╝", ConsoleColor.DarkGray) },
+            new[] { new CoreLink.Segment("    FIRES EASY BAKE MESHES",   ConsoleColor.Cyan) },
+            new CoreLink.Segment[0],
+            new[] { new CoreLink.Segment("   Fires Easy Bake Meshes Loaded", ConsoleColor.Magenta) },
         };
 
         private static readonly (string text, ConsoleColor color)[] s_bigLines =

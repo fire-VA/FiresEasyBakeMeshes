@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using UnityEngine;
@@ -86,7 +87,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_verdicts.TryGetValue(zdo.m_uid, out var known) && known.Revision == zdo.DataRevision) return known.StayLive;
 
             bool stayLive = false;
-            if (zdo.GetBool(CustomFieldsKey) || CarriesStructureTweak(zdo))
+            if (zdo.GetBool(CustomFieldsKey) || (StructureTweaksInstalled() && CarriesStructureTweak(zdo)))
             {
                 ReadKeys(zdo);
                 stayLive = CountEdits(zdo, EditTargets(prefabHash));
@@ -110,6 +111,21 @@ namespace FiresEasyBakeMeshes.EasyBake
             return named.Count > 0 ? string.Join(", ", named.ToArray()) : "none found now";
         }
 
+        // 1.2.161 (the lead, Raven's Rest: override_interact x2,032 kept out of the bake): World Edit Commands writes these keys and only Structure Tweaks reads
+        // them. Without that mod they change nothing on a piece, so they must not keep it live. Asked once, in the world, after every plugin has loaded.
+        private static bool? s_structureTweaksInstalled;
+
+        private static bool StructureTweaksInstalled()
+        {
+            if (s_structureTweaksInstalled.HasValue) return s_structureTweaksInstalled.Value;
+            bool installed = BepInEx.Bootstrap.Chainloader.PluginInfos.Values.Any(plugin =>
+                plugin.Metadata.GUID.IndexOf("structure_tweaks", StringComparison.OrdinalIgnoreCase) >= 0
+                || plugin.Metadata.Name.Replace(" ", "").IndexOf("StructureTweaks", StringComparison.OrdinalIgnoreCase) >= 0);
+            s_structureTweaksInstalled = installed;
+            EasyBakeLog.Debug($"[Data] Structure Tweaks installed: {installed}; its override_ keys {(installed ? "keep a piece live" : "are ignored, nothing reads them")}");
+            return installed;
+        }
+
         private static bool CarriesStructureTweak(ZDO zdo)
         {
             foreach (int key in StructureTweaksKeys.Keys)
@@ -122,7 +138,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             bool stayLive = false;
             foreach (int key in s_keysOnPiece)
             {
-                if (StructureTweaksKeys.TryGetValue(key, out string tweak))
+                if (StructureTweaksInstalled() && StructureTweaksKeys.TryGetValue(key, out string tweak))
                 {
                     Count(s_liveEdits, tweak);
                     stayLive = true;
@@ -234,7 +250,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_targetsByPrefab.TryGetValue(prefabHash, out var targets)) return targets;
 
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(prefabHash) : null;
             if (prefab == null) return NoTargets;
 
             var behaviours = prefab.GetComponentsInChildren<MonoBehaviour>(true);
@@ -307,7 +323,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static string PrefabName(int prefabHash)
         {
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(prefabHash) : null;
             return prefab != null ? prefab.name : prefabHash.ToString();
         }
 

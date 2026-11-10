@@ -27,6 +27,8 @@ namespace FiresEasyBakeMeshes.Patches
     //
     // For invulnerable pieces (m_health < 0, or all-Immune damage modifiers):
     //
+    // 1.2.167: what may be skipped is decided by InvulnerableClassifier.CanSkipWear; by default all-Immune pieces stay skipped, vanilla behind [Batching] VanillaWearOnInvulnerablePieces.
+    //
     //   UpdateWear: every code path that could accumulate damage — rain wear,
     //   support collapse, ashlands burn, lava — is gated at the bottom by
     //   `CanBeRemoved()` returning false → `num1 = 0`, no damage applied. The
@@ -74,7 +76,7 @@ namespace FiresEasyBakeMeshes.Patches
         public static void Postfix(WearNTear __instance, float v)
         {
             if (v <= 0f || !FiresEasyBakeMeshesPlugin.BatchingActive()) return;
-            EasyBake.ZoneTracker.HandBackPiece(__instance);
+            EasyBake.ZoneTracker.HandBackPiece(__instance, EasyBake.ShellPieces.Reason.AshlandsBurn);
         }
     }
 
@@ -85,7 +87,7 @@ namespace FiresEasyBakeMeshes.Patches
         public static void Prefix(WearNTear __instance)
         {
             if (!FiresEasyBakeMeshesPlugin.BatchingActive()) return;
-            EasyBake.ZoneTracker.HandBackPiece(__instance);
+            EasyBake.ZoneTracker.HandBackPiece(__instance, EasyBake.ShellPieces.Reason.Highlight);
         }
     }
 
@@ -97,7 +99,7 @@ namespace FiresEasyBakeMeshes.Patches
         {
             if (!FiresEasyBakeMeshesPlugin.PluginEnabled.Value) return true;
             if (!FiresEasyBakeMeshesPlugin.WearShortCircuitEnabled.Value) return true;
-            if (!EasyBake.InvulnerableClassifier.IsInvulnerable(__instance)) return true;
+            if (!EasyBake.InvulnerableClassifier.CanSkipWear(__instance)) return true;
             return false;
         }
     }
@@ -110,7 +112,7 @@ namespace FiresEasyBakeMeshes.Patches
         {
             if (!FiresEasyBakeMeshesPlugin.PluginEnabled.Value) return true;
             if (!FiresEasyBakeMeshesPlugin.WearShortCircuitEnabled.Value) return true;
-            if (!EasyBake.InvulnerableClassifier.IsInvulnerable(__instance)) return true;
+            if (!EasyBake.InvulnerableClassifier.CanSkipWear(__instance)) return true;
             return false;
         }
     }

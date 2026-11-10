@@ -204,7 +204,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static void Report()
         {
             string status = TakeStatus();
-            if (status != null) Log.Info("[ScanGate] " + status);
+            if (status != null) Log.Debug("[ScanGate] " + status);
         }
     }
 }

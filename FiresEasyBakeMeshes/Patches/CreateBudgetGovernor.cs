@@ -107,7 +107,7 @@ namespace FiresEasyBakeMeshes.Patches
         private static Vector2s CurrentZone()
         {
             var net = ZNet.instance;
-            return net != null ? ZoneSystem.GetZone(net.GetReferencePosition()) : new Vector2s(0, 0);
+            return net != null ? EasyBake.EbmZones.Of(net.GetReferencePosition()) : new Vector2s(0, 0);
         }
 
         private static AccessTools.FieldRef<ZNetScene, List<ZDO>> s_distantList;
@@ -181,7 +181,7 @@ namespace FiresEasyBakeMeshes.Patches
             double sortMs = s_sortTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             string status =
                 $"CreateObjectsSorted over {s_frames:N0} pass(es): walk {walkMs:N0} ms of up to {s_nearPeak:N0} near, " +
-                $"SORT {sortMs:N0} ms over {s_sortCalls:N0} call(s) of up to {s_sortPeak:N0}, " +
+                $"SORT {sortMs:N0} ms over {s_sortCalls:N0} call(s) of up to {s_sortPeak:N0} ({s_partialCalls:N0} partial: nearest only), " +
                 $"CREATE {tailMs - sortMs:N0} ms for {s_createdSum:N0} object(s) " +
                 $"(sort+create {tailMs:N0} ms of up to {s_candPeak:N0} candidate(s))" +
                 (s_capped == 0 ? "" : $"; budget held back {s_capped:N0} pass(es) (asked up to {s_peakAsked:N0}, allowed {s_peakGiven:N0})") +
@@ -190,7 +190,7 @@ namespace FiresEasyBakeMeshes.Patches
                 (s_released == 0 ? "" : $"; cap RELEASED on {s_released:N0} pass(es), queue peaked at {s_releasePeak:N0}");
             s_frames = 0; s_capped = 0; s_peakAsked = 0; s_peakGiven = 0;
             s_walkTicks = 0; s_tailTicks = 0; s_nearPeak = 0; s_candPeak = 0; s_createdSum = 0;
-            s_sortTicks = 0; s_sortCalls = 0; s_sortPeak = 0;
+            s_sortTicks = 0; s_sortCalls = 0; s_sortPeak = 0; s_partialCalls = 0;
             s_released = 0; s_releasePeak = 0;
             return status;
         }
@@ -228,13 +228,13 @@ namespace FiresEasyBakeMeshes.Patches
             }
 
             if (swapped == 1)
-                Log.Info("[CreateBudget] governor installed on ZNetScene.CreateObjectsSorted.");
+                Log.Debug("[CreateBudget] governor installed on ZNetScene.CreateObjectsSorted.");
             else
                 Log.Warn($"[CreateBudget] expected ONE Mathf.Max in CreateObjectsSorted, swapped {swapped} — " +
                     "the budget expression changed; the governor is not doing what it says and should be re-read against the current game code.");
 
             if (sortSwapped == 1)
-                Log.Info("[CreateBudget] Sort timer installed; sort and create now report separately.");
+                Log.Debug("[CreateBudget] Sort timer installed; sort and create now report separately.");
             else
                 Log.Warn($"[CreateBudget] expected ONE List<ZDO>.Sort in CreateObjectsSorted, swapped {sortSwapped} — " +
                     "sort time will read 0 and 'sort+create' keeps its old conflated meaning. Do not read the split.");
@@ -245,15 +245,70 @@ namespace FiresEasyBakeMeshes.Patches
         private static long s_sortTicks;
         private static int s_sortCalls, s_sortPeak;
 
+        // 1.2.151 ([fgn] / lead 10-30, Fire's town walk: "not created 12174/frame (sorted every frame) ... CreateObjectsSorted 937.2 ms
+        // over 69 frames" = ~13.6 ms a frame): vanilla sorts EVERY candidate by distance each frame but only creates the first `budget`
+        // of them. With [Optimize] PartialCreateSort only the K nearest (K = max(512, 4 x this frame's budget)) are put first, in
+        // vanilla's own order; the rest follow unsorted (they are re-ranked next frame anyway). O(n log K) instead of O(n log n).
+        private static readonly List<ZDO> s_heap = new List<ZDO>(), s_rest = new List<ZDO>();
+        private static long s_partialCalls;
+
         public static void TimedSort(List<ZDO> list, System.Comparison<ZDO> comparison)
         {
             long start = s_clock.ElapsedTicks;
-            list.Sort(comparison);
+            int k = Mathf.Max(512, CreationCensus.LastBudget * 4);
+            if (FiresEasyBakeMeshesPlugin.PartialCreateSort != null && FiresEasyBakeMeshesPlugin.PartialCreateSort.Value && list.Count > k * 2)
+            {
+                PartialSort(list, comparison, k);
+                s_partialCalls++;
+            }
+            else list.Sort(comparison);
             s_sortTicks += s_clock.ElapsedTicks - start;
             s_sortCalls++;
             int n = list.Count;
             if (n > s_sortPeak) s_sortPeak = n;
         }
+
+        // The k smallest by `cmp` to the front of `list` in sorted order, the rest after them (any order). A bounded max-heap: each
+        // element is compared against the current k-th nearest and only the nearer ones enter.
+        private static void PartialSort(List<ZDO> list, System.Comparison<ZDO> cmp, int k)
+        {
+            s_heap.Clear(); s_rest.Clear();
+            for (int i = 0; i < list.Count; i++)
+            {
+                var z = list[i];
+                if (s_heap.Count < k) { s_heap.Add(z); SiftUp(s_heap, s_heap.Count - 1, cmp); continue; }
+                if (cmp(z, s_heap[0]) < 0) { s_rest.Add(s_heap[0]); s_heap[0] = z; SiftDown(s_heap, 0, cmp); }
+                else s_rest.Add(z);
+            }
+            s_heap.Sort(cmp);
+            list.Clear(); list.AddRange(s_heap); list.AddRange(s_rest);
+            s_heap.Clear(); s_rest.Clear();
+        }
+
+        // max-heap on cmp (the root is the farthest of the k kept)
+        private static void SiftUp(List<ZDO> h, int i, System.Comparison<ZDO> cmp)
+        {
+            while (i > 0) { int p = (i - 1) >> 1; if (cmp(h[i], h[p]) <= 0) break; var t = h[i]; h[i] = h[p]; h[p] = t; i = p; }
+        }
+
+        private static void SiftDown(List<ZDO> h, int i, System.Comparison<ZDO> cmp)
+        {
+            int n = h.Count;
+            while (true)
+            {
+                int l = 2 * i + 1, r = l + 1, m = i;
+                if (l < n && cmp(h[l], h[m]) > 0) m = l;
+                if (r < n && cmp(h[r], h[m]) > 0) m = r;
+                if (m == i) return;
+                var t = h[i]; h[i] = h[m]; h[m] = t; i = m;
+            }
+        }
+
+        // ═══ ONE PACER, ONE RULE (1.2.250, Fire's SP split) ══════════════════════════════════════════════════
+        // There is nothing to defer to any more. This governor only ever runs inside vanilla's CreateObjectsSorted, and vanilla's body runs only when
+        // nobody replaced the pass: EBM's ObjectStreamPacer is off, it faulted, or it is an arrival (which the pacer leaves to vanilla, with no cap below).
+        // While the pacer takes the pass, vanilla's body and this method do not run at all, so the two cannot stack.
+        private static bool s_ruleSaid;
 
         // Replaces Mathf.Max(backlog/100, maxCreatedPerFrame).
         public static int Budget(int backlogScaled, int nominal)
@@ -264,6 +319,7 @@ namespace FiresEasyBakeMeshes.Patches
             s_midpoint = now;
 
             int vanilla = Mathf.Max(backlogScaled, nominal);
+            if (!s_ruleSaid) { s_ruleSaid = true; Log.Info("[CreateBudget] create budget: bounds vanilla's own create loop only; it runs when the object stream pacer does not take the pass (arrival, or the pacer off)."); }
             s_frames++;
             if (backlogScaled > s_peakAsked) s_peakAsked = backlogScaled;
 
@@ -284,7 +340,7 @@ namespace FiresEasyBakeMeshes.Patches
             // then, so the cap held. Lifted while the local player is teleporting as well.
             int cap = Player.m_localPlayer == null || Player.m_localPlayer.IsTeleporting() ? 0
                     : (FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame != null
-                    ? FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value : 0);
+                    ? Mathf.Max(1, (int)(FiresEasyBakeMeshesPlugin.CreateBudgetPerFrame.Value * EasyBake.PerformanceProfile.Budget)) : 0);   // 1.2.135
 
             // ═══ A CEILING ON CREATES IS PAID IN SORTS, EVERY FRAME ═════════════════════════════════════════════
             // The cap trades one frame's instantiation burst for a longer queue. That trade is only a win while the

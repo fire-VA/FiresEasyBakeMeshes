@@ -110,7 +110,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (_byPrefab.TryGetValue(prefabHash, out var cached)) return cached;
 
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(prefabHash) : null;
+            var prefab = scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(prefabHash) : null;
             var destructible = prefab != null ? prefab.GetComponent<IDestructible>() : null;
             var type = destructible != null ? destructible.GetDestructibleType() : DestructibleType.Default;
 

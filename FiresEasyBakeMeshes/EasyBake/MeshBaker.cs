@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using FiresCore.Pieces;
+
 using Unity.Profiling;
 using UnityEngine;
 
@@ -39,6 +39,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             // draw, so the originals keep drawing and nothing is ever drawn twice.
             public readonly List<GameObject> PendingSuppress = new List<GameObject>();
             public bool Ready = true;
+            // 1.2.206: called once when a time-sliced bake becomes Ready (ZoneTracker announces the zone to EbmApi then). Not on DropPending.
+            public Action<BakeResult> OnReady;
             // Identity of every piece that fed at least one batch. Used on zone
             // reload to recognise the same pieces returning and disable their
             // renderers without rebaking.
@@ -467,7 +469,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if ((result.Batches.Count > 0 && FiresEasyBakeMeshesPlugin.VerboseZoneLogging.Value)
                 || FiresEasyBakeMeshesPlugin.BatchingVerbose.Value)
             {
-                EasyBakeLog.Info(
+                EasyBakeLog.Debug(
                     $"[Bake] Zone ({coord.x},{coord.y}): {pieces.Count} pieces, " +
                     $"{candidates} candidate renderers ({skippedNonLod0} nonLod0-skip, {skippedPropertyBlock} propBlock-skip, {skippedNonReadable} nonReadable-skip), " +
                     $"baked {result.Batches.Count} batches covering {totalContributions} contributions, " +
@@ -499,7 +501,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static void PumpSuppression()
         {
             if (s_pendingBakes.Count == 0) return;
-            float budgetMs = FiresEasyBakeMeshesPlugin.SuppressBudgetMs.Value;
+            float budgetMs = FiresEasyBakeMeshesPlugin.SuppressBudgetMs.Value * PerformanceProfile.Budget;   // 1.2.135
             var clock = System.Diagnostics.Stopwatch.StartNew();
             int done = 0;
             while (s_pendingBakes.Count > 0)
@@ -521,8 +523,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 s_pendingBakes.RemoveAt(0);
                 if (!result.Ready)
                 {
-                    result.Ready = true;
+                    result.Ready = true; Indirect.EbmIndirect.RequestFullWalk();
                     if (result.Parent != null) result.Parent.SetActive(true);
+                    var onReady = result.OnReady;   // 1.2.206
+                    result.OnReady = null;
+                    if (onReady != null) { try { onReady(result); } catch (Exception e) { EasyBakeLog.Warn("[EbmApi] zone announce threw: " + e.Message); } }
                 }
             }
             BakeProfile.NoteSuppressSlice(clock.ElapsedTicks, done, s_pendingBakes.Count);
@@ -530,12 +535,21 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         // A bake torn down or unloaded before its queue ran out: nothing more to silence (what was silenced is restored by
         // Restore as before).
-        internal static void DropPending(BakeResult result)
+        // stillQueued, when given, receives the pieces not silenced yet: ZoneTracker keeps them with the unload's survivors.
+        internal static void DropPending(BakeResult result, List<GameObject> stillQueued = null)
         {
             if (result == null) return;
+            if (stillQueued != null && result.PendingSuppress.Count > 0)
+            {
+                int kept = 0;
+                for (int i = 0; i < result.PendingSuppress.Count; i++)
+                    if (result.PendingSuppress[i] != null) { stillQueued.Add(result.PendingSuppress[i]); kept++; }
+                if (kept > 0) EasyBakeLog.Debug($"[Suppress] zone unloaded while silencing: {kept} piece(s) not silenced yet are kept for its reload");
+            }
             result.PendingSuppress.Clear();
             s_pendingBakes.Remove(result);
-            result.Ready = true;
+            result.Ready = true; Indirect.EbmIndirect.RequestFullWalk();
+            result.OnReady = null;   // 1.2.206: torn down / unloaded before it was ready: never announced
         }
 
         public static void Restore(BakeResult result)
@@ -557,6 +571,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             DestroyBatches(result.Batches);
             DestroyBatches(result.FarBatches);
+            EbmTrace.Step("restore parent destroy", 0, result.Parent != null ? result.Parent.name : null);
             if (result.Parent != null) UnityEngine.Object.Destroy(result.Parent);
         }
 
@@ -646,10 +661,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (mr == null) continue;
 
                 bool isLodControlled = lodControlled.Contains(mr);
+                bool shown = mr.enabled || Indirect.Coverage.CoveredObject.HiddenByCoverage(mr);   // 1.2.210: a part coverage switched off still counts as shown
                 bool inNearTier = !isLodControlled || lod0Set.Contains(mr);
-                bool inFarTier = isLodControlled ? farSet.Contains(mr) : mr.enabled;
+                bool inFarTier = isLodControlled ? farSet.Contains(mr) : shown;
 
-                if (inNearTier && mr.enabled)
+                if (inNearTier && shown)
                 {
                     candidates++;
                     info.NearCandidates++;
@@ -661,7 +677,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                             ref skippedPropertyBlock, ref skippedNonReadable))
                         info.HadIneligibleEnabled = true;
                 }
-                else if (isLodControlled && !inNearTier && mr.enabled)
+                else if (isLodControlled && !inNearTier && shown)
                 {
                     candidates++;
                     skippedNonLod0++;
@@ -711,6 +727,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 var material = s_bakeMaterials[s];
                 if (material == null) continue;
+                material = MaterialVariants.SharedSource(mr, material);   // 1.2.88: one batch per variant, nameable in the cache
                 var batchKey = BatchKey.From(mr, material);
                 if (recordKeysInto != null) recordKeysInto.Add(batchKey);
                 into.Add(new MeshContribution
@@ -731,6 +748,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (batches == null) return;
             foreach (var batch in batches)
             {
+                EbmTrace.Step("batch destroy", batch.Mesh != null ? batch.Mesh.GetInstanceID() : 0, batch.Combined != null ? batch.Combined.name : null);
                 if (batch.Combined != null) UnityEngine.Object.Destroy(batch.Combined);
                 if (batch.Mesh != null) UnityEngine.Object.Destroy(batch.Mesh);
             }
@@ -829,6 +847,10 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static readonly Dictionary<int, string> _combinerRefusals = new Dictionary<int, string>();
 
+        // 1.2.253: the verdict a live copy already earned, without computing one from the prefab asset: WhyCombinerRefuses reads activeness and property
+        // blocks of a live piece, and caches the first answer it gives.
+        internal static bool TryGetKnownCombinerRefusal(int prefabHash, out string refusal) => _combinerRefusals.TryGetValue(prefabHash, out refusal);
+
         // Why Mesh.CombineMeshes could never take this prefab, or null when it can. Mirrors what CollectContributions
         // accepts in the near tier: a CPU-readable mesh on every enabled LOD0 renderer, and no per-object material values
         // unless the piece only tints itself. The census reports the same answer, so both read one rule.
@@ -862,7 +884,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < renderers.Length; i++)
             {
                 var renderer = renderers[i];
-                if (renderer == null || !renderer.enabled) continue;
+                if (renderer == null || !(renderer.enabled || Indirect.Coverage.CoveredObject.HiddenByCoverage(renderer))) continue;   // 1.2.21x: a part coverage switched off still counts
                 if (lodControlled != null && lodControlled.Contains(renderer) && (lod0 == null || !lod0.Contains(renderer))) continue;
                 if (renderer.HasPropertyBlock() && !tintOnly) propertyBlock = true;
                 var filter = renderer.GetComponent<MeshFilter>();
@@ -1154,7 +1176,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 s_classSweepAt = Mathf.Max(65536, s_classes.Count * 2);
             }
             if (s_classQueue.Count == 0 && s_classUrgent.Count == 0 && s_preps.Count == 0) return;
-            float budgetMs = FiresEasyBakeMeshesPlugin.ClassifyBudgetMs.Value;
+            float budgetMs = FiresEasyBakeMeshesPlugin.ClassifyBudgetMs.Value * PerformanceProfile.Budget;   // 1.2.135
             if (budgetMs <= 0f) { s_classQueue.Clear(); s_classUrgent.Clear(); s_preps.Clear(); return; }   // 0 = the old behaviour: all of it at bake time
             var clock = System.Diagnostics.Stopwatch.StartNew();
             int done = 0;
@@ -1224,7 +1246,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static WearLook LookOf(ZDO zdo)
         {
             var scene = ZNetScene.instance;
-            return WearLooks.Resolve(scene != null ? scene.GetPrefab(zdo.GetPrefab()) : null, zdo);
+            return WearLooks.Resolve(scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(zdo.GetPrefab()) : null, zdo);
         }
 
         internal static WearLook LookOf(WearNTear wnt)
@@ -1285,7 +1307,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var combined = new Mesh { name = $"EasyBake_{coord.x}_{coord.y}_{batchName}" };
                 if (wide)
                     combined.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+                EbmTrace.Step("combine begin", combined.GetInstanceID(), "zone " + coord.x + "," + coord.y + " " + batchName + " sources " + combineArr.Length);
                 combined.CombineMeshes(combineArr, mergeSubMeshes: true, useMatrices: true);
+                EbmTrace.Step("combine end", combined.GetInstanceID(), "verts " + combined.vertexCount);
                 combined.RecalculateBounds();
                 BakeProfile.Mark(BakeProfile.Phase.CombineNative, meshes: 1, sourceMeshes: contributions.Count, vertices: combined.vertexCount);
 
@@ -1297,6 +1321,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 mf.sharedMesh = combined;
                 var mr = go.AddComponent<MeshRenderer>();
                 batchKey.ApplyTo(mr);
+                if (!EbmMeshCheck.Sane(combined, "zone combine " + coord.x + "," + coord.y)) mr.forceRenderingOff = true;   // 1.2.234: a bad mesh is never drawn
                 if (farTier) go.SetActive(false);
 
                 into.Add(new BatchInstance { Combined = go, Mesh = combined });

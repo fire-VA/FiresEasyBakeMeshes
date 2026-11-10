@@ -13,14 +13,16 @@ namespace FiresEasyBakeMeshes.Utilities
             if (_registered || Application.isBatchMode) return;
             _registered = true;
 
-            FiresCore.Help.HelpRegistry.RegisterSection(ModId, "", "What Easy Bake Does", 0, BuildOverview);
-            FiresCore.Help.HelpRegistry.RegisterSection(ModId, "", "Tuning & Troubleshooting", 1, BuildTuning, adminOnly: true);
+            CoreLink.RegisterHelp(ModId, "", "What Easy Bake Does", 0, BuildOverview);
+            CoreLink.RegisterHelp(ModId, "", "Tuning & Troubleshooting", 1, BuildTuning, adminOnly: true);
         }
 
-        private static void BuildOverview(FiresCore.Help.HelpContentWriter w)
+        private static void BuildOverview(CoreLink.HelpWriter w)
         {
             w.Header("What Easy Bake Does");
-            w.Paragraph("Fires Easy Bake Meshes is a silent performance mod — no UI, no commands. You " +
+            w.Paragraph("Fires Easy Bake Meshes is a silent, client-only performance mod — no UI, and a few console commands: " +
+                "ebm_census and ebm_vegetation (what is loaded around you and why), ebm_why (what Easy Bake does with the piece " +
+                "you look at) and, with devcommands, ebm_rebake [all|here] (bake the zones around you again). You " +
                 "experience it as smoother frames, especially around large builds and when crossing zone " +
                 "borders.");
             w.Divider();
@@ -39,18 +41,20 @@ namespace FiresEasyBakeMeshes.Utilities
                 "swaps to it past [Batching] FarTierDistanceMeters (default 64m, which is far enough " +
                 "that the swap never happens while you are standing in that zone).");
             w.Bullet("Disk cache — baked meshes persist per world and reload ~4x faster next session.");
-            w.Bullet("Zone keepalive — recently-visited baked zones stay pinned briefly instead of being " +
+            w.Bullet("Zone keepalive (OFF by default since 1.2.86; [Optimize] ZoneKeepaliveEnabled) — when on, recently-visited baked zones stay pinned briefly instead of being " +
                 "destroyed and rebuilt when you cross back.");
             w.Bullet("A set of steady-state CPU trims: time-sliced object destruction, wear-and-tear " +
                 "short-circuits for invulnerable pieces, distance-LOD on light flicker/sound/clutter " +
                 "updates, and static-piece sync skips.");
             w.Divider();
 
-            w.Paragraph("Everything is local to your machine and can be switched off live — " +
-                "[General] PluginEnabled in F8 applies without a restart.");
+            w.Paragraph("Everything is local to your machine and can be switched off with " +
+                "[General] PluginEnabled (F1 › Config settings, or Esc › Mod Settings). Turning it off works at once; after turning " +
+                "it back on, relog so the zones already loaded are picked up again. Only three settings show by default; the rest " +
+                "are under Show Advanced.");
         }
 
-        private static void BuildTuning(FiresCore.Help.HelpContentWriter w)
+        private static void BuildTuning(CoreLink.HelpWriter w)
         {
             w.AdminHeader("Tuning & Troubleshooting");
             w.SubHeader("If Something Looks Wrong");
@@ -58,14 +62,16 @@ namespace FiresEasyBakeMeshes.Utilities
                 "after changes settle ([Batching] SettleDelaySeconds).");
             w.Bullet("Transparent pieces (glass) are excluded from batching by design " +
                 "(ExcludeTransparentPieces) — merged transparency would draw through walls.");
-            w.Bullet("Suspect the mod? Flip [General] PluginEnabled off live and compare.");
+            w.Bullet("Suspect the mod? Flip [General] PluginEnabled off live and compare (relog after turning it back on).");
+            w.Bullet("One piece looks wrong or is missing? Look at it and run ebm_why: it names the prefab and how it is drawn. " +
+                "Add the prefab to [Batching] ExcludedPrefabs to leave it out of baking, then relog.");
             w.Divider();
 
             w.SubHeader("Prewarm Skips");
             w.Paragraph("Prefabs that take pathologically long to instantiate (or have enormous " +
                 "hierarchies) are skipped and REMEMBERED:");
             w.Bullet("SlowInstantiateThresholdMs — a prefab slower than this is recorded to " +
-                "config/FiresEasyBakeMeshes/prewarm_slow_skips.txt and skipped in future sessions. " +
+                "BepInEx/cache/FiresEasyBakeMeshes/prewarm_slow_skips.txt and skipped in future sessions. " +
                 "Delete a line to retry it.");
             w.Bullet("MaxTransformCount — skip prefabs with more than N hierarchy nodes (default 800).");
             w.Bullet("SkipNameContains — manual comma-separated skip list.");

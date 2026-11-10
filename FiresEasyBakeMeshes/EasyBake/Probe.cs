@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using BepInEx.Bootstrap;
-using FiresCore.Diagnostics;
+
 
 namespace FiresEasyBakeMeshes.EasyBake
 {
@@ -23,16 +23,16 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         public static void Detect()
         {
-            _profilerPresent = Chainloader.PluginInfos.ContainsKey(DebugToolsGuid);
+            _profilerPresent = true;   // 1.2.208: no PluginInfos lookup; the timer only runs when a FrameTimer was registered through EbmApi (CoreLink.TimerEnabled)
         }
 
         public static long Start() =>
-            (_profilerPresent && FrameTimer.Enabled) ? Stopwatch.GetTimestamp() : 0L;
+            (_profilerPresent && CoreLink.TimerEnabled) ? Stopwatch.GetTimestamp() : 0L;
 
         public static void Stop(string label, long start)
         {
             if (start == 0L) return;
-            FrameTimer.Record(label, Stopwatch.GetTimestamp() - start);
+            CoreLink.Record(label, Stopwatch.GetTimestamp() - start);
         }
     }
 }

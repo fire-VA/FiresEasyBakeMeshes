@@ -114,7 +114,7 @@ namespace FiresEasyBakeMeshes.Patches
 
             float perCall = (float)s_created / s_calls;
             float meanBudget = s_budgetSamples > 0 ? (float)s_budgetSum / s_budgetSamples : -1f;
-            Log.Info($"[Creations] {s_created:N0} object(s) over {s_calls:N0} CreateObjects call(s) = {perCall:0.0} per call " +
+            Log.Debug($"[Creations] {s_created:N0} object(s) over {s_calls:N0} CreateObjects call(s) = {perCall:0.0} per call " +
                      $"(worst {s_worstInOneCall:N0}); mean budget handed out {meanBudget:0.0} " +
                      $"(last backlog/100 = {LastBacklogScaled}, nominal = {LastNominal}). " +
                      (meanBudget > 0 && perCall > meanBudget * 1.5f
@@ -132,12 +132,12 @@ namespace FiresEasyBakeMeshes.Patches
                 string name = "?";
                 if (scene != null)
                 {
-                    var go = scene.GetPrefab(kv.Key);
+                    var go = FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(kv.Key);
                     if (go != null) name = go.name;
                 }
                 sb.Append($"\n    {kv.Value,7:N0}  {name}");
             }
-            Log.Info(sb.ToString());
+            Log.Debug(sb.ToString());
 
             s_calls = 0; s_created = 0; s_worstInOneCall = 0;
             s_budgetSum = 0; s_budgetSamples = 0;
@@ -236,7 +236,7 @@ namespace FiresEasyBakeMeshes.Patches
                 // Absent from THIS client's ZNetScene: uncreatable here, and only a server ever cleans it up.
                 // Resolved here rather than inside WouldSkip so the hash list below still works when skipping is
                 // switched off entirely, and so the CreateObject path does not pay for a label only this reads.
-                if (scene.GetPrefab(hash) == null)
+                if (FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(hash) == null)
                 {
                     absentPrefab++;
                     s_stuckByPrefab.TryGetValue(hash, out int a); s_stuckByPrefab[hash] = a + 1;
@@ -264,7 +264,7 @@ namespace FiresEasyBakeMeshes.Patches
             // DeferCreationWhileBaking is on - which it is not by default, for reasons measured in DeferCreation.
             // So with the defer off this line should read zero held back, and the queue is budget, all of it.
             int bakePending = Reason(EasyBake.ZoneTracker.SkipReason.ZoneBakePending);
-            bool deferHolds = EasyBake.DeferCreation.Enabled;
+            bool deferHolds = false;   // 1.2.150: the defer is removed
             int heldByUs = deferHolds ? bakePending : 0;
             int waitingOnBudget = Reason(EasyBake.ZoneTracker.SkipReason.SkipInactive)
                                 + Reason(EasyBake.ZoneTracker.SkipReason.PrefabNotSkippable)
@@ -286,7 +286,7 @@ namespace FiresEasyBakeMeshes.Patches
             int freeToSkip = Reason(EasyBake.ZoneTracker.SkipReason.WouldBeSkipped);
             string sample = stride == 1 ? "" : $", 1-in-{stride} sample of {sampled:N0} scaled up";
 
-            Log.Info($"[Candidates] {n:N0} ZDO(s) queued with no instance, bucketed in {clock.Elapsed.TotalMilliseconds:0.0} ms{sample}: " +
+            Log.Debug($"[Candidates] {n:N0} ZDO(s) queued with no instance, bucketed in {clock.Elapsed.TotalMilliseconds:0.0} ms{sample}: " +
                      $"{waitingOnBudget:N0} need a real create (0.183 ms and a budget slot each), " +
                      $"{freeToSkip:N0} the bake absorbs FREE when the loop reaches them, " +
                      $"{heldByUs:N0} withheld by EBM's defer, " +
@@ -298,7 +298,7 @@ namespace FiresEasyBakeMeshes.Patches
             // Why the skip passed each one over, in the order the stages are evaluated. This does not change who
             // creates them - vanilla does - it sizes how much of the queue the skip could ever take, which is the
             // only actionable thing in the breakdown.
-            Log.Info($"[Candidates] why the skip passed them over: " +
+            Log.Debug($"[Candidates] why the skip passed them over: " +
                      $"{Reason(EasyBake.ZoneTracker.SkipReason.SkipInactive):N0} skipping inactive this session, " +
                      $"{Reason(EasyBake.ZoneTracker.SkipReason.PrefabNotSkippable):N0} prefab can never be skipped, " +
                      $"{Reason(EasyBake.ZoneTracker.SkipReason.BuildHold):N0} near a build tool, " +

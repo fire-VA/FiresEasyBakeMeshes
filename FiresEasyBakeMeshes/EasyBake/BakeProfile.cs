@@ -115,6 +115,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static long s_clsTicks, s_clsMax;
         private static int s_clsFrames, s_clsPieces;
+        private static float s_clsNextLog;
         internal static void NoteClassifySlice(long ticks, int pieces, int left)
         {
             if (pieces == 0) return;
@@ -122,7 +123,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_clsPieces += pieces;
             s_clsFrames++;
             if (ticks > s_clsMax) s_clsMax = ticks;
-            if (s_clsFrames % 200 == 0 || left == 0)
+            // 1.2.98 (the lead 10-13: 178 of these in one session): once a minute at most
+            if ((s_clsFrames % 200 == 0 || left == 0) && UnityEngine.Time.unscaledTime >= s_clsNextLog && (s_clsNextLog = UnityEngine.Time.unscaledTime + 60f) > 0f)
                 EasyBakeLog.Debug($"[BakeProfile] classify slices: {s_clsPieces} pieces over {s_clsFrames} frames, {Ms(s_clsTicks):0.0} ms total, " +
                                  $"worst frame {Ms(s_clsMax):0.0} ms, {PerUnit(s_clsTicks, s_clsPieces)} us per piece, {left} queued");
         }

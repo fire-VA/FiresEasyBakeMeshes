@@ -1,5 +1,5 @@
 using System.Collections.Generic;
-using FiresCore.Pieces;
+
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes.EasyBake
@@ -15,6 +15,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             public Collider Source;
             public Matrix4x4 RootToCollider;
             public int Layer;
+            public bool Leaky;   // 1.2.127: vanilla Cover.IsUnderRoof skips "leaky" colliders; a stand-in must too
         }
 
         private static readonly Template[] NoTemplates = new Template[0];
@@ -33,7 +34,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (templates.Length == 1)
             {
                 colliders = 1;
-                return CreateCollider(root, templates[0], pieceMatrix);
+                return Mark(CreateCollider(root, templates[0], pieceMatrix), identity, piece);
             }
 
             var holder = new GameObject("StandIn");
@@ -41,13 +42,23 @@ namespace FiresEasyBakeMeshes.EasyBake
             for (int i = 0; i < templates.Length; i++)
                 CreateCollider(holder.transform, templates[i], pieceMatrix);
             colliders = templates.Length;
-            return holder;
+            return Mark(holder, identity, piece);
+        }
+
+        // 1.2.130: the piece this stands in for, for other mods (EbmStandIns.StandsInFor)
+        private static GameObject Mark(GameObject go, MeshBaker.PieceIdentity identity, MeshBaker.PieceTransform piece)
+        {
+            var mark = go.AddComponent<EbmStandIn>();
+            mark.PrefabHash = identity.PrefabHash;
+            mark.Position = piece.Position;
+            return go;
         }
 
         private static GameObject CreateCollider(Transform parent, Template template, Matrix4x4 pieceMatrix)
         {
             Matrix4x4 world = pieceMatrix * template.RootToCollider;
             var go = new GameObject("StandInCollider") { layer = template.Layer };
+            if (template.Leaky) go.tag = "leaky";
             var transform = go.transform;
             transform.SetParent(parent, false);
             transform.SetPositionAndRotation(world.GetColumn(3), world.rotation);
@@ -60,7 +71,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (_byKey.TryGetValue(key, out var cached)) return cached;
             var scene = ZNetScene.instance;
-            var prefab = scene != null ? scene.GetPrefab(key.PrefabHash) : null;
+            var prefab = scene != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(key.PrefabHash) : null;
             if (prefab == null) return NoTemplates;
 
             var root = prefab.transform;
@@ -74,6 +85,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     Source = collider,
                     RootToCollider = root.worldToLocalMatrix * collider.transform.localToWorldMatrix,
                     Layer = collider.gameObject.layer,
+                    Leaky = collider.gameObject.CompareTag("leaky"),
                 });
             }
 

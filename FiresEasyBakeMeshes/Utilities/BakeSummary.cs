@@ -1,4 +1,4 @@
-using FiresCore.Logging;
+
 using UnityEngine;
 
 namespace FiresEasyBakeMeshes
@@ -11,7 +11,7 @@ namespace FiresEasyBakeMeshes
     {
         private const float DebounceSeconds = 5f;
 
-        private static readonly LoadSummary.TaggedEmitter Emitter = LoadSummary.For("FiresEasyBakeMeshes");
+
 
         private static int _zonesFromCache;
         private static int _zonesBakedFresh;
@@ -40,7 +40,7 @@ namespace FiresEasyBakeMeshes
             if (_lastEventUnscaledTime < 0f) return;
             if (Time.unscaledTime - _lastEventUnscaledTime < DebounceSeconds) return;
 
-            Emitter.EmitMiniBox("🧱 ZONES BAKED", new[]
+            CoreLink.MiniBox("🧱 ZONES BAKED", new[]
             {
                 $"from cache : {_zonesFromCache}",
                 $"baked fresh: {_zonesBakedFresh}",

@@ -38,15 +38,18 @@ namespace FiresEasyBakeMeshes.Patches
     [HarmonyPatch(typeof(ZSFX), nameof(ZSFX.CustomUpdate))]
     public static class ZSFX_CustomUpdate_Patch
     {
+        private static readonly AccessTools.FieldRef<ZSFX, float> DelayRef = AccessTools.FieldRefAccess<ZSFX, float>("m_delay");
+
         [HarmonyPrefix]
         public static bool Prefix(ZSFX __instance)
         {
             if (!FiresEasyBakeMeshesPlugin.ZSFXLodEnabled.Value) return true;
+            if (DelayRef(__instance) >= 0f) return true;   // 1.2.167 ([generator] B6): Play() runs inside CustomUpdate, so a sound not yet started must tick or it never plays
 
             var player = Player.m_localPlayer;
             if (player == null) return true;
 
-            float maxDist = FiresEasyBakeMeshesPlugin.ZSFXLodDistance.Value;
+            float maxDist = FiresEasyBakeMeshesPlugin.ZSFXLodDistance.Value * EasyBake.PerformanceProfile.Distance;   // 1.2.135
             float sqrMax = maxDist * maxDist;
 
             // sqrMagnitude — no sqrt, no Vector3 allocation.

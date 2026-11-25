@@ -28,8 +28,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static float LastArrival(Vector2s coord)
             => s_lastArrival.TryGetValue(ZoneSystem.SectorToIndex(coord).Sector, out float at) ? at : -1f;
 
-        [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.AddToSector)), HarmonyPostfix]
-        private static void AddToSectorPostfix(ZDO zdo, ZoneSystem.SectorIndex sectorIndex)
+        internal static void OnAdd(ZDO zdo, ZoneSystem.SectorIndex sectorIndex)   // 1.2.271: called from SectorHooks (one postfix per vanilla method)
         {
             if ((!KeyOn && !(FiresEasyBakeMeshesPlugin.CacheEmptyZoneDropsCache != null && FiresEasyBakeMeshesPlugin.CacheEmptyZoneDropsCache.Value)) || zdo == null || zdo.DataRevision != 0U) return;   // 1.2.255: EmptyZoneDropsCache reads these stamps too
             s_lastArrival[sectorIndex.Sector] = Time.unscaledTime;

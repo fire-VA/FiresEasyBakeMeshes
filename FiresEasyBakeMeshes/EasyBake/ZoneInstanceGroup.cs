@@ -66,7 +66,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             Identities.Add(identity);
             _ver++; Indirect.EbmIndirect.MarkGroupDirty(this);   // 1.2.195
             _partsDirty = true;
-            _snowDirty = true;
+            if (_sIdx < 0) _snowDirty = true;   // 1.2.354: a pass in flight resumes past the appended instance (EnsureSnow) instead of restarting
         }
 
         // A piece joining after the bake; many can land in one frame, so bounds are recomputed once at the next draw.
@@ -83,7 +83,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             Identities.Add(identity);
             _ver++; Indirect.EbmIndirect.MarkGroupDirty(this);   // 1.2.195
             _partsDirty = true;
-            _snowDirty = true;
+            if (_sIdx < 0) _snowDirty = true;   // 1.2.354: a pass in flight resumes past the appended instance (EnsureSnow) instead of restarting
         }
 
         public bool TryRemove(MeshBaker.PieceIdentity identity)
@@ -199,6 +199,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
                 var matrices = p == 0 ? Matrices : _partMatrices[p];
                 var renderParams = part.RenderParams;
+                if (InstanceDefinition.DrawLateOn) renderParams.material = InstanceDefinition.LateMaterial(renderParams.material);   // 1.2.402 [Optimize] InstancedPiecesDrawLate (default off): a one-queue-later copy; key off = the part's own material, as before
                 renderParams.worldBounds = bounds;
                 if (camera != null) renderParams.camera = camera;
                 // 1.2.149 (Fire's shadow option C): far or small baked pieces draw without casting
@@ -505,6 +506,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_budgetFrame = -1;
         private static long s_budgetUsedTicks;
         private static int s_slicedGroups, s_slicedCalls, s_deferredCalls;   // 1.2.147: deferred = draws that waited for a later frame
+        private static int s_passResumed, s_restartDirty, s_restartCount;      // 1.2.354
         private int _sIdx = -1, _sCount, _sCovered, _sCalls;
         private float[] _sVal;
         private bool[] _sRoofed;
@@ -525,10 +527,22 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (!_snowDirty && _sIdx < 0 && _snowRanges.Count > 0) return;
             if (_snowDirty || _sIdx < 0 || _sCount != count)
             {
-                // (re)start a pass: a new dirty mark or a changed instance count restarts it from the first instance
-                _snowDirty = false;
-                _sIdx = 0; _sCount = count; _sCovered = 0; _sCalls = 0;
-                if (_sVal == null || _sVal.Length != count) { _sVal = new float[count]; _sRoofed = new bool[count]; }
+                // 1.2.354 ([2ic], lead 11-13: run_16 arrival "re-split pass running 122277"): instances only APPENDED while a pass runs (Add / AddCached
+                // no longer mark dirty then; a removal, reorder or input change still does) = the pass resumes past the old count, the instances
+                // already done keep their values. Anything else (re)starts it from the first instance, as before.
+                if (!_snowDirty && _sIdx >= 0 && count > _sCount && _sVal != null)
+                {
+                    if (_sVal.Length < count) { System.Array.Resize(ref _sVal, count); System.Array.Resize(ref _sRoofed, count); }
+                    _sCount = count;
+                    s_passResumed++;
+                }
+                else
+                {
+                    if (_sIdx >= 0) { if (_snowDirty) s_restartDirty++; else s_restartCount++; }
+                    _snowDirty = false;
+                    _sIdx = 0; _sCount = count; _sCovered = 0; _sCalls = 0;
+                    if (_sVal == null || _sVal.Length != count) { _sVal = new float[count]; _sRoofed = new bool[count]; }
+                }
             }
             long rsStart = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.144: re-split step timer (FlushResplitFrame)
             // 1.2.159 (launch-1 log: "worst frame 4.6 ms (Core coverage 1.8, exposure 3.4 ...)" summed past its total): close the previous
@@ -551,11 +565,14 @@ namespace FiresEasyBakeMeshes.EasyBake
             var local = Definition.MeshBounds;
             var e = local.extents;
             int startIdx = _sIdx;
+            // 1.2.354 ([2ic], lead 11-13; run_16:22712 worst 5.0 ms against the 2 ms budget, 4.4 ms of it exposure tests): in rain each instance is a roof
+            // test that can cost over a millisecond, so 4 between budget checks overran it. Wet = the budget is checked before every instance.
+            int step = _wetSeen ? 1 : SliceStep;
             for (int i = _sIdx; i < count; i++)
             {
                 // 1.2.146: out of this frame's budget -> stop here, resume next frame. 1.2.147: only the frame's first re-split is
                 // guaranteed SliceStep instances (so every pass still ends); any later group may stop before its first instance
-                if ((i - startIdx) % SliceStep == 0 && (!firstThisFrame || i > startIdx)
+                if ((i - startIdx) % step == 0 && (!firstThisFrame || i > startIdx)
                     && s_budgetUsedTicks + (System.Diagnostics.Stopwatch.GetTimestamp() - rsStart) > budget)
                 {
                     _sIdx = i; _sCovered = covered;
@@ -592,7 +609,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 // 1.2.162 (Fire 11-04: "many baked meshes and va pieces meshes do not get snow still"): with FTS's world field on, the shader shelters per pixel
                 // and a live piece's value is the area cover alone (FiresPieceSnowDriver), so a baked one gets the same and neighbours match. The per-piece
                 // test here read a neighbour's stand-in as a roof and zeroed the piece. It still runs in rain, for the dry range.
-                float exposure = _fieldSeen && !_wetSeen ? 1f : ExposureCache.Get(centre + up * reach, up);
+                float exposure = _fieldSeen && !_wetSeen ? 1f : ExposureCache.Get(Identities[i].PrefabHash, centre + up * reach, up);   // 1.2.354: keyed by prefab + spot
                 s_frExposureTicks += System.Diagnostics.Stopwatch.GetTimestamp() - te;
                 roofed[i] = exposure <= 0.001f;
                 value[i] = _fieldSeen ? coverage : roofed[i] ? 0f : coverage * exposure;
@@ -687,6 +704,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 s_nextSplitSummary = Time.time + 30f;
                 EasyBakeLog.Debug($"[SnowBake] last 30 s: {s_splits} group re-split(s), {s_splitInstances} instance(s), {s_splitRoofed} roofed/dry{(WetOverride.Raining ? " (raining)" : "")}; worst frame of EBM re-split (incl. Core/FTS calls) {s_rsWorstTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F1} ms ({ResplitSplit(s_rsWorstTicks, s_worstCoverTicks, s_worstExposureTicks, s_worstFinishTicks)}), {s_rsSlowFrames} frame(s) over {ResplitSlowMs:0} ms; {ZoneTracker.SnowAreaSummary()}; per-group lines: [Batching] VerboseLogging");
+                // 1.2.354: pass resumes / restarts + the roof-test cache (with its dry-flag re-check) for the same 30 s
+                EasyBakeLog.Debug($"[SnowBake] passes last 30 s: {s_passResumed} resumed past appended instance(s), restarted {s_restartDirty} (inputs changed / removal / reorder) + {s_restartCount} (count shrank); budget checked every {(WetOverride.BakedDries ? 1 : SliceStep)} instance(s) now; {ExposureCache.Take30s()}");
+                s_passResumed = s_restartDirty = s_restartCount = 0;
                 if (s_slicedGroups > 0)
                 {
                     float budgetMs = FiresEasyBakeMeshesPlugin.SnowResplitBudgetMs != null ? FiresEasyBakeMeshesPlugin.SnowResplitBudgetMs.Value : 2f;
@@ -861,7 +881,16 @@ namespace FiresEasyBakeMeshes.EasyBake
         // Bumped at the end of every finished snow / wet re-split (EnsureSnow): the indirect path rewrites the group's looks then.
         internal int SnowGeneration => _snowGen;
         // The look ranges are in force (the same test the instanced Draw uses); off = every instance plain.
-        internal bool LooksActive => SnowFeed.Active || WetOverride.BakedDries || ExtCount > 0;
+        internal bool LooksActive => AmountLooksActive || ShapeCount > 0 || EbmSnowStore.ShapeSourceOn;   // 1.2.437: + snow shape
+        private bool AmountLooksActive => SnowFeed.Active || WetOverride.BakedDries || ExtCount > 0;      // the pre-1.2.437 LooksActive (x / y logic)
+
+        // ── 1.2.437 EbmApi.SetPieceSnowShape (EbmSnowStore.SetShape / ShapeLookZ) ──
+        // ShapeCount = this group's pieces with a shape value; ShapeGen bumps on a shape change only. It re-runs the look write (IndirectLooks.WriteGroup,
+        // .z of changed slots) and nothing else: no ExtGen, no _snowDirty, no re-split, no Version bump. The instanced path draws the source materials
+        // (Vedr/Piece etc.), which do not read EBM's shape, so it needs no work here.
+        internal int ShapeCount;
+        internal int ShapeGen;
+        internal void ShapeLooksChanged() { ShapeGen++; Indirect.EbmIndirect.MarkGroupDirty(this); }
 
         // ── 1.2.206 EbmApi.SetPieceSnow (EbmSnowStore) ──
         // ExtCount = how many of this group's pieces have a pushed value; ExtGen bumps on every change (IndirectLooks.WriteGroup reads it).
@@ -931,10 +960,22 @@ namespace FiresEasyBakeMeshes.EasyBake
         // instances are only reordered when a pass ends, so they still line up.
         internal Vector4 LookOf(int i)
         {
+            var look = LookXY(i);
+            // 1.2.437: z = snow shape + 1 (0 = unset), on every return of the x / y logic, which is unchanged
+            if ((ShapeCount > 0 || EbmSnowStore.ShapeSourceOn) && i >= 0 && i < Identities.Count && i < Matrices.Count)
+            {
+                var m = Matrices[i];
+                look.z = EbmSnowStore.ShapeLookZ(this, Identities[i], new Vector3(m.m03, m.m13, m.m23));   // the pivot, as EnsureSnow's CoverageAt(pos)
+            }
+            return look;
+        }
+
+        private Vector4 LookXY(int i)
+        {
             // 1.2.206: a pushed value first, by the piece's identity (Identities moves with Matrices, so i still names the same piece)
             if (ExtCount > 0 && i >= 0 && i < Identities.Count && EbmSnowStore.TryGet(Identities[i], out var ext)) return new Vector4(ext.x, ext.y, 0f, 0f);
             if (i >= 0 && i < Identities.Count && EbmSnowStore.HoldPlain(Identities[i])) return new Vector4(0f, 1f, 0f, 0f);   // 1.2.260 WaitForPushedSnow
-            if (!LooksActive || _instVals == null || _snowRangesCount != Matrices.Count || i < 0 || i >= _snowRangesCount) return new Vector4(0f, 1f, 0f, 0f);
+            if (!AmountLooksActive || _instVals == null || _snowRangesCount != Matrices.Count || i < 0 || i >= _snowRangesCount) return new Vector4(0f, 1f, 0f, 0f);
             return new Vector4(_instVals[i], _wetSeen && i < _instCovered ? 0f : 1f, 0f, 0f);
         }
 

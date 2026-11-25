@@ -42,7 +42,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         [HarmonyLib.HarmonyPatch(typeof(CookingStation), "UpdateVisual"), HarmonyLib.HarmonyPostfix]
         private static void StationAfter(CookingStation __instance, int __state) { Compare(__state, LitMask(__instance.m_haveFireObject)); }
 
-        private const int MaxPixel = 8;
+        // 1.2.296 ([lead] swamp: water's 92 light-pass draws = one ForwardAdd per pixel torch touching a tile): the pixel slot count is a key now.
+        // In Valheim's deferred path a light's render mode only changes FORWARD objects (water, sign text, particles); a vertex-lit piece light also
+        // loses its shadow here, as before. Fewer slots = fewer extra passes on water / transparents and fewer shadowed torches.
+        private static int MaxPixel => FiresEasyBakeMeshesPlugin.LightBudgetPixelLights != null ? Mathf.Clamp(FiresEasyBakeMeshesPlugin.LightBudgetPixelLights.Value, 1, 16) : 8;
         private const float EnterRange = 18f, LeaveRange = 22f, HoldSeconds = 3f, RankSeconds = 0.5f, ListSeconds = 2f, LogSeconds = 10f;
 
         private class State { public LightRenderMode Mode; public LightShadows Shadows; public bool LodOwnsShadows; public bool Pixel = true; public float Since = -999f; }
@@ -50,7 +53,18 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Dictionary<Light, State> s_states = new Dictionary<Light, State>();
         private static readonly List<Light> s_pieceLights = new List<Light>();
         private static readonly List<(Light light, float d2)> s_ranked = new List<(Light, float)>();
+        // 1.2.291 LightBudgetScreenRank: scores and the two comparers, made once (no closure per tick)
+        private static readonly Dictionary<Light, float> s_score = new Dictionary<Light, float>();
+        private static readonly Plane[] s_planes = new Plane[6];
+        private static readonly System.Comparison<(Light light, float d2)> s_byDistance = (a, b) => a.d2.CompareTo(b.d2);
+        private static readonly System.Comparison<(Light light, float d2)> s_byScore = (a, b) =>
+        {
+            s_score.TryGetValue(a.light, out float sa); s_score.TryGetValue(b.light, out float sb);
+            int c = sb.CompareTo(sa);
+            return c != 0 ? c : a.d2.CompareTo(b.d2);
+        };
         private static float s_nextRank, s_nextList, s_nextLog;
+        private static int w_flips;
         private static bool s_ran;
         private static string s_lastLine;
 
@@ -105,9 +119,26 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             bool flipWaiting = false;
             s_ranked.Clear();
+            // 1.2.291 [Optimize] LightBudgetScreenRank (round-2 E5): inside the same enter / leave ranges, the MaxPixel slots go to the lights that light the
+            // most of what is on screen, not simply the nearest: score = range^2 x intensity / distance^2, and a light whose sphere is wholly outside the view
+            // ranks after every visible one. Off = nearest first, as before. The score is kept beside the distance; the hysteresis still uses distance.
+            bool screenRank = FiresEasyBakeMeshesPlugin.LightBudgetScreenRank != null && FiresEasyBakeMeshesPlugin.LightBudgetScreenRank.Value;
+            if (screenRank) GeometryUtility.CalculateFrustumPlanes(cam, s_planes);
+            s_score.Clear();
             foreach (var l in s_pieceLights)
-                if (l != null && l.isActiveAndEnabled) s_ranked.Add((l, (l.transform.position - eye).sqrMagnitude));
-            s_ranked.Sort((a, b) => a.d2.CompareTo(b.d2));
+            {
+                if (l == null || !l.isActiveAndEnabled) continue;
+                float d2 = (l.transform.position - eye).sqrMagnitude;
+                s_ranked.Add((l, d2));
+                if (screenRank)
+                {
+                    float r = l.range;
+                    bool inView = d2 <= r * r || GeometryUtility.TestPlanesAABB(s_planes, new Bounds(l.transform.position, Vector3.one * (2f * r)));
+                    float score = r * r * Mathf.Max(0.01f, l.intensity) / Mathf.Max(1f, d2);
+                    s_score[l] = inView ? score : score * 1e-6f;
+                }
+            }
+            if (screenRank) s_ranked.Sort(s_byScore); else s_ranked.Sort(s_byDistance);
 
             int pixel = 0, vertex = 0, shadowed = 0;
             float enter2 = EnterRange * EnterRange, leave2 = LeaveRange * LeaveRange;
@@ -128,6 +159,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     EasyBakeLog.Debug($"[EBM] light budget flip: '{l.name}' on '{PieceName(l)}' {(st.Pixel ? "pixel" : "vertex")} -> {(want ? "pixel" : "vertex")} at {Mathf.Sqrt(d2):0.0} m, rank {i + 1}/{s_ranked.Count}, shadows {(st.LodOwnsShadows ? "left to LightLod" : (want ? st.Shadows.ToString() : "None"))}");
                     st.Pixel = want;
                     st.Since = now;
+                    w_flips++;   // 1.2.297 ([lead]: fewer slots measured slower; are flips the cost?)
                 }
                 else if (want != st.Pixel) flipWaiting = true;
                 if (st.Pixel)
@@ -148,8 +180,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (now >= s_nextLog)
             {
                 s_nextLog = now + LogSeconds;
-                string line = $"[EBM] light budget: {pixel} pixel ({shadowed} shadowed) / {vertex} vertex-lit of {s_ranked.Count} piece light(s); budget {MaxPixel}, enter {EnterRange:0} m / leave {LeaveRange:0} m; fire state events {s_fireEvents}";
+                string line = $"[EBM] light budget: {pixel} pixel ({shadowed} shadowed) / {vertex} vertex-lit of {s_ranked.Count} piece light(s); {w_flips} flip(s) in the last {LogSeconds:0} s; budget {MaxPixel}, enter {EnterRange:0} m / leave {LeaveRange:0} m, ranked by {(screenRank ? "screen contribution (LightBudgetScreenRank)" : "distance")}; fire state events {s_fireEvents}";
                 if (line != s_lastLine) { s_lastLine = line; EasyBakeLog.Debug(line); }
+                w_flips = 0;
             }
         }
 

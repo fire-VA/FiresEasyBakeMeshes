@@ -20,7 +20,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static Pair Current, Next;
 
         internal static int PxPerView(ImpostorEngine.Sharpness s) => s == ImpostorEngine.Sharpness.Low ? 64 : s == ImpostorEngine.Sharpness.High ? 192 : s == ImpostorEngine.Sharpness.Ultra ? 256 : 128;
-        internal static int MipsFor(int size) { int m = 0; while (size >= 4) { m++; size >>= 1; } return m; }   // down to 4 x 4 (DXT blocks)
+        internal static int MipsFor(int size) { int m = 0; while (size >= 4 && (size & 3) == 0) { m++; size >>= 1; } return m; }   // 1.2.346 ([ghost], Fire run_8: 240 "Index was outside the bounds" bake failures): every mip must be a whole number of 4x4 DXT blocks. Sharpness High = 192 px x 8 views = 1536, whose 9th mip is 6x6: ImpostorDxt.Size(6,6) reserved one block while Encode wrote four, past the end of the chain. Stop at the last multiple of 4 (1536 -> 8 mips, down to 12x12).
 
         /// <summary>The pair bakes go into right now (Next while a Sharpness change is pending).</summary>
         internal static Pair Target => Next ?? Current;

@@ -86,6 +86,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_planesOk) GeometryUtility.CalculateFrustumPlanes(cam, s_censusPlanes);
         }
 
+        private static bool s_censusLostSaid;
         private static void StepCensus()
         {
             long end = Stopwatch.GetTimestamp() + (long)(CensusBudgetMs * Stopwatch.Frequency / 1000.0);
@@ -110,6 +111,15 @@ namespace FiresEasyBakeMeshes.EasyBake
                     s_censusPiece = 0;
                 }
                 var count = s_censusCounts[st.Coord];
+                // 1.2.311 ([classes-ui] census-02-town on 1.2.310: NullReferenceException in Classify every frame, 1,294+ in Player.log). The census walks a
+                // zone's pieces over SEVERAL frames, but the zone's "still active and baked" check (above) ran only when the zone was first set up. A zone that
+                // unloaded or re-baked mid-walk left st.Bake null, and Classify's first line (st.Bake.ContributorIdentities) threw on every later piece of it,
+                // every frame, because s_censusPiece never advanced past the throw. Now the zone is re-checked each time the walk resumes it; a lost zone is left.
+                if (!st.ZoneActive || !st.Baked || st.Bake == null)
+                {
+                    if (!s_censusLostSaid) { s_censusLostSaid = true; EasyBakeLog.Info($"[BakeProof] census: zone {st.Coord} unloaded or lost its bake mid-walk; left out of this pass (shown once)"); }
+                    s_censusZone++; s_censusPiece = -1; continue;
+                }
                 while (s_censusPiece < s_censusBuf.Count)
                 {
                     if ((s_censusPiece & 3) == 0 && Stopwatch.GetTimestamp() > end) return;   // 1258 review (b): checked every 4 pieces (was 16)
@@ -200,7 +210,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void Report()
         {
-            if (!EasyBakeLog.DebugOn()) return;
+            if (!(VerifyOn || EasyBakeLog.DebugOn())) return;   // 1.2.296: Verify on = its summary line at Info
             int bake = 0, real = 0, both = 0, neither = 0, inView = 0, zones = 0;
             foreach (var c in s_censusCounts.Values) { if (c.Bake + c.Real + c.Both + c.Neither == 0) continue; zones++; bake += c.Bake; real += c.Real; both += c.Both; neither += c.Neither; inView += c.InView; }
             var sb = new StringBuilder(1024);
@@ -214,7 +224,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (c.Neither > 0) { sb.Append("; neither by why:"); for (int i = 0; i < 6; i++) if (c.NeitherBy[i] > 0) sb.Append(' ').Append(NeitherWhy[i]).Append(' ').Append(c.NeitherBy[i]).Append(';'); }
                 foreach (var e in c.Examples) sb.Append("\n    ").Append(e);
             }
-            EasyBakeLog.Debug(sb.ToString());
+            string full = sb.ToString();
+            if (VerifyOn) { int nl = full.IndexOf('\n'); EasyBakeLog.Info(nl > 0 ? full.Substring(0, nl) : full); }   // the summary + fix counts; per-zone rows stay Debug
+            if (EasyBakeLog.DebugOn()) EasyBakeLog.Debug(full);
             s_fixBoth = s_fixHandBackLook = s_fixRestored = s_fixSkippedBack = s_fixSkippedNotSame = s_fixZoneBusy = 0;
         }
 

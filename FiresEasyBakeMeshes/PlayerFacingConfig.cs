@@ -86,6 +86,8 @@ namespace FiresEasyBakeMeshes
             ["Cache/EmptyZoneDropsCache"] = "Remove the saved bake of a fully demolished zone.",
             ["Cache/KeepOtherSettings"] = "Keep saved zones made under other settings on disk.",
             ["Cache/PreloadNearOnly"] = "Keep only nearby saved zones in memory; far zones may rebuild after a teleport.",
+            ["Cache/PreloadSlim"] = "Keep a saved zone in memory only until it is built; saves RAM.",
+            ["Cache/ZdoCombineIdleRelease"] = "Free the first-visit bake's model copies when they are not in use; saves RAM.",
             ["Cache/MaxMBPerWorld"] = "Disk space for one world's saved zones (0 = no limit).",
             ["Cache/MaxMBAllWorlds"] = "Disk space for all worlds' saved zones (0 = no limit).",
             ["Optimize/CoverAfterBakeEnds"] = "Draw pieces a bake gives back through the faster path again.",
@@ -166,5 +168,8 @@ namespace FiresEasyBakeMeshes
             CoreLink.MarkAdvanced(config, d => !Basics.Contains(d.Section + "/" + d.Key));
             EasyBakeLog.Debug($"[Config] {shortened} key descriptions shortened; all but {Basics.Count} basics marked Advanced.");
         }
+
+        // 1.2.319: a feature marks its own few player-facing keys Basic (the water look); read lazily by the Advanced predicate above.
+        internal static void AddBasic(string section, string key) => Basics.Add(section + "/" + key);
     }
 }

@@ -229,7 +229,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             set.Add(zdo);
             if (nv.m_distant) { s_stDistant.Add(zdo); s_sliceDistant++; return; }
             s_stCount.TryGetValue(sector, out int c); s_stCount[sector] = c + 1;
-            if (nv.GetComponent<Rigidbody>() != null) s_stMobile[zdo] = nv;
+            if (Mobile(zdo, nv)) s_stMobile[zdo] = nv;   // 1.2.276: per prefab hash, not GetComponent per instance
         }
 
         private static void StageRemove(ZDO zdo)
@@ -240,12 +240,26 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (!s_stDistant.Remove(zdo) && s_stCount.TryGetValue(sector, out int c)) { if (c <= 1) s_stCount.Remove(sector); else s_stCount[sector] = c - 1; }
         }
 
+        // 1.2.276 (lead 11-10, every ours-only swamp leg: EBM's worst plugin Update 6-8 ms each window, all "sector mirror + zsync report"):
+        // a fixed 8,000-instance slice (GetZone + four table writes + a GetComponent<Rigidbody> each) was one 6-8 ms frame per rebuild.
+        // The slice now also stops at SliceBudgetMs (clock read every 128 instances), and "has a Rigidbody" is asked once per ZDO prefab hash.
+        private const double SliceBudgetMs = 1.0;
+        private static readonly Dictionary<int, bool> s_mobileByPrefab = new Dictionary<int, bool>();
+        private static bool Mobile(ZDO zdo, ZNetView nv)
+        {
+            int h = zdo.GetPrefab();
+            if (!s_mobileByPrefab.TryGetValue(h, out bool m)) { m = nv.GetComponent<Rigidbody>() != null; s_mobileByPrefab[h] = m; }
+            return m;
+        }
+
         private static void SliceStep()
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             int end = System.Math.Min(s_snapshot.Count, s_slicePos + SliceSize);
+            int n = 0;
             for (; s_slicePos < end; s_slicePos++)
             {
+                if ((++n & 127) == 0 && sw.Elapsed.TotalMilliseconds >= SliceBudgetMs) break;
                 var kv = s_snapshot[s_slicePos];
                 if (kv.Key == null || kv.Value == null || s_stZdoSector.ContainsKey(kv.Key)) continue;
                 StageAdd(kv.Key, kv.Value);
@@ -320,6 +334,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         public static void Reset()
         {
+            s_mobileByPrefab.Clear();   // 1.2.276: prefabs per scene
             _countBySector.Clear();
             _zdoSector.Clear();
             _zdosBySector.Clear();

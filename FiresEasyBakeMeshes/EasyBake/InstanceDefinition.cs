@@ -30,6 +30,7 @@ namespace FiresEasyBakeMeshes.EasyBake
     internal sealed class LodPart
     {
         public Mesh Mesh; public int SubMesh; public Matrix4x4 FromFirst; public RenderParams RenderParams; public Material SourceMaterial;
+        public bool Last;   // E8 (1.2.292): in its LODGroup's last level
         public float Start, End; public Vector3 RefFirst; public float Size;   // Size 0 = not under a LODGroup: always drawn
     }
 
@@ -233,6 +234,44 @@ namespace FiresEasyBakeMeshes.EasyBake
             EasyBakeLog.Debug($"[Snow] instancing copy '{copy.name}' follows its source to shader '{(source.shader != null ? source.shader.name : "null")}' #{(source.shader != null ? source.shader.GetInstanceID() : 0)} (was '{(old != null ? old.name : "null")}' #{(old != null ? old.GetInstanceID() : 0)})");
         }
 
+        // ---- 1.2.402 [Optimize] InstancedPiecesDrawLate ([visual], [lead]): the copy a part draws with while the key is on: same shader, properties and
+        // keywords as the part's own material, render queue one later (opaque geometry range only), so terrain and rocks at queue 2000 fill depth first and the
+        // piece pixels they hide are rejected before shading. Made once per material, kept like the instancing copies. Follows its source at most once a
+        // second (signature) and at once on a shader change; the queue is set again after every follow.
+        private static readonly Dictionary<Material, Material> s_lateCopies = new Dictionary<Material, Material>();
+        private static readonly Dictionary<Material, int> s_lateSig = new Dictionary<Material, int>();
+        private static readonly Dictionary<Material, float> s_lateNext = new Dictionary<Material, float>();
+        private static bool s_lateSaid;
+        internal static bool DrawLateOn => FiresEasyBakeMeshesPlugin.InstancedPiecesDrawLate != null && FiresEasyBakeMeshesPlugin.InstancedPiecesDrawLate.Value;
+        internal static Material LateMaterial(Material m)
+        {
+            if (m == null) return m;
+            int q = m.renderQueue;
+            if (q < 2000 || q > 2449) return m;   // only opaque geometry; alpha-test (2450+) and later stay where they are
+            if (!s_lateCopies.TryGetValue(m, out Material late) || late == null)
+            {
+                late = new Material(m) { name = m.name + " (EBM late)", enableInstancing = true };
+                s_lateCopies[m] = late; s_lateSig[late] = Signature(m); s_lateNext[late] = Time.realtimeSinceStartup + 1f;
+                if (!s_lateSaid) { s_lateSaid = true; EasyBakeLog.Info("[Instancing] InstancedPiecesDrawLate on: baked pieces draw one render-queue step after the terrain and rocks (copies of their materials; the game's own materials are not changed)"); }
+            }
+            else if (late.shader != m.shader)
+            {
+                late.shader = m.shader; late.CopyPropertiesFromMaterial(m); late.enableInstancing = true; s_lateSig[late] = Signature(m);
+            }
+            else
+            {
+                float now = Time.realtimeSinceStartup;
+                if (!s_lateNext.TryGetValue(late, out float next) || now >= next)
+                {
+                    s_lateNext[late] = now + 1f;
+                    int sig = Signature(m);
+                    if (!s_lateSig.TryGetValue(late, out int had) || had != sig) { late.CopyPropertiesFromMaterial(m); late.enableInstancing = true; s_lateSig[late] = sig; }
+                }
+            }
+            if (late.renderQueue != q + 1) late.renderQueue = q + 1;   // after every follow: CopyPropertiesFromMaterial may carry the source's queue
+            return late;
+        }
+
         public static bool TryBuild(GameObject prefab, WearLook look, out InstanceDefinition definition, out string rejectReason)
         {
             definition = null;
@@ -306,7 +345,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                         FromFirst = i == 0 ? Matrix4x4.identity : firstInverse * offset,
                         SourceRenderer = renderer, SourceIndex = m, SourceMaterial = material,   // 1.2.155
                         RenderParams = new RenderParams(InstancingMaterial(material))
-                        {
+                        { motionVectorMode = MotionVectorGenerationMode.Camera, 
                             shadowCastingMode = renderer.shadowCastingMode,
                             receiveShadows = renderer.receiveShadows,
                             layer = renderer.gameObject.layer,
@@ -549,7 +588,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             var groups = prefab.GetComponentsInChildren<LODGroup>(true);
             if (groups.Length == 0) return null;
-            var windows = new Dictionary<Renderer, (float start, float end, LODGroup group)>();
+            var windows = new Dictionary<Renderer, (float start, float end, LODGroup group, bool last)>();
             foreach (var g in groups)
             {
                 if (g == null || !g.enabled) continue;
@@ -562,8 +601,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                     foreach (var r in lods[k].renderers)
                     {
                         if (r == null) continue;
-                        if (windows.TryGetValue(r, out var w)) windows[r] = (Mathf.Max(w.start, start), Mathf.Min(w.end, end), w.group);   // in several levels: spans them
-                        else windows[r] = (start, end, g);
+                        if (windows.TryGetValue(r, out var w)) windows[r] = (Mathf.Max(w.start, start), Mathf.Min(w.end, end), w.group, w.last || k == lods.Length - 1);   // in several levels: spans them
+                        else windows[r] = (start, end, g, k == lods.Length - 1);
                     }
                 }
             }
@@ -579,10 +618,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var mats = r.sharedMaterials;
                 if (mats.Length == 0 || mats.Length > mf.sharedMesh.subMeshCount) return null;
                 var offset = prefab.transform.worldToLocalMatrix * r.transform.localToWorldMatrix;
-                float start = float.MaxValue, end = 0f, size = 0f; Vector3 refFirst = Vector3.zero;
+                float start = float.MaxValue, end = 0f, size = 0f; Vector3 refFirst = Vector3.zero; bool lastLv = false;
                 if (windows.TryGetValue(r, out var w))
                 {
-                    start = w.start; end = w.end;
+                    start = w.start; end = w.end; lastLv = w.last;
                     var gt = w.group.transform;
                     var refPrefab = prefab.transform.InverseTransformPoint(gt.TransformPoint(w.group.localReferencePoint));
                     refFirst = firstInverse.MultiplyPoint3x4(refPrefab);
@@ -595,8 +634,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                     list.Add(new LodPart
                     {
                         Mesh = mf.sharedMesh, SubMesh = m, FromFirst = firstInverse * offset, SourceMaterial = mats[m],
-                        RenderParams = new RenderParams(InstancingMaterial(mats[m])) { shadowCastingMode = r.shadowCastingMode, receiveShadows = r.receiveShadows, layer = r.gameObject.layer, lightProbeUsage = LightProbeUsage.Off, reflectionProbeUsage = r.reflectionProbeUsage },
-                        Start = start, End = end, RefFirst = refFirst, Size = size,
+                        RenderParams = new RenderParams(InstancingMaterial(mats[m])) { motionVectorMode = MotionVectorGenerationMode.Camera,  shadowCastingMode = r.shadowCastingMode, receiveShadows = r.receiveShadows, layer = r.gameObject.layer, lightProbeUsage = LightProbeUsage.Off, reflectionProbeUsage = r.reflectionProbeUsage },
+                        Start = start, End = end, RefFirst = refFirst, Size = size, Last = lastLv,
                     });
                 }
             }

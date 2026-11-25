@@ -75,11 +75,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static long s_createCalls, s_createNull;
         private static readonly Dictionary<int, int> s_nullByPrefab = new Dictionary<int, int>();
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObject"), HarmonyPrefix, HarmonyPriority(Priority.First)]
-        private static void OnePre() { if (On && s_oneDepth++ == 0) s_oneStart = Stopwatch.GetTimestamp(); }
+        // 1.2.271: CreateObject / CreateObjects pre + post reach these through CreatePassHooks (one EBM prefix + one postfix per vanilla method)
+        internal static void OnePre() { if (On && s_oneDepth++ == 0) s_oneStart = Stopwatch.GetTimestamp(); }
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObject"), HarmonyPostfix, HarmonyPriority(Priority.Last)]
-        private static void OnePost(ZDO zdo, GameObject __result)
+        internal static void OnePost(ZDO zdo, GameObject __result)
         {
             if (!On) { s_oneDepth = 0; return; }
             s_createCalls++;
@@ -116,11 +115,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_createBefore, s_removeBefore, s_created, s_destroyed;
         private static double s_createMs, s_removeMs;
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObjects"), HarmonyPrefix, HarmonyPriority(Priority.First)]
-        private static void CreatePre(ZNetScene __instance) { if (!On) return; s_createStart = Stopwatch.GetTimestamp(); s_createBefore = __instance.NrOfInstances(); }
+        internal static void CreatePre(ZNetScene __instance) { if (!On) return; s_createStart = Stopwatch.GetTimestamp(); s_createBefore = __instance.NrOfInstances(); }
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObjects"), HarmonyPostfix, HarmonyPriority(Priority.Last)]
-        private static void CreatePost(ZNetScene __instance)
+        internal static void CreatePost(ZNetScene __instance)
         {
             if (!On || s_createStart == 0) return;
             double ms = (Stopwatch.GetTimestamp() - s_createStart) * 1000.0 / Stopwatch.Frequency;

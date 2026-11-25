@@ -22,6 +22,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         internal static readonly Dictionary<string, int> RendererRefusals = new Dictionary<string, int>();   // reason -> renderers, since load
 
         internal CoverageRules.Verdict Verdict;
+        internal bool Cluster;   // 1.2.286 [Optimize] IndirectStaticClusters: a dungeon room / location part tree with no ZNetView (StaticClusters.cs)
         private bool m_started, m_paused, m_open;
         private string m_sticky;
         private Vector3 m_pos;
@@ -84,6 +85,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             var e = m_entries[i];
             if (e.LevelOff) return;
             if (IndirectBatches.Active) for (int k = 0; k < e.Handles.Length; k++) { try { IndirectBatches.Remove(e.Handles[k]); } catch { } }
+            else if (IndirectBatches.TablesLive) for (int k = 0; k < e.Handles.Length; k++) { try { IndirectBatches.Remove(e.Handles[k]); } catch { } }   // 1.2.381: the coverage key off alone leaves the tables live (IndirectBatches.TablesLive)
             Handles -= e.Handles.Length; LevelSlotsOff += e.Mats.Length; LevelsOff++; LevelOffs++;
             e.Handles = s_noHandles; e.LevelOff = true;
             m_entries[i] = e;
@@ -96,7 +98,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             var added = new int[e.Mats.Length];
             for (int sub = 0; sub < e.Mats.Length; sub++)
             {
-                EbmIndirect.s_addContext = "covered '" + transform.gameObject.name + "' (level back on) at " + transform.position.ToString("F0");   // 1.2.235
+                EbmIndirect.SetCoveredContext(transform, null);   // 1.2.235; 1.2.356: names read only when an [Integrity] line prints
                 int h = IndirectBatches.Add(e.Mesh, sub, e.Mats[sub], in e.Matrix, e.Shadows, e.Layer, in e.Range);
                 if (h < 0)
                 {
@@ -132,6 +134,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         {
             if (m_parked || m_entries.Count == 0) return;
             bool tablesLive = IndirectBatches.Active;
+            tablesLive |= IndirectBatches.TablesLive;   // 1.2.381: the coverage key off alone still leaves the tables live (IndirectBatches.TablesLive)
             int slots = 0;
             for (int i = 0; i < m_entries.Count; i++)
             {
@@ -294,6 +297,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         private void Start()
         {
             m_started = true; Live.Add(this);
+            if (TryGetComponent<StaticPhysics>(out var phys)) { m_physics = phys; ByPhysics[phys] = this; }   // 1.2.405: the PushUp postfix finds this object by a lookup, not a component search
             // CoverageBatchedStart: queue the first cover for the one late-frame pass. A copy holding born-off parts covers now as before
             // (its parts are off until covered, so it must never reach a drawn frame uncovered).
             if (Batched && m_bornOff.Count == 0) { Enqueue(ref m_pendStart); return; }
@@ -301,7 +305,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         }
         private void OnEnable() { if (m_started) { Live.Add(this); Count("object re-enabled"); Refresh(); } }
         private void OnDisable() { CancelInvoke(nameof(QueuedRefresh)); CancelInvoke(nameof(QueuedAfterBake)); m_refreshQueued = false; m_pendPart = false; Release(); }   // a queued Start cover stays queued: it runs Refresh, which hands an inactive object back exactly as Start did
-        private void OnDestroy() { Live.Remove(this); m_pendStart = false; m_pendPart = false; Release(); RestoreBornOff(); }
+        // 1.2.405 ([visual], [2ic]'s DN main-thread read): StaticPhysics -> its CoveredObject, for CoveragePatches' PushUp postfix (vanilla calls PushUp on every
+        // non-falling StaticPhysics update). Filled in Start, emptied in OnDestroy (by reference, also when the StaticPhysics was destroyed first). Main thread only, as Live.
+        internal static readonly Dictionary<StaticPhysics, CoveredObject> ByPhysics = new Dictionary<StaticPhysics, CoveredObject>();
+        private StaticPhysics m_physics;
+        private void OnDestroy() { if ((object)m_physics != null) { ByPhysics.Remove(m_physics); m_physics = null; } Live.Remove(this); m_pendStart = false; m_pendPart = false; Release(); RestoreBornOff(); }
 
         // ---- CoverageBatchedStart ([Optimize], default off): Start and the part on/off re-cover only queue; FlushPending (EBM's LateUpdate,
         // after every Start of the frame's spawns) runs the same Refresh for all of them. A destroyed object drops out (Unity null); a disabled
@@ -403,14 +411,35 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
 
         // ---- dropped items: drawn by the batches only while their Rigidbody sleeps. Checked on vanilla's own 10 s ItemDrop.SlowUpdate and
         // on any collision (CoveredItemBump); a woken item goes back to Unity at once and is covered again, where it now rests, once asleep.
+        // 1.2.338 ([visual], lead 11-12; town 615 census: "item came to rest (re-covered) 165" every 30 s with 4 items covering): the count sat
+        // BEFORE Refresh decided, and an asleep item Refresh declines (sticky, suppressed, every renderer refused ...) was walked and counted
+        // again on every 10 s SlowUpdate for good. Now one attempt per rest: a declined one is counted ONCE with Refresh's exit named, and not
+        // retried until the body wakes (the moving branch / Woken clear it: event-driven, no timer re-walk).
+        private bool m_restTried;
         internal void SleepCheck()
         {
             if (Verdict == null || Verdict.Kind != CoverageRules.Kind.Item) return;
             bool asleep = m_body != null && m_body.IsSleeping();
-            if (asleep && !IsCovering) { Count("item came to rest (re-covered)"); Refresh(); }
-            else if (!asleep && IsCovering) { Count("item moving (handed back)"); Release(); }
+            if (asleep && !IsCovering)
+            {
+                if (m_restTried) return;
+                m_restTried = true;
+                Refresh();
+                if (IsCovering) Count("item came to rest (re-covered)");
+                else Count(RestDeclinedReason(m_lastExit));
+            }
+            else if (!asleep && IsCovering) { m_restTried = false; Count("item moving (handed back)"); Release(); }
+            else if (!asleep) m_restTried = false;
         }
-        internal void Woken() { if (IsCovering) { Count("item bumped (handed back)"); Release(); } }
+        internal void Woken() { m_restTried = false; if (IsCovering) { Count("item bumped (handed back)"); Release(); } }
+        // the census keeps at most 32 reasons; these are fixed strings, one per exit (no per-call allocation)
+        private static readonly Dictionary<string, string> s_restDeclined = new Dictionary<string, string>();
+        private static string RestDeclinedReason(string exit) { if (!s_restDeclined.TryGetValue(exit, out var s)) { s = "item at rest, not coverable: " + exit; s_restDeclined[exit] = s; } return s; }
+        // 1.2.338: why the last Refresh left the object uncovered (or "covered"); fixed strings, read by SleepCheck's census row
+        private string m_lastExit = ExitNotStarted;
+        private const string ExitNotStarted = "not started", ExitInactive = "object inactive", ExitPaused = "paused (tree shake / regrow)", ExitOpen = "waiting to settle",
+            ExitLookHeld = "look held (MaterialMan value)", ExitBatchesOff = "indirect batches off", ExitSuppressed = "baked by EBM (suppressed visuals)", ExitMoving = "body not sleeping",
+            ExitNoRenderer = "no active renderer", ExitRefused = "every renderer refused or not ours (see refusals)", ExitCovered = "covered";
         private Rigidbody m_body;
 
         /// <summary>EBM's own bake took this piece over (EasyBakeSuppressedVisuals): hand everything back now, so it is never drawn twice.</summary>
@@ -489,14 +518,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         {
             m_signatureCount = -1;
             Release();
-            if (!m_started) return;   // Start covers it (born-off parts wait for that, before the first frame is drawn)
-            if (!isActiveAndEnabled || m_sticky != null || m_paused || m_open || m_lookHeld) { RestoreBornOff(); return; }
-            if (!IndirectBatches.Active) { RestoreBornOff(); return; }
-            if (TryGetComponent<EasyBakeSuppressedVisuals>(out var suppressed) && !(CoverAfterBakeEnds && suppressed.Restored)) { RestoreBornOff(); m_sticky = BakedByEbm; return; }   // EBM's bake draws it
+            if (!m_started) { m_lastExit = ExitNotStarted; return; }   // Start covers it (born-off parts wait for that, before the first frame is drawn)
+            if (!isActiveAndEnabled || m_sticky != null || m_paused || m_open || m_lookHeld)
+            {
+                m_lastExit = !isActiveAndEnabled ? ExitInactive : m_sticky != null ? m_sticky : m_paused ? ExitPaused : m_open ? ExitOpen : ExitLookHeld;   // 1.2.338: m_sticky is already its reason text
+                RestoreBornOff(); return;
+            }
+            if (!IndirectBatches.Active) { m_lastExit = ExitBatchesOff; RestoreBornOff(); return; }
+            if (EbmIndirect.GateHoldsOut) { m_lastExit = ExitGate; RestoreBornOff(); return; }   // 1.2.401 [Optimize] IndirectSelfGate: the path stands down; Unity draws the object (the Release above already ran) until the gate covers it again
+            if (TryGetComponent<EasyBakeSuppressedVisuals>(out var suppressed) && !(CoverAfterBakeEnds && suppressed.Restored)) { m_lastExit = ExitSuppressed; RestoreBornOff(); m_sticky = BakedByEbm; return; }   // EBM's bake draws it
             if (Verdict != null && Verdict.Kind == CoverageRules.Kind.Item)
             {
                 if (m_body == null) m_body = GetComponent<Rigidbody>();
-                if (m_body == null || !m_body.IsSleeping()) { RestoreBornOff(); return; }   // moving: Unity draws it until it rests
+                if (m_body == null || !m_body.IsSleeping()) { m_lastExit = ExitMoving; RestoreBornOff(); return; }   // moving: Unity draws it until it rests
                 if (!TryGetComponent<CoveredItemBump>(out _)) gameObject.AddComponent<CoveredItemBump>();
             }
             m_pos = transform.position;
@@ -535,6 +569,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
                 ComputeReach();
                 CoverageReach.File(this);   // 1.2.214 P2: filed by cell; judged at once while the gate is on (a far object is parked before it is drawn)
             }
+            m_lastExit = m_entries.Count > 0 ? ExitCovered : s_renderers.Count == 0 ? ExitNoRenderer : ExitRefused;   // 1.2.338
             m_signature = Signature(out m_signatureCount);   // 1.2.215: what this cover saw; 1.2.227: stored covered or not (only a full attempt gets here)
         }
 
@@ -548,10 +583,28 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             return why;
         }
 
+        // 1.2.395 ([visual], [lead]; Plains census 11-15: "class MineRock: 34 object(s), 714 renderer(s) ... 714 drawn by the batches", 34 after an off / on cycle,
+        // frame 5.306 -> 4.934 ms in the same launch). Vanilla MineRock.UpdateVisability shows an untouched rock as its base model alone and switches the
+        // area meshes off (renderer.enabled = false; first call 1-2 s after Start, then every 10 s). Coverage took the rock before that call, with every
+        // renderer still on, hid them itself, and so never saw vanilla switch the areas off: it drew about 20 hidden area meshes on top of each base model.
+        // Rule: while the base model is active, an area mesh is vanilla's (not covered). The set is vanilla's own (MineRock.Start: the MeshRenderers on the
+        // GameObjects that hold a Collider under m_areaRoot, or under the rock when there is no area root). When an area breaks, vanilla switches the base
+        // model off and the area renderers on; the RPC_Hide / UpdateVisability hooks re-cover on that change and the areas are covered as before.
+        private MineRock m_rock; private bool m_rockLooked;
+        private bool RockAreaHiddenByVanilla(MeshRenderer r)
+        {
+            if (!m_rockLooked) { m_rockLooked = true; m_rock = GetComponent<MineRock>(); }
+            if (m_rock == null || m_rock.m_baseModel == null || !m_rock.m_baseModel.activeSelf) return false;   // no base model, or a broken rock: its areas are what vanilla shows
+            if (!r.TryGetComponent<Collider>(out _)) return false;   // not on a hit-area object (the base model's own parts)
+            return r.transform.IsChildOf(m_rock.m_areaRoot != null ? m_rock.m_areaRoot.transform : transform);
+        }
+
         private string TryCoverPart(MeshRenderer r, bool born)
         {
             if (r == null || (!r.enabled && !born) || r.forceRenderingOff) return "";
+            if (Verdict != null && Verdict.Kind == CoverageRules.Kind.MineRock && RockAreaHiddenByVanilla(r)) return "";   // 1.2.395: see RockAreaHiddenByVanilla
             var root = transform;
+            if (Cluster && !StaticClusters.StaticPart(r.transform, root)) return "networked, animated or physics part (stays Unity's)";   // 1.2.286 StaticClusters
             if (Verdict != null && Verdict.ExcludedPaths.Count > 0 && Verdict.ExcludedPaths.Contains(CoverageRules.PathOf(root, r.transform))) return "changes at runtime (material variation / animator / fader)";
             if (CoverageRules.IsLowTwin(r)) return "";
             var mf = r.GetComponent<MeshFilter>();
@@ -577,7 +630,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
 
             var matrix = r.transform.localToWorldMatrix;
             EbmIndirect.NoteCoveredRenderer(r, mesh);   // 1.2.246: logs only, with the validator on
-            EbmIndirect.s_addContext = "covered '" + transform.gameObject.name + "/" + r.gameObject.name + "' at " + transform.position.ToString("F0");   // 1.2.235
+            EbmIndirect.SetCoveredContext(transform, r);   // 1.2.235; 1.2.356: names read only when an [Integrity] line prints
             s_added.Clear();
             for (int sub = 0; sub < s_materials.Count; sub++)
             {
@@ -594,6 +647,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             OwnEntries().Add(new Entry { Renderer = r, Handles = s_added.ToArray(), Range = range, Disabled = disable, Bounds = bounds,
                                       Mesh = mesh, Mats = s_materials.ToArray(), Matrix = matrix, Shadows = r.shadowCastingMode, Layer = r.gameObject.layer });
             CoveredRenderers++; Handles += s_added.Count;
+            EbmCreatureVerify.NoteCovered(r);   // 1.2.314 [wishbone] CreatureIndirect Verify (counts only Custom/Creature, only with its key on)
             if (!r.TryGetComponent<CoveredPartWatch>(out _)) r.gameObject.AddComponent<CoveredPartWatch>();   // once per part, kept for its life
             return null;
         }
@@ -605,6 +659,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         /// again on the next start), so stale handles are dropped without a Remove.
         /// </summary>
         private void Release() => ReleaseEntries();
+        private const string ExitGate = "indirect path stood down (self-gate)";   // 1.2.401
+        /// <summary>1.2.401 IndirectSelfGate: this object goes back to Unity now, exactly as ReleaseEverything does for each one; the gate's Refresh covers it again later.</summary>
+        internal void GateRelease() { Release(); RestoreBornOff(); }
 
         private static Bounds WorldBounds(Bounds local, in Matrix4x4 m)
         {
@@ -630,10 +687,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
                 var e = m_entries[i];
                 if (e.Disabled) { DisabledNow--; if (e.Renderer != null) s_disabledByUs.Remove(e.Renderer); else s_disabledByUs.RemoveWhere(x => x == null); }   // a destroyed part: drop dead keys
                 if (e.Renderer == null) continue;
+                EbmCreatureVerify.NoteReleased(e.Renderer);   // 1.2.314 [wishbone] CreatureIndirect Verify
                 if (e.Disabled) e.Renderer.enabled = true; else e.Renderer.forceRenderingOff = false;   // undo exactly what we did
             }
 
             bool tablesLive = IndirectBatches.Active;
+            tablesLive |= IndirectBatches.TablesLive;   // 1.2.381: the coverage key off alone still leaves the tables live (IndirectBatches.TablesLive)
             for (int i = 0; i < m_entries.Count; i++)
             {
                 var e = m_entries[i];

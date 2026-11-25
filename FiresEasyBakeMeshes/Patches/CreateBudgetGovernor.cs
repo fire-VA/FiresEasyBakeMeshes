@@ -160,7 +160,7 @@ namespace FiresEasyBakeMeshes.Patches
             try
             {
                 var list = s_candidates(__instance);
-                s_candLast = list != null ? list.Count : 0;
+                s_candLast = list != null ? list.Count : 0; s_candAt = Time.unscaledTime;   // 1.2.315: when vanilla last counted (FDT shows the age)
                 if (s_candLast > s_candPeak) s_candPeak = s_candLast;
                 EasyBake.ScanGate.Create.NoteScanFound(s_candLast);
             }
@@ -170,6 +170,9 @@ namespace FiresEasyBakeMeshes.Patches
         // The exact candidate count, for FDT's overlay. Not backlog/100 - that
         // integer division loses two digits at the sizes this matters at.
         public static int LastCandidateCount => s_candLast;
+        // 1.2.315: unscaled time vanilla CreateObjectsSorted last counted (-1 = never); the count goes stale while EBM's create pacer owns creation
+        public static float LastCandidateTime => s_candAt;
+        private static float s_candAt = -1f;
         public static int LastNearCount => s_nearPeak;
 
         // EBM's budget part of the status box: null while nothing was held back since the last box.

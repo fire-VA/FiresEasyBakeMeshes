@@ -34,43 +34,47 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="UnityEngine.UIModule">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.UIModule.dll</HintPath>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>..\..\..\customspawnsmod\lib\0Harmony.dll</HintPath>
+      <HintPath>..\..\..\..\customspawnsmod\lib\0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="assembly_valheim, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
       <SpecificVersion>False</SpecificVersion>
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_valheim.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_valheim.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="assembly_utils">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_utils.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="BepInEx">
-      <HintPath>..\..\..\customspawnsmod\lib\BepInEx.dll</HintPath>
+      <HintPath>..\..\..\..\customspawnsmod\lib\BepInEx.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule">
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ScreenCaptureModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.AssetBundleModule">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.ParticleSystemModule">
-      <HintPath>..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="System" />
@@ -83,12 +87,20 @@
     <Compile Include="EasyBake\Far\FarBuildingDraw.cs" />
     <Compile Include="EasyBake\Far\FarBuildingDrawHandoff.cs" />
     <Compile Include="EasyBake\Far\FarCapPool.cs" />
+    <Compile Include="EasyBake\Far\FarMergedCache.cs" />
+    <Compile Include="EasyBake\EbmFtsGlobals.cs" />
     <Compile Include="EasyBake\Far\FarIndexRanges.cs" />
     <Compile Include="EasyBake\Far\FarZoneGrid.cs" />
     <Compile Include="EasyBake\Far\FarGroundProbe.cs" />
     <Compile Include="EasyBake\Far\FarBuildingMerge.cs" />
     <Compile Include="EasyBake\Far\FarBuildingNet.cs" />
     <Compile Include="EasyBake\Far\FarBuildings.cs" />
+    <Compile Include="EasyBake\Far\FarRocks.cs" />
+    <Compile Include="EasyBake\Far\FarGroundCover.cs" />
+    <Compile Include="EasyBake\Far\FarTerrainTiles.cs" />
+    <Compile Include="EasyBake\Far\FarReach.cs" />
+    <Compile Include="EasyBake\Far\FarFog.cs" />
+    <Compile Include="EasyBake\Far\FarBakeSources.cs" />
     <Compile Include="EasyBake\Far\FarBuildingSources.cs" />
     <Compile Include="EasyBake\Far\FarCache.cs" />
     <Compile Include="EasyBake\Far\FarCacheWorld.cs" />
@@ -117,6 +129,8 @@
     <Compile Include="EasyBake\EbmBakeMemRelease.cs" />
     <Compile Include="EasyBake\EbmHandoffWarm.cs" />
     <Compile Include="EasyBake\ZoneTrackerBakeProof.cs" />
+    <Compile Include="EasyBake\ZoneTrackerZdoBake.cs" />
+    <Compile Include="EasyBake\ZdoCombine.cs" />
     <Compile Include="EasyBake\WearLooks.cs" />
     <Compile Include="EasyBake\PrewarmCoroutine.cs" />
     <Compile Include="EasyBake\EbmSafety.cs" />
@@ -158,6 +172,7 @@
     <Compile Include="EasyBake\Indirect\EbmIndirectSpheres.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectPhases.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectPresize.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectCompact.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectSlots.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectGrass.cs" />
     <Compile Include="EasyBake\Indirect\EbmGrassFarCost.cs" />
@@ -166,6 +181,7 @@
     <Compile Include="EasyBake\Indirect\EbmIndirectSkyDepth.cs" />
     <Compile Include="EasyBake\Indirect\EbmShadowCensus.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectCpuTrim.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectSelfGate.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectSyncCleanup.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectSyncTimer.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectStagedSync.cs" />
@@ -178,6 +194,37 @@
     <Compile Include="EasyBake\FillTracker.cs" />
     <Compile Include="EasyBake\StreamPacer.cs" />
     <Compile Include="EasyBake\SectorArrivals.cs" />
+    <Compile Include="EasyBake\SectorHooks.cs" />
+    <Compile Include="EasyBake\CreatePassHooks.cs" />
+    <Compile Include="EasyBake\DungeonInteriorCull.cs" />
+    <Compile Include="EasyBake\EbmLightCensus.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectMergedCasters.cs" />
+    <Compile Include="EasyBake\Indirect\EbmGpuCaps.cs" />
+    <Compile Include="EasyBake\HeightmapBulkDetach.cs" />
+    <Compile Include="EasyBake\ZoneTrackerSkipCensus.cs" />
+    <Compile Include="EasyBake\ZoneTrackerFarSkip.cs" />
+    <Compile Include="EasyBake\ZoneTrackerSupportSafe.cs" />
+    <Compile Include="EasyBake\ArrivalTimeline.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectDepthCull.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\StaticClusters.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\VanillaPieceCensus.cs" />
+    <Compile Include="EasyBake\GpuFires.cs" />
+    <Compile Include="EasyBake\WaterSplit.cs" />
+    <Compile Include="EasyBake\WaterHideBuried.cs" />
+    <Compile Include="EasyBake\WaterTightBounds.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectWaterOccl.cs" />
+    <Compile Include="EasyBake\Indirect\EbmIndirectDepthRegCheck.cs" />
+    <Compile Include="EasyBake\ZoneTrackerZoneKeep.cs" />
+    <Compile Include="EasyBake\SignTextCull.cs" />
+    <Compile Include="EasyBake\EbmTerrainShader.cs" />
+    <Compile Include="EasyBake\EbmMist.cs" />
+    <Compile Include="EasyBake\EbmWater.cs" />
+    <Compile Include="EasyBake\EbmFatWaterLook.cs" />
+    <Compile Include="EasyBake\Indirect\EbmCreatureVerify.cs" />
+    <Compile Include="EasyBake\StandItemCull.cs" />
+    <Compile Include="EasyBake\Indirect\EbmVegetationPrepass.cs" />
+    <Compile Include="EasyBake\PieceHeightmapHub.cs" />
+    <Compile Include="EasyBake\Indirect\Coverage\CoverageRegistry.cs" />
     <Compile Include="EasyBake\EbmObjectArea.cs" />
     <Compile Include="EasyBake\EbmTeleportCreateGate.cs" />
     <Compile Include="EasyBake\EbmDistantPrefabs.cs" />
@@ -187,6 +234,7 @@
     <Compile Include="EasyBake\EbmMeshCheck.cs" />
     <Compile Include="EasyBake\EbmSelfCost.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectReceivers.cs" />
+    <Compile Include="EasyBake\Indirect\EbmCasterReceiverCull.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectViews.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectOnePass.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectLocalShadows.cs" />
@@ -199,12 +247,14 @@
     <Compile Include="EasyBake\EbmSnowStore.cs" />
     <Compile Include="EasyBake\Indirect\IndirectBatches.cs" />
     <Compile Include="EasyBake\Indirect\Coverage\CoverageCensus.cs" />
+    <Compile Include="EasyBake\EbmBlackFrameWatch.cs" />
     <Compile Include="EasyBake\Indirect\Coverage\CoveragePatches.cs" />
     <Compile Include="EasyBake\Indirect\Coverage\CoverageRules.cs" />
     <Compile Include="EasyBake\Indirect\Coverage\PrefabCoverage.cs" />
     <Compile Include="EasyBake\Indirect\Coverage\CoverageReach.cs" />
     <Compile Include="EasyBake\Indirect\CasterCensus.cs" />
     <Compile Include="EasyBake\Indirect\PhysicsCensus.cs" />
+    <Compile Include="EasyBake\Indirect\EbmLodLevelCensus.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectIntegrity.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectMeshContent.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectDiag.cs" />

@@ -67,20 +67,15 @@ namespace FiresEasyBakeMeshes.Patches
         internal static int LastBacklogScaled;
         internal static int LastNominal;
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObjects")]
-        [HarmonyPrefix]
-        [HarmonyPriority(Priority.First)]
-        private static void BeforeCreateObjects()
+        // 1.2.271: these three reach vanilla through EasyBake.CreatePassHooks (one EBM prefix + one postfix per vanilla method)
+        internal static void BeforeCreateObjects()
         {
             if (!Active) return;
             s_insideCreateObjects = true;
             s_inCall = 0;
         }
 
-        [HarmonyPatch(typeof(ZNetScene), "CreateObjects")]
-        [HarmonyPostfix]
-        [HarmonyPriority(Priority.Last)]
-        private static void AfterCreateObjects()
+        internal static void AfterCreateObjects()
         {
             if (!Active) return;
             s_insideCreateObjects = false;
@@ -93,10 +88,7 @@ namespace FiresEasyBakeMeshes.Patches
 
         // Counts only creations that actually produced an object; a skipped
         // piece returns null from the prefix and is not a creation.
-        [HarmonyPatch(typeof(ZNetScene), "CreateObject")]
-        [HarmonyPostfix]
-        [HarmonyPriority(Priority.Last)]
-        private static void AfterCreateObject(ZDO zdo, GameObject __result)
+        internal static void AfterCreateObject(ZDO zdo, GameObject __result)
         {
             if (!Active) return;
             if (__result == null || zdo == null) return;

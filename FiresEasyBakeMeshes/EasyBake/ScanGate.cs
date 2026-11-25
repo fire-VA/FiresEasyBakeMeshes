@@ -60,6 +60,8 @@ namespace FiresEasyBakeMeshes.EasyBake
     internal sealed class ScanGate
     {
         private const float ForceScanSeconds = 1f;
+        private const float ForceScanSecondsHashed = 3f;   // 1.2.268: with the event counter the count test is exact, the force scan is a safety lap
+        private long _events = -1;
         private const float ValidateEverySeconds = 5f;
 
         internal static readonly ScanGate Create = new ScanGate("create");
@@ -80,6 +82,20 @@ namespace FiresEasyBakeMeshes.EasyBake
         private ScanGate(string name)
         {
             _name = name;
+        }
+
+        // -- 1.2.268 ScanGateEventHash: sector membership events inside the active area --
+        internal static long s_areaEvents;
+        private static bool EventHashOn => FiresEasyBakeMeshesPlugin.ScanGateEventHash != null && FiresEasyBakeMeshesPlugin.ScanGateEventHash.Value;
+        internal static void NoteSectorEvent(ZoneSystem.SectorIndex s)   // 1.2.271: called from SectorHooks (one postfix per vanilla method)
+        {
+            if (!EventHashOn) return;
+            var net = ZNet.instance;
+            if (net == null) return;
+            Vector2s here = ZoneSystem.GetZone(net.GetReferencePosition());
+            int x = (int)(s.Sector % 512u) - 256, y = (int)(s.Sector / 512u) - 256;   // vanilla's own decode (ZoneSystem.cs:3463-3464)
+            int r = net.GetSyncedSimulationDistance().TotalSimulationDistance;
+            if (Mathf.Abs(x - here.x) <= r && Mathf.Abs(y - here.y) <= r) s_areaEvents++;
         }
 
         internal static bool Enabled =>
@@ -106,10 +122,16 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (_lastFound != 0) return false;
 
             float now = Time.unscaledTime;
+            // 1.2.268 [Optimize] ScanGateEventHash (TESTPLAN row 33): every sector add / remove inside the active area bumps s_areaEvents (vanilla
+            // ZDOMan.AddToSector / RemoveFromSector postfixes below), so a ZDO leaving while another arrives (the counts' one blind spot) is seen too.
+            // With that, the forced scan relaxes from every 1 s to every 3 s; the 5 s audit is unchanged and still counts anything a skip would miss.
+            bool hashOn = EventHashOn;
             bool unchanged = near == _near
                           && distant == _distant
                           && instances == _instances
-                          && _haveZone && zone.x == _zone.x && zone.y == _zone.y;
+                          && _haveZone && zone.x == _zone.x && zone.y == _zone.y
+                          && (!hashOn || s_areaEvents == _events);
+            _events = s_areaEvents;
 
             if (!unchanged)
             {
@@ -135,7 +157,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return false;
             }
 
-            if (now - _lastScan >= ForceScanSeconds)
+            if (now - _lastScan >= (hashOn ? ForceScanSecondsHashed : ForceScanSeconds))
             {
                 _lastScan = now;
                 _scanned++;

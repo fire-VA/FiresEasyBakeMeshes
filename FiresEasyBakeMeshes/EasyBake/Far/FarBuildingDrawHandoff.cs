@@ -19,7 +19,6 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         //      at once and is rebuilt behind it (the normal swap), as any changed far target is today.
         internal static bool ProvenOn => FiresEasyBakeMeshesPlugin.FarHandoffProvenDrawn != null && FiresEasyBakeMeshesPlugin.FarHandoffProvenDrawn.Value;
         internal static bool KeepOn => FiresEasyBakeMeshesPlugin.FarKeepHandedOff != null && FiresEasyBakeMeshesPlugin.FarKeepHandedOff.Value;
-        private const float RetainSeconds = 120f;
 
         private static int s_byInstances, s_bySkippedDrawn, s_timeoutMissing, s_timeoutSkippedNotDrawn, s_retained, s_reshown, s_retainExpired, s_retainEvicted;
         private static int s_blockWhy;   // the last AllInstanced: 0 none, 1 an instance missing, 2 a skipped piece whose group is not drawn yet
@@ -48,11 +47,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // the copy hidden and kept; false = destroy as before (key off, or no room)
+        // 1.2.424 ([visual], Fire 11-16 "back off a couple zones and the builds pop out"): room is half the vertex cap (was a quarter), and when it is full the kept
+        // copies deepest INSIDE the loaded area (not on its edge, farthest from the player) are let go first, so the edge ring, which unloads next, always keeps its copy.
+        private static readonly List<Target> s_retainTmp = new List<Target>();
         private static bool Retain(Target t)
         {
             if (!KeepOn || t.Chunks.Count == 0) return false;
+            int room = FarBuildings.MaxVertices / 2;
             int kept = 0; foreach (var o in s_targets.Values) if (o.Retained) kept += o.Verts;
-            if (kept + t.Verts > FarBuildings.MaxVertices / 4) { s_retainEvicted++; return false; }
+            if (kept + t.Verts > room)
+            {
+                s_retainTmp.Clear();
+                foreach (var o in s_targets.Values) if (o.Retained && !o.Edge) s_retainTmp.Add(o);
+                s_retainTmp.Sort((a, b) => b.Dist.CompareTo(a.Dist));   // farthest interior copy first
+                foreach (var o in s_retainTmp) { if (kept + t.Verts <= room) break; kept -= o.Verts; Expire(o); }
+                s_retainTmp.Clear();
+                if (kept + t.Verts > room) { s_retainEvicted++; if (t.Edge) SkipEdge(t); return false; }
+            }
             SetVisible(t, false);
             t.Retained = true; t.RetainedAt = Time.unscaledTime; t.HoldUntil = -1f;
             s_retained++;
@@ -60,12 +71,48 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // from HandOff for a retained target: true = handled (skip the rest of the loop)
+        // 1.2.424: no time limit any more (it was 120 s, so a copy was lost after two minutes in town); it stays while its zone stays loaded, until the room above
+        // needs it or the key goes off
         private static bool TickRetained(Target t, bool loaded, ref List<long> expire)
         {
             if (!t.Retained) return false;
             if (!loaded) { t.Retained = false; SetVisible(t, true); s_reshown++; s_planDirty = true; return true; }   // walked back out: shown at once, no rebuild wait
-            if (Time.unscaledTime - t.RetainedAt > RetainSeconds || !KeepOn) (expire ?? (expire = new List<long>())).Add(t.Key);
+            if (!KeepOn) (expire ?? (expire = new List<long>())).Add(t.Key);
             return true;
+        }
+
+        // ======== 1.2.424 edge pre-build ========
+        // a loaded zone with at least one of its 8 neighbours not loaded: it can unload next
+        private static bool OnLoadedEdge(Vector2s z)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+                for (int dy = -1; dy <= 1; dy++)
+                    if ((dx != 0 || dy != 0) && !ZoneLoaded(new Vector2s(z.x + dx, z.y + dy))) return true;
+            return false;
+        }
+
+        // an edge zone whose copy found no room is not pre-built again for a minute (no build / destroy loop)
+        private static readonly Dictionary<Vector2s, float> s_edgeSkip = new Dictionary<Vector2s, float>();
+        private static void SkipEdge(Target t) { float until = Time.unscaledTime + 60f; foreach (var z in t.Zones) s_edgeSkip[z] = until; }
+        private static bool EdgeSkipped(Vector2s z)
+        {
+            if (!s_edgeSkip.TryGetValue(z, out float until)) return false;
+            if (Time.unscaledTime < until) return true;
+            s_edgeSkip.Remove(z); return false;
+        }
+
+        internal static int EdgeColdTargets { get; private set; }   // edge-ring targets admitted and not built yet (FarBuildings' edge budget)
+
+        // the prep queue with edge targets first, each group in its existing order
+        private static readonly List<Target> s_edgeTmp = new List<Target>();
+        private static void EdgeFirst()
+        {
+            if (s_prepQueue.Count < 2) return;
+            s_edgeTmp.Clear();
+            foreach (var t in s_prepQueue) if (t.Edge) s_edgeTmp.Add(t);
+            if (s_edgeTmp.Count == 0 || s_edgeTmp.Count == s_prepQueue.Count) { s_edgeTmp.Clear(); return; }
+            foreach (var t in s_prepQueue) if (!t.Edge) s_edgeTmp.Add(t);
+            s_prepQueue.Clear(); s_prepQueue.AddRange(s_edgeTmp); s_edgeTmp.Clear();
         }
 
         private static void Expire(Target t)

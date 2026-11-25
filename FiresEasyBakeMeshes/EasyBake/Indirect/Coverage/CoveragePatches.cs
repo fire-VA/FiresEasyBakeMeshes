@@ -19,6 +19,37 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
     {
         private static bool s_registered, s_engagedSaid, s_wasActive;
 
+        // 1.2.302 ebm_set: find the key by name (section optional, both case-insensitive); with a value, set it through BoxedValue (the entry's own
+        // type converter), so SettingChanged fires and SaveOnConfigSet writes the cfg exactly as an F8 / file edit would. Several sections holding
+        // the same key name = ambiguous: the section must be given.
+        internal static string EbmSetCommand(string[] a)
+        {
+            var cfg = FiresEasyBakeMeshesPlugin.Instance != null ? FiresEasyBakeMeshesPlugin.Instance.Config : null;
+            if (cfg == null) return "[ebm_set] no EBM config";
+            if (a == null || a.Length < 2) return "[ebm_set] usage: ebm_set <Key> [value] | ebm_set <Section> <Key> [value]";
+            string section = null, key, value = null;
+            BepInEx.Configuration.ConfigEntryBase hit = null; int found = 0;
+            // try "<Section> <Key> [value]" first when there are 3+ words and the first names a section
+            if (a.Length >= 3)
+                foreach (var def in cfg.Keys)
+                    if (string.Equals(def.Section, a[1], StringComparison.OrdinalIgnoreCase) && string.Equals(def.Key, a[2], StringComparison.OrdinalIgnoreCase)) { hit = cfg[def]; found = 1; section = a[1]; break; }
+            if (hit != null) { key = a[2]; if (a.Length >= 4) value = string.Join(" ", a, 3, a.Length - 3); }
+            else
+            {
+                key = a[1]; if (a.Length >= 3) value = string.Join(" ", a, 2, a.Length - 2);
+                foreach (var def in cfg.Keys)
+                    if (string.Equals(def.Key, key, StringComparison.OrdinalIgnoreCase)) { if (found++ == 0) hit = cfg[def]; else section = section == null ? hit.Definition.Section + ", " + def.Section : section + ", " + def.Section; }
+                if (found > 1) return $"[ebm_set] '{key}' is in several sections ({section}): ebm_set <Section> {key} [value]";
+            }
+            if (hit == null) return $"[ebm_set] no EBM key named '{key}'";
+            string name = $"[{hit.Definition.Section}] {hit.Definition.Key}";
+            if (value == null) return $"[ebm_set] {name} = {hit.GetSerializedValue()} ({hit.SettingType.Name})";
+            string before = hit.GetSerializedValue();
+            try { hit.BoxedValue = BepInEx.Configuration.TomlTypeConverter.ConvertToValue(value, hit.SettingType); }
+            catch (Exception e) { return $"[ebm_set] {name}: '{value}' is not a {hit.SettingType.Name} ({e.GetType().Name})"; }
+            return $"[ebm_set] {name}: {before} -> {hit.GetSerializedValue()}";
+        }
+
         internal static void SayEngagedOnce(CoverageRules.Verdict v)
         {
             if (s_engagedSaid) return;
@@ -47,13 +78,17 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             bool now = IndirectBatches.Active;
             if (now == s_wasActive) return;
             s_wasActive = now;
-            if (!now) { CoveredObject.ReleaseEverything(); PrefabCoverage.RestoreAll("indirect batches off"); EasyBakeLog.Info("[Coverage] indirect batches off: every covered object is drawn by Unity again"); return; }
+            // 1.2.383 ([lead]): the hand-back says how much it handed back (counted before the release), so a run can gate on "acted > 0"
+            int offObjects = now ? 0 : CoveredObject.CoveredObjects, offInstances = now ? 0 : CoveredObject.Handles;
+            if (!now) { CoverageRegistry.Clear(); CoveredObject.ReleaseEverything(); PrefabCoverage.RestoreAll("indirect batches off"); EasyBakeLog.Info($"[Coverage] indirect batches off: every covered object is drawn by Unity again; acted on {offObjects} covered object(s) ({offInstances} instance(s) left the tables){(offObjects == 0 ? "; no targets in this scene" : "")}"); return; }
             try { PrefabCoverage.Apply(); }   // step 2 (its key off = nothing): prefab parts off before the loaded copies are walked
             catch (Exception e) { EasyBakeLog.Debug("[Coverage] prefab mode apply skipped: " + e.Message); }
             var instances = ZoneTracker.SceneInstances();
             int n = 0;
-            if (instances != null) foreach (var kv in instances) { if (kv.Value != null) { Attach(kv.Value); n++; } }
+            int attached = 0;   // 1.2.383 ([lead]): objects that got (or already had) a CoveredObject; their covering runs in their Start, a frame later
+            if (instances != null) foreach (var kv in instances) { if (kv.Value != null) { if (Attach(kv.Value) != null) attached++; n++; } }
             EasyBakeLog.Debug($"[Coverage] indirect batches on: {n} loaded object(s) checked");
+            EasyBakeLog.Info($"[Coverage] indirect batches on: walked {n} loaded object(s), acted on {attached} (handed to the indirect path; registry-filed ones attach as they come in reach){(attached == 0 ? "; none attached at once" : "")}");
         }
 
         [HarmonyPatch(typeof(ZNetScene), "Awake")]
@@ -65,6 +100,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             private static void Postfix()
             {
                 CoverageRules.Clear();   // prefab verdicts per scene: mods register different prefabs each session
+                CoverageRegistry.Clear();   // 1.2.272: a new scene starts with an empty registry
+                try { EasyBake.PieceHeightmapHub.Install(); } catch (Exception e) { EasyBakeLog.Debug("[EBM] piece hub install skipped: " + e.Message); }   // 1.2.288: once, before any piece starts; FiresFixes owns it when present + on
                 CoverageReach.Clear();   // 1.2.214: cells hold this scene's objects only
                 CoveredObject.RendererRefusals.Clear();
                 s_wasActive = IndirectBatches.Active;
@@ -72,6 +109,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
                 if (s_registered) return;
                 s_registered = true;
                 IndirectBatches.ActiveChanged += OnActiveChanged;
+                // 1.2.381 ([visual], [lead] hot-swap audit 4c): IndirectBatches.Active reads [Optimize] IndirectCoverage, but ActiveChanged is raised only when IndirectRenderer
+                // changes. The coverage key flipped alone now runs the same hand-back (off) / attach of every loaded object (on).
+                if (FiresEasyBakeMeshesPlugin.IndirectCoverage != null) FiresEasyBakeMeshesPlugin.IndirectCoverage.SettingChanged += (_, __) => OnActiveChanged();
                 if (FiresEasyBakeMeshesPlugin.IndirectCoverageLocationProps != null)   // 1.2.216, live: verdicts depend on it
                     FiresEasyBakeMeshesPlugin.IndirectCoverageLocationProps.SettingChanged += (_, __) =>
                     {
@@ -105,6 +145,42 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
                         EasyBakeLog.Debug(line);
                         args.Context?.AddString(line);
                     }));
+                new Terminal.ConsoleCommand("ebm_set",   // 1.2.302 ([lead]: same-launch look A/B; EBM has no cfg hot reload)
+                    "<Key> [value] | <Section> <Key> [value] FiresEasyBakeMeshes: show or set one EBM config key live (written to the cfg, SettingChanged fires). Key names as in the cfg, e.g. ebm_set IndirectVegetationPrepass true.",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        string line = EbmSetCommand(args.Args);
+                        EasyBakeLog.Info(line);   // typed by the player / the rig: one line
+                        args.Context?.AddString(line);
+                    }));
+                new Terminal.ConsoleCommand("ebm_shaderuse",   // 1.2.300: which renderers use a shader (research before shader ports)
+                    "<shader name> FiresEasyBakeMeshes: every enabled renderer using that shader (exact name, e.g. Custom/Flow), by material: queue, keywords, kind, count, in view, top owners.",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        if (args.Length < 2) { args.Context?.AddString("ebm_shaderuse <shader name>, e.g. ebm_shaderuse Custom/Flow"); return; }
+                        string name = string.Join(" ", args.Args, 1, args.Args.Length - 1);
+                        string report = ShaderUseCensus.Run(name);
+                        EasyBakeLog.Info(report);
+                        foreach (var line in report.Split('\n')) args.Context?.AddString(line);
+                    }));
+                new Terminal.ConsoleCommand("ebm_standitems",   // 1.2.300: hung-item materials (research for indirect variants)
+                    "FiresEasyBakeMeshes: the materials on items hung on item stands: shader, keywords, queue, renderer kind, and whether EBM has a variant.",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        string report = StandItemCull.Report();
+                        EasyBakeLog.Info(report);
+                        foreach (var line in report.Split('\n')) args.Context?.AddString(line);
+                    }));
+                new Terminal.ConsoleCommand("ebm_vanillapieces",   // 1.2.296 ([lead]: the town's 816 Custom/Piece draws EBM does not take)
+                    "[radius m] FiresEasyBakeMeshes: building pieces near the camera that the game still draws itself (not baked or batched), by prefab, with what likely keeps EBM off them.",
+                    new Terminal.ConsoleEvent(args =>
+                    {
+                        float radius = 150f;
+                        if (args.Length > 1) float.TryParse(args[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out radius);
+                        string report = VanillaPieceCensus.Run(radius > 0f ? radius : 150f);
+                        EasyBakeLog.Info(report);
+                        foreach (var line in report.Split('\n')) args.Context?.AddString(line);
+                    }));
                 new Terminal.ConsoleCommand("ebm_coverage",
                     "[radius m] FiresEasyBakeMeshes: live trees, rocks, destructibles and pickables near the camera by class and shader - renderers, materials, LODs, which the indirect batches draw and why the rest stay vanilla (read-only, also written to the log).",
                     new Terminal.ConsoleEvent(args =>
@@ -133,6 +209,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
                     catch (Exception e) { born = s_born.Count > 0; EasyBakeLog.Debug($"[Coverage] prefab mode copy check failed for {__instance?.name}: {e.Message}"); }
                 }
                 if (!IndirectBatches.Active) { if (born) PrefabCoverage.Restore(s_born); return; }
+                // 1.2.272 [Optimize] CoverageRegistryAttach: register, no AddComponent here (CoverageRegistry); born-off copies keep the immediate path
+                if (!born && CoverageRegistry.On)
+                {
+                    try { if (CoverageRegistry.Register(__instance)) return; }
+                    catch (Exception e) { EasyBakeLog.Debug($"[CoverageRegistry] register skipped for {__instance?.name}, old path used: {e.Message}"); }
+                }
                 try
                 {
                     var co = Attach(__instance);
@@ -170,7 +252,33 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             // 1.2.222 ([ghost], 1.2.220 O census: itemstand 3,510 + itemstandh 2,712 re-covers per 30 s standing still): vanilla's UpdateVisual calls
             // SetVisualItem on every stand every 4 s (InvokeRepeating, ItemStand.cs:103), and SetVisualItem returns at once when the item is
             // unchanged (:419). Re-cover only when the stand really shows something else (its active renderers / meshes changed).
-            private static void Postfix(ItemStand __instance) { var co = __instance != null ? __instance.GetComponentInParent<CoveredObject>() : null; if (co != null) co.RefreshIfChanged("ItemStand.SetVisualItem"); }
+            // 1.2.265 [Optimize] StandQuickCheck (TESTPLAN row 31, AUDIT_shave_heap_lateupdate "Stands: 4-second timer"): the prefix evaluates vanilla's
+            // own no-op test (ItemStand.cs:465: same item hash, variant and orientation = SetVisualItem returns at once); then the postfix skips the
+            // GetComponentInParent + signature walk. Fields read through FieldRefAccess (publicized private fields throw at JIT).
+            private static readonly AccessTools.FieldRef<ItemStand, int> s_hash = AccessTools.FieldRefAccess<ItemStand, int>("m_visualHash");
+            private static readonly AccessTools.FieldRef<ItemStand, int> s_variant = AccessTools.FieldRefAccess<ItemStand, int>("m_visualVariant");
+            private static readonly AccessTools.FieldRef<ItemStand, int> s_orient = AccessTools.FieldRefAccess<ItemStand, int>("m_orientation");
+            private static int s_quickSkipped, s_quickWalked; private static float s_quickNext;
+            private static void Prefix(ItemStand __instance, int itemHash, int variant, int orientation, out bool __state)
+            {
+                __state = false;
+                if (__instance == null || FiresEasyBakeMeshesPlugin.StandQuickCheck == null || !FiresEasyBakeMeshesPlugin.StandQuickCheck.Value) return;
+                try { __state = s_hash(__instance) == itemHash && s_variant(__instance) == variant && s_orient(__instance) == orientation; } catch { __state = false; }
+            }
+            private static void Postfix(ItemStand __instance, bool __state)
+            {
+                if (__state) { s_quickSkipped++; QuickSay(); return; }
+                s_quickWalked++; QuickSay();
+                PostfixWalk(__instance);
+            }
+            private static void QuickSay()
+            {
+                float now = UnityEngine.Time.unscaledTime;
+                if (now < s_quickNext) return;
+                if (s_quickNext > 0f && EasyBakeLog.DebugOn()) EasyBakeLog.Debug($"[Coverage] stands 30 s: {s_quickSkipped} unchanged refresh(es) skipped by StandQuickCheck, {s_quickWalked} checked in full");
+                s_quickNext = now + 30f; s_quickSkipped = s_quickWalked = 0;
+            }
+            private static void PostfixWalk(ItemStand __instance) { var co = __instance != null ? __instance.GetComponentInParent<CoveredObject>() : null; if (co != null) co.RefreshIfChanged("ItemStand.SetVisualItem"); }
         }
 
         // ---- Pickables: m_hideWhenPicked is set active / inactive by these; the refresh drops or re-adds it.
@@ -182,6 +290,34 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         {
             private static MethodBase TargetMethod() => AccessTools.Method(typeof(Pickable), nameof(Pickable.SetEnabled), new[] { typeof(int) });
             private static void Postfix(Pickable __instance) => RefreshOf(__instance, "Pickable.SetEnabled");
+        }
+
+        // ---- 1.2.268 Fish ([generator] item 5): vanilla hides an unowned fish by parking its LOD reference point (Fish.SetVisible, Fish.cs:980-994), which
+        // changes no renderer, so RefreshIfChanged would not notice. When the visibility really flips, the fish's cover is judged again from scratch:
+        // hidden = refused by CoverageRules.RangeFor (parked point), shown = covered as before once it rests. Debug count of fish handed back as hidden.
+        [HarmonyPatch]
+        private static class FishVisible
+        {
+            private static readonly AccessTools.FieldRef<Fish, bool> s_lodVisible = AccessTools.FieldRefAccess<Fish, bool>("m_lodVisible");
+            internal static int HiddenHandBacks, ShownRechecks;
+            private static float s_next;
+            private static MethodBase TargetMethod() => AccessTools.Method(typeof(Fish), "SetVisible", new[] { typeof(bool) });
+            private static void Prefix(Fish __instance, out bool __state) { __state = __instance != null && s_lodVisible(__instance); }
+            private static void Postfix(Fish __instance, bool visible, bool __state)
+            {
+                // vanilla calls SetVisible every frame (Fish.Update :470) and returns at once with no LODGroup or no change: compare the field, not the argument
+                if (__instance == null || s_lodVisible(__instance) == __state) return;
+                var co = __instance.GetComponent<CoveredObject>();
+                if (co == null) return;
+                if (!visible && co.IsCovering) HiddenHandBacks++; else if (visible) ShownRechecks++;
+                co.Refresh();
+                float now = Time.unscaledTime;
+                if (now >= s_next)
+                {
+                    if (s_next > 0f && EasyBakeLog.DebugOn()) EasyBakeLog.Debug($"[Coverage] fish 30 s: {HiddenHandBacks} hidden fish handed back to vanilla, {ShownRechecks} shown again and re-checked; renderers refused for a parked LOD point {CoverageRules.ParkedRefused}");
+                    s_next = now + 30f; HiddenHandBacks = ShownRechecks = 0; CoverageRules.ParkedRefused = 0;
+                }
+            }
         }
 
         // ---- Trees: shake rotates m_trunk for 1 s, regrow swaps it for a scaled copy for 0.3 s. Vanilla draws those; cover again after.
@@ -249,7 +385,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         private static class PhysicsPushUp
         {
             private static MethodBase TargetMethod() => AccessTools.Method(typeof(StaticPhysics), "PushUp");
-            private static void Postfix(StaticPhysics __instance) { var co = __instance != null ? __instance.GetComponent<CoveredObject>() : null; if (co != null) co.RefreshIfMoved(); }
+            private static void Postfix(StaticPhysics __instance) { if (CoveredObject.ByPhysics.Count == 0 || (object)__instance == null || !CoveredObject.ByPhysics.TryGetValue(__instance, out var co) || co == null) return; co.RefreshIfMoved(); }   // 1.2.405: a lookup (CoveredObject.ByPhysics) instead of GetComponent on every vanilla PushUp
         }
 
         // ---- Debris: vanilla's CreateFragments(root, visibleOnly) copies each active renderer whose isVisible is set (or every active one,

@@ -22,6 +22,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         public int Prefab; public string Name; public List<FarPart> Parts = new List<FarPart>();
         public bool Ready, Failed; public int Vertices;
         public bool Closed;   // far fix: TryFinish ran its end once
+        public Bounds LocalBounds; public bool HasBounds;   // 1.2.431: the far look's bounds in the prefab root's space (body parts only), for the interior cut
+        public float LastUsed;   // 1.2.291 FarSourceIdleRelease: the last time a target asked for it (Get)
     }
 
     /// <summary>
@@ -44,7 +46,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         /// <summary>The source for a prefab; starts its read the first time (null result = not ready yet).</summary>
         internal static FarSource Get(int prefab)
         {
-            if (s_sources.TryGetValue(prefab, out var s)) return s.Ready ? s : null;
+            if (s_sources.TryGetValue(prefab, out var s)) { if (s.Ready) { s.LastUsed = Time.unscaledTime; return s; } return null; }
             s = new FarSource { Prefab = prefab };
             s_sources[prefab] = s;
             s_pending.Enqueue(prefab);
@@ -58,8 +60,30 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static bool AsyncOn => FiresEasyBakeMeshesPlugin.FarSourceAsync != null && FiresEasyBakeMeshesPlugin.FarSourceAsync.Value;
         private static bool s_saidAsync;
 
+        // ---- 1.2.291 [Optimize] FarSourceIdleRelease (round-2 E25, Fire's "low RAM over load hitch"): a far source (one prefab's far mesh arrays, CPU side)
+        // stayed for the whole session even after the last building that used it was gone. Every 30 s, a READY source no target asked for in IdleMinutes is
+        // dropped; the next Get reads it again from the per-install far cache on disk (the async read path). A merge job already holding its parts keeps its
+        // own references, so nothing in flight breaks. Failed sources stay (so a broken prefab is not retried every few minutes). Debug census.
+        private const float IdleMinutes = 10f;
+        private static float s_idleCheckAt;
+        private static int c_released; private static long c_releasedVerts;
+        private static readonly List<int> s_idleScratch = new List<int>();
+        internal static void ReleaseIdle()
+        {
+            float now = Time.unscaledTime;
+            if (now < s_idleCheckAt) return;
+            s_idleCheckAt = now + 30f;
+            if (FiresEasyBakeMeshesPlugin.FarSourceIdleRelease == null || !FiresEasyBakeMeshesPlugin.FarSourceIdleRelease.Value) return;
+            s_idleScratch.Clear();
+            foreach (var kv in s_sources) { var s = kv.Value; if (s.Ready && !s.Failed && s.LastUsed > 0f && now - s.LastUsed > IdleMinutes * 60f) s_idleScratch.Add(kv.Key); }
+            foreach (int p in s_idleScratch) { c_releasedVerts += s_sources[p].Vertices; s_sources.Remove(p); c_released++; }
+            if (s_idleScratch.Count > 0 && EasyBakeLog.DebugOn())
+                EasyBakeLog.Debug($"{FarBuildings.Log} idle far sources released: {s_idleScratch.Count} now ({c_released} this session, {c_releasedVerts:N0} vertices' arrays), {s_sources.Count} kept; unused for {IdleMinutes:0} min, read again from the far cache when needed");
+        }
+
         internal static void Step(long deadline = long.MaxValue)
         {
+            ReleaseIdle();   // 1.2.291
             int started = 0;
             while (s_pending.Count > 0 && started < 4 && s_inFlight < 16 && (started == 0 || !AsyncOn || System.Diagnostics.Stopwatch.GetTimestamp() < deadline))
             {
@@ -68,8 +92,37 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             }
         }
 
+        // 1.2.341 (G2): a bake id's parts come from FAP's arrays (FarBakeSources), read once like prefab meshes, never saved to the disk mesh cache; not in
+        // memory yet = the source stays pending (not failed) and is begun again when FAP raises Ready for that name
+        private static bool s_bakeHooked;
+        private static void BeginBake(FarSource s)
+        {
+            if (!s_bakeHooked) { s_bakeHooked = true; FarBakeSources.BakeReady += id => { if (s_sources.TryGetValue(id, out var bs) && !bs.Ready) { bs.Parts.Clear(); bs.Failed = false; bs.Closed = false; s_pending.Enqueue(id); } }; }
+            FarBakeSources.TryGetName(s.Prefab, out string name); s.Name = FarBakeSources.BakeParentPrefab + " " + name;
+            if (!FarBakeSources.TryGetParts(s.Prefab, out Mesh[] meshes, out Material[][] mats)) return;   // waits for Ready
+            var picked = new List<Mesh>();
+            for (int i = 0; i < meshes.Length; i++)
+            {
+                var mesh = meshes[i]; var mm = mats[i];
+                if (mesh == null || mm == null || mm.Length == 0) continue;
+                bool ok = true; foreach (var m in mm) if (m == null || m.renderQueue > 2500) { ok = false; break; }   // opaque + cutout only, as for prefabs
+                if (!ok) continue;
+                s.Parts.Add(new FarPart { Local = Matrix4x4.identity, Mats = mm, IsCap = false });
+                picked.Add(mesh);
+            }
+            if (picked.Count == 0) { s.Failed = true; s.Closed = true; EasyBakeLog.Debug($"{FarBuildings.Log} bake '{name}': no opaque part; not drawn far away"); return; }
+            for (int i = 0; i < picked.Count; i++)
+            {
+                var part = s.Parts[i]; var mesh = picked[i];
+                if (mesh.isReadable) { ReadCpu(mesh, part); part.Ready = true; FarBuildings.S.MeshCpu++; }
+                else { FarBuildings.S.MeshGpu++; ReadGpu(mesh, part, s); }
+            }
+            TryFinish(s);
+        }
+
         private static void Begin(FarSource s)
         {
+            if (FarBakeSources.IsBake(s.Prefab)) { BeginBake(s); return; }   // 1.2.341 (G2)
             var prefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(s.Prefab) : null;
             if (prefab == null) { s.Failed = true; return; }
             s.Name = prefab.name;
@@ -145,7 +198,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             // 1.2.248 ([generator]): only a source with every part read is saved; a failed part fails for this session and is tried again next launch.
             bool anyFailed = false;
             foreach (var p in s.Parts) if (p.Failed) anyFailed = true;
-            if (!anyFailed) SaveCached(s);
+            if (!anyFailed && !FarBakeSources.IsBake(s.Prefab)) SaveCached(s);   // 1.2.341: a bake's parts are FAP's, never in the per-install mesh cache
             s.Parts.RemoveAll(p => p.Failed);
             if (s.Parts.Count == 0)
             {
@@ -160,7 +213,16 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static void Finish(FarSource s)
         {
             int v = 0; foreach (var p in s.Parts) v += p.Pos.Length;
-            s.Vertices = v; s.Ready = true;
+            // 1.2.431: root-space bounds of the body parts (caps excluded), for FarBuildingMerge's interior cut
+            bool any = false; var lb = new Bounds();
+            foreach (var p in s.Parts)
+            {
+                if (p.IsCap || p.Pos == null) continue;
+                foreach (var q in p.Pos) { var w = p.Local.MultiplyPoint3x4(q); if (!any) { lb = new Bounds(w, Vector3.zero); any = true; } else lb.Encapsulate(w); }
+            }
+            s.LocalBounds = lb; s.HasBounds = any;
+            s.Vertices = v; s.Ready = true; s.LastUsed = Time.unscaledTime;   // 1.2.291: the idle clock starts when it is ready
+            if (FarBakeSources.IsBake(s.Prefab)) EasyBakeLog.Info($"{FarBuildings.Log} bake source served: '{s.Name}' ({s.Parts.Count} part(s), {v:N0} vertices) from FAP; its placements are drawn far from the next far job");   // 1.2.341 (G2) proof line
             FarBuildingDraw.OnSourceReady(s.Prefab);
         }
 
@@ -444,6 +506,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // â”€â”€ Per-install cache (#4, Global): arrays only; renderers and materials are re-picked (cheap) and matched by count â”€â”€
+        internal static string ModTag { get { if (s_cacheTag == null) CacheKey(new FarSource { Name = "" }); return s_cacheTag; } }   // 1.2.425: the mod-set tag, for FarMergedCache
         private static string CacheKey(FarSource s)
         {
             if (s_cacheTag == null)

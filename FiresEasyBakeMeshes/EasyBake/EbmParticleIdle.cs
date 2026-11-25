@@ -40,9 +40,10 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Batching", "ParticleIdlePause", false,
+            Enabled = config.Bind("Batching", "ParticleIdlePause", true /* 1.2.264 Fire 11-10: on to test */,
                 "Looping particle effects on pieces and world objects that have no particles and are not emitting (nothing to draw) are paused, and resume the same frame they emit again (a fire lit or fuelled shows at once). No visible change. Off = the game updates them every frame.");
             Enabled.SettingChanged += (_, __) => { if (!On) ResumeAll("key off"); };
+            Enabled.SettingChanged += (_, __) => { if (On) ConsiderLoaded(); };   // 1.2.381: turned on mid-run, the objects created while it was off are looked at too
         }
 
         // From ZNetScene.CreateObject's postfix (ZNetScenePatches), beside IdleGates.PauseOffScreen
@@ -67,6 +68,22 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (ffName) s_ffNamed.Add(id);   // review 11-09: dropped later if FF's flag goes live
             }
             s_scratch.Clear();
+        }
+
+        // 1.2.381 ([visual], [lead] hot-swap audit 4c): Consider runs when ZNetScene creates an object and returned at once with the key off, so a live OFF -> ON only
+        // reached objects created afterwards. Turned on, every loaded object goes through Consider once (s_known keeps a system from being watched twice).
+        private static void ConsiderLoaded()
+        {
+            var instances = ZoneTracker.SceneInstances();
+            if (instances == null) return;
+            int before = s_running.Count + s_paused.Count;
+            // 1.2.383 ([lead], town run O_20261114_163205: "0 looping system(s) ... (0 in all)" did not say whether nothing was walked or everything was skipped):
+            // the walk and the reasons it left systems alone are in the line (Consider's own counters, read before and after).
+            int walked = 0, skipMode = c_skipMode, skipFF = c_skipFF, full = c_full;
+            foreach (var kv in instances) { if (kv.Value == null) continue; walked++; }
+            foreach (var kv in instances) if (kv.Value != null) Consider(kv.Value.gameObject);
+            int acted = s_running.Count + s_paused.Count - before;
+            EasyBakeLog.Info($"[Particles] idle pause turned on: walked {walked} loaded object(s); looping systems: acted on {acted} (watched now), skipped {c_skipMode - skipMode} not on Automatic culling (IdleGates or another mod owns them), {c_skipFF - skipFF} FiresFixes', {c_full - full} over the cap; {s_running.Count + s_paused.Count} watched in all{(acted == 0 ? "; no targets in this scene" : "")}");
         }
 
         private static void Hook()

@@ -38,6 +38,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         internal static void CleanExit() => RemoveMarker();
 
+        // 1.2.284: has this install ever fallen back after a GPU crash (or is a crash verdict still pending)? False when unknown = the folder is not known yet.
+        private const string SeenFileName = "indirect_fallback_seen.txt";
+        internal static bool CrashHistoryKnown(out bool crashed)
+        {
+            crashed = false;
+            string path = MarkerPath;
+            if (path == null) return false;
+            string dir = Path.GetDirectoryName(path);
+            if (File.Exists(path)) return false;   // a running marker left over: the crash verdict for the last session is still pending, so ask again next launch
+            crashed = File.Exists(Path.Combine(dir, SeenFileName));
+            return true;
+        }
+
         private static void WriteMarker()
         {
             if (!On) return;
@@ -71,6 +84,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 if (found == null) { EasyBakeLog.Debug("[Indirect] the last session ended without a clean quit, with no graphics crash in its log (killed, or another cause): the GPU path stays on"); return; }
                 s_reason = "the last session crashed in the graphics driver on this path (" + found + "), so this one session uses the instanced path; the next launch tries it again, or ebm_indirect on now";
                 EasyBakeLog.Warn("[Indirect] " + s_reason);
+                // 1.2.284 (lead / Fire: never switch a path back on that crashed a player's GPU): a lasting note that a fallback fired, read by the defaults migration
+                try { File.WriteAllText(Path.Combine(Path.GetDirectoryName(path), SeenFileName), DateTime.UtcNow.ToString("o") + " " + found + "\n"); } catch { }
             }
             catch (Exception e) { EasyBakeLog.Debug("[Indirect] crash marker check skipped: " + e.Message); }
         }
@@ -95,8 +110,22 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             foreach (string hard in new[] { "failed to create buffer", "DEVICE_REMOVED", "DEVICE_HUNG", "DEVICE_RESET" })
                 if (text.IndexOf(hard, StringComparison.OrdinalIgnoreCase) >= 0) return hard;
             if (text.IndexOf("Crash!!!", StringComparison.Ordinal) < 0) return null;
-            foreach (string gfx in new[] { "d3d11", "dxgi", "nvlddmkm", "nvwgf2um", "atidxx", "igd10" })
-                if (text.IndexOf(gfx, StringComparison.OrdinalIgnoreCase) >= 0) return "a crash naming " + gfx;
+            // 1.2.288 (lead 11-11: a vanilla MagicaCloth crash at shutdown read as "a crash naming d3d11"): every Unity crash report lists ALL loaded modules,
+            // d3d11 / dxgi included, so a module name counts only on a STACK FRAME line ("0x<address> (module) symbol") inside the crash's
+            // "OUTPUTTING STACK TRACE" block, never in the module list (those lines start with a file path).
+            int s = text.LastIndexOf("OUTPUTTING STACK TRACE", StringComparison.Ordinal);
+            if (s < 0) return null;
+            int e = text.IndexOf("END OF STACKTRACE", s, StringComparison.Ordinal);
+            string block = e > s ? text.Substring(s, e - s) : text.Substring(s);
+            foreach (string line in block.Split('\n'))
+            {
+                if (!line.StartsWith("0x", StringComparison.Ordinal)) continue;
+                int a = line.IndexOf('('), b = a >= 0 ? line.IndexOf(')', a + 1) : -1;
+                if (a < 0 || b <= a) continue;
+                string module = line.Substring(a + 1, b - a - 1);
+                foreach (string gfx in new[] { "d3d11", "dxgi", "nvlddmkm", "nvwgf2um", "atidxx", "igd10", "amdxx", "nvoglv", "vulkan-1" })
+                    if (module.IndexOf(gfx, StringComparison.OrdinalIgnoreCase) >= 0) return "a crash inside " + module + " (stack frame)";
+            }
             return null;
         }
     }

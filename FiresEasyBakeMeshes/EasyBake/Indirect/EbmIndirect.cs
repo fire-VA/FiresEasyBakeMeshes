@@ -37,6 +37,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private const int CellViews = 2;      // the CPU cell cull judges the camera + the sun volume
         private const int Group = 64;
 
+        // E8 (1.2.292): [Optimize] IndirectCoarseCasters; the shader reads 1 (or less) as off. Cascades 2 and 3 only (_EbmCasterLodFrom fixed at 2 in the shader).
+        private static readonly int IdCasterLodBias = Shader.PropertyToID("_EbmCasterLodBias");
+        private static float CoarseCastersBias() { var e = FiresEasyBakeMeshesPlugin.IndirectCoarseCasters; return e == null || LodPerInstanceOn ? 1f : Mathf.Clamp(e.Value, 1f, 4f); }
+
         internal sealed class Batch
         {
             public int Index;
@@ -45,6 +49,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             public float MaxScale = 1f;   // 1.2.233 ([generator]): the largest instance scale ever added (never shrinks), for the caster size skip
             public ShadowCastingMode Shadows; public bool ReceiveShadows; public int Layer; public uint RenderingLayerMask;
             public Bounds LocalBounds; public Vector4 Lod; public float StartHeight, EndHeight;
+            public sbyte FarCard = -1;
+            public sbyte OpaqueQueue = -1;   // 1.2.376 IndirectCameraDrawSort: -1 = not judged, 1 = material.renderQueue < 2500 (opaque / alpha-test: draw order does not change the image), 0 = transparent (keeps its order and bounds)
+            public sbyte PrepassCard = -1; public Material PrepassMat;   // 1.2.301 IndirectVegetationPrepass   // 1.2.297 IndirectFarCardShadows: -1 = not judged, 1 = a small alpha-cut card mesh (no far-cascade caster), 0 = not
+            public bool LodLast;   // E8 (1.2.292): this batch is its LOD chain's LAST level (past its end vanilla culls), so the coarse caster test keeps the camera's end for it
             public bool LodPerInstance;   // rank 6 ([wishbone]): made with [Optimize] IndirectLodPerInstance: no LOD window in the key, each instance carries its own (packed in _EbmInstLod.w)
             public int Count, Capacity, VisibleOffset; public long Tris;
             public Bounds World; public bool WorldSet;
@@ -65,7 +73,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private sealed class GroupSlots
         {
             public int Version = -1; public int Seen;
-            public int LkVersion = int.MinValue, LkGen, LkExt, LkSlots; public bool LkActive;   // 1.2.223: the looks state last written for this group
+            public int LkVersion = int.MinValue, LkGen, LkExt, LkShape = int.MinValue, LkSlots; public bool LkActive;   // 1.2.223: the looks state last written for this group
             public readonly List<int> Slots = new List<int>(); public readonly List<int> SlotInstance = new List<int>();   // 1.2.208: the group instance each slot draws (looks)
             public readonly List<Lane> Lanes = new List<Lane>();   // 1.2.210
             public GroupStage Stage;   // [Optimize] IndirectStagedSync: a first registration being prepared (EbmIndirectStagedSync.cs)
@@ -132,8 +140,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             // a throw latches the path off until the key goes off and on again ([generator]: never a broken frame twice)
             if (!want) s_faulted = null;
             if (want && s_faulted != null) { SetActive(false, s_faulted); return false; }
-            if (want && !EbmIndirectAssets.Ready(out string why)) { SetActive(false, why); return false; }
-            if (want && !SystemInfo.supportsComputeShaders) { SetActive(false, "this GPU has no compute shaders"); return false; }
+            if (want) { string capWhy = EbmGpuCaps.WhyNot(); if (capWhy != null) { EbmGpuCaps.SayOnce("off: " + capWhy); FallBack(capWhy); return false; } }   // 1.2.279: every capability, once
+            if (want && !EbmIndirectAssets.Ready(out string why)) { EbmGpuCaps.SayOnce("off: " + why); FallBack(why); return false; }
+            if (want) EbmGpuCaps.SayOnce($"on (bundle {EbmIndirectAssets.LoadedFile})");
             if (want && s_override != true && IndirectCrashGuard.FallBackThisSession(out string crashWhy)) { SetActive(false, crashWhy); return false; }   // 1.2.256 [Optimize] IndirectCrashFallback
             SetActive(want, want ? null : "[Optimize] IndirectRenderer is off");
             if (!Active) return false;
@@ -143,6 +152,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_aliveValid = false;   // 1.2.213: last frame's alive flags are not trusted until EndFrame refreshes them
             TakenGroups = RefusedGroups = 0;
             return true;
+        }
+
+        // 1.2.263 (Fire 11-10: IndirectRenderer / IndirectCascadeShadows / IndirectCoverage default ON): a machine that cannot run the GPU path draws
+        // through the normal instanced path for the session, and says so ONCE as a Warning (a player-visible line), never invisible pieces.
+        private static string s_warnedFallback;
+        private static void FallBack(string why)
+        {
+            if (s_warnedFallback != why)
+            {
+                s_warnedFallback = why;
+                EasyBakeLog.Warn($"[Indirect] the GPU draw path is off for this session ({why}); baked buildings, trees and rocks draw through the normal path instead. Nothing is missing.");
+            }
+            SetActive(false, why);
         }
 
         private static void SetActive(bool on, string why)
@@ -162,6 +184,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // The group draws through the indirect path this frame (true), or the caller draws it as before (false).
         internal static bool Take(ZoneInstanceGroup group)
         {
+            if (GateTake(group, out bool gateResult)) return gateResult;   // 1.2.401 [Optimize] IndirectSelfGate (EbmIndirectSelfGate.cs): counts the walk's load; while the gate moves or holds the path out it answers for the group. Gate in = false at once.
             if (!s_groups.TryGetValue(group, out var reg))
             {
                 // a refusal is judged once per group version, never per frame (its reason string is built once)
@@ -182,7 +205,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (LooksChangeDrivenOn)
             {
                 // 1.2.227 (lead: "0 skips"): the FIRST check that fails is counted, so the line names what re-dirties every group
-                int why = reg.Version != group.Version ? 0 : reg.LkVersion != group.Version ? 1 : reg.LkGen != group.SnowGeneration ? 2 : reg.LkExt != group.ExtGen ? 3
+                int why = reg.Version != group.Version ? 0 : reg.LkVersion != group.Version ? 1 : reg.LkGen != group.SnowGeneration ? 2 : reg.LkExt != group.ExtGen || reg.LkShape != group.ShapeGen ? 3
                         : reg.LkActive != group.LooksActive ? 4 : reg.LkSlots != reg.Slots.Count ? 5 : group.LooksSettledWhy();
                 if (why < 0) { s_looksSkipped++; TakenGroups++; s_takeSettled = true; return true; }
                 s_looksWhy[why]++;
@@ -194,7 +217,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             long sw0 = InstancedDraw.SubT();
             IndirectLooks.WriteGroup(group, reg.Slots, reg.SlotInstance);
             InstancedDraw.SubAcc(InstancedDraw.SubLooksWrite, sw0);   // A2: a no-op unless version / snow generation / look state moved
-            reg.LkVersion = group.Version; reg.LkGen = group.SnowGeneration; reg.LkExt = group.ExtGen; reg.LkActive = group.LooksActive; reg.LkSlots = reg.Slots.Count; EnqueueWork(group);
+            reg.LkVersion = group.Version; reg.LkGen = group.SnowGeneration; reg.LkExt = group.ExtGen; reg.LkShape = group.ShapeGen; reg.LkActive = group.LooksActive; reg.LkSlots = reg.Slots.Count; EnqueueWork(group);
             TakenGroups++;
             return true;
         }
@@ -228,8 +251,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static void Sync(ZoneInstanceGroup group, GroupSlots reg)
         {
             reg.Version = group.Version;
-            s_addContext = "baked group of " + group.Matrices.Count + " at " + (group.Matrices.Count > 0 ? ((Vector3)group.Matrices[0].GetColumn(3)).ToString("F0") : "?");   // 1.2.235 BadInstance names it (the mesh name is on the same line)
+            SetGroupContext(group.Matrices.Count, group.Matrices.Count > 0 ? (Vector3)group.Matrices[0].GetColumn(3) : Vector3.zero);   // 1.2.235 BadInstance names it; 1.2.356 text built only when it prints
             reg.Slots.Clear(); reg.SlotInstance.Clear();
+            s_slotListRebuilds++;   // 1.2.392 IndirectSlotCompact: this group's slot lists are rebuilt, so a pass in flight ends (its index is stale); the settle clock is not touched
             if (SyncCleanupOn) PresizeSlotLists(group, reg);   // [Optimize] IndirectSyncCleanup
             int lane = 0;
             var lodParts = group.Definition.LodParts;
@@ -240,7 +264,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 foreach (var lp in lodParts)
                 {
                     var rp = lp.RenderParams;
-                    var batch = BatchOf(lp.Mesh, lp.SubMesh, EbmIndirectAssets.VariantFor(rp.material), rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, lp.Size > 0f ? lp.Start : float.MaxValue, lp.Size > 0f ? lp.End : 0f);
+                    var batch = BatchOf(lp.Mesh, lp.SubMesh, EbmIndirectAssets.VariantFor(rp.material), rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, lp.Size > 0f ? lp.Start : float.MaxValue, lp.Size > 0f ? lp.End : 0f, lp.Last);
                     SyncLane(reg, lane++, batch, ms, lp, Vector4.zero, lp.Size > 0f ? lp.Start : float.MaxValue, lp.Size > 0f ? lp.End : 0f);
                 }
                 s_lodPartGroups++;
@@ -347,7 +371,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 // past the last resolved mesh vanilla keeps culling at its last transition; a deeper level we could not resolve keeps this mesh
                 end = level < levels - 1 ? h[level] : (h.Length > levels ? 0f : h[Mathf.Min(level, h.Length - 1)]);
             }
-            var batch = BatchOf(mesh, part.SubMesh, variant, rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, start, end);
+            var batch = BatchOf(mesh, part.SubMesh, variant, rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, start, end, level == levels - 1);   // E8: the last level
             batch.Lod = lod;   // the LOD reference (mesh local) + size for baked instances; per-instance world values go to _EbmInstLod
             lodOut = lod; startOut = start; endOut = end;   // rank 6: the lane keeps its own (the batch may be shared)
             return batch;
@@ -358,7 +382,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static readonly Dictionary<Material, bool> s_hasCaster = new Dictionary<Material, bool>();
         private static bool HasCasterPass(Material m) { if (!s_hasCaster.TryGetValue(m, out bool v)) { v = m.FindPass("ShadowCaster") >= 0; s_hasCaster[m] = v; } return v; }
 
-                internal static Batch BatchOf(Mesh mesh, int subMesh, Material variant, ShadowCastingMode shadows, bool receive, int layer, uint renderingLayerMask, float start, float end)
+                internal static Batch BatchOf(Mesh mesh, int subMesh, Material variant, ShadowCastingMode shadows, bool receive, int layer, uint renderingLayerMask, float start, float end, bool lodLast = false)
         {
             // rank 6 ([wishbone], VPO study #10): with [Optimize] IndirectLodPerInstance the LOD window leaves the key (-1 / -1 in its place): one batch per
             // mesh + material whatever the LOD setup; each instance carries its own window in _EbmInstLod.w (two half distances). Off = as before.
@@ -367,14 +391,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (shadows != ShadowCastingMode.Off && variant != null && !HasCasterPass(variant)) shadows = ShadowCastingMode.Off;
             bool perInst = LodPerInstanceOn;
             var key = (mesh, subMesh, variant, shadows, receive, layer, renderingLayerMask, perInst ? -1f : start, perInst ? -1f : end);
-            if (s_byKey.TryGetValue(key, out var batch)) return batch;
+            if (s_byKey.TryGetValue(key, out var batch)) { if (lodLast) batch.LodLast = true; return batch; }
             batch = new Batch
             {
                 Index = s_batches.Count, Mesh = mesh, SubMesh = subMesh, Material = variant,
                 Shadows = shadows, ReceiveShadows = receive, Layer = layer, RenderingLayerMask = renderingLayerMask,
                 LocalBounds = mesh.GetSubMesh(Mathf.Clamp(subMesh, 0, mesh.subMeshCount - 1)).bounds,
                 CameraProps = new MaterialPropertyBlock(), ShadowProps = new MaterialPropertyBlock(),
-                StartHeight = perInst ? float.MaxValue : start, EndHeight = perInst ? 0f : end, LodPerInstance = perInst,
+                StartHeight = perInst ? float.MaxValue : start, EndHeight = perInst ? 0f : end, LodPerInstance = perInst, LodLast = lodLast,
             };
             if (batch.LocalBounds.size == Vector3.zero) batch.LocalBounds = mesh.bounds;
             s_byKey[key] = batch;
@@ -468,6 +492,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             StMark(3, ref stT);
             var wb = TransformBounds(batch.LocalBounds, m);
             if (!batch.WorldSet) { batch.World = wb; batch.WorldSet = true; } else batch.World.Encapsulate(wb);
+            s_phEpoch++;   // 1.2.265 ([ghost] review): the shadow placeholder box rebuilds when caster area grows
             StMark(4, ref stT);
             s_cells.Add(batch.Index, s_instPos[slot], wb.min, wb.max, cellEnd, cellStart);
             StMark(5, ref stT);
@@ -484,6 +509,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (s_inst[slot].O0 != Vector4.zero || s_inst[slot].O1 != Vector4.zero || s_inst[slot].O2 != Vector4.zero)   // 1.2.239 ([generator]): a broken instance has no cell
                 s_cells.Remove((int)b - 1, s_instPos[slot]);   // baked instances never move, so the filed position is exact
             s_instBatch[slot] = 0;   // a free slot matches no batch in the cull
+            s_slotMutations++;   // 1.2.392 IndirectSlotCompact: the slot range changed (settle clock)
             s_live--; s_removesWindow++; RemovesWaiting++;   // [seasons] 11-09 E28 census (cleared at Upload)
             s_free.Push(slot);
             // 1.2.213 IndirectCompactSlots: the top slots that are free come off s_high, so every cull dispatch covers fewer threads
@@ -519,7 +545,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_instPos[slot] = m.GetColumn(3);
             s_instLod[slot] = lodWorld;
             var wb = TransformBounds(batch.LocalBounds, m);
-            batch.World.Encapsulate(wb);
+            batch.World.Encapsulate(wb); s_phEpoch++;   // 1.2.265 ([ghost] review)
             s_cells.Add(batch.Index, s_instPos[slot], wb.min, wb.max, cellEnd, cellStart);
             MarkDirty(slot);
         }
@@ -575,8 +601,22 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         internal static void EndFrame()
         {
             if (!Active) return;
+            GateTick();   // 1.2.401 [Optimize] IndirectSelfGate: key off and nothing to undo = two compares
+            EbmCreatureVerify.Tick();   // 1.2.314 [wishbone] CreatureIndirect Verify: key off = one bool test; on = a check every 5 s
+            if (s_gate == GateOut && s_live == 0 && s_groups.Count == 0)   // 1.2.404 ([visual], [2ic]'s DN read): stood down and empty: nothing below has work (no group to drop, no stage, no cell, no batch to draw)
+            {
+                s_aliveValid = false;   // the per-batch alive check is skipped; every reader falls back to the direct check (EbmIndirectCpuTrim.cs HasMesh / HasMaterial)
+                if (!s_settledFrame) { foreach (var kv in s_refused) if (kv.Value.seen != s_frame) s_gone.Add(kv.Key); foreach (var g in s_gone) s_refused.Remove(g); s_gone.Clear(); }   // as below: unloaded groups leave the refused table on full walks
+                VegPrepassFrameStart();   // as below: last frame's prepass draws never run in a frame that does not reach Draw()
+                GateZeroDetach();
+                LastCalls = 0; LastInstances = 0;
+                return;
+            }
+            s_cellVerdictSame = false;   // 1.2.330: set true by Cull only when it reused last frame's CPU verdict unchanged
             PhaseBegin();   // 1.2.212: per-phase timers (Debug)
             long tPh = PhT();
+            using (PhMarker[PhGroups].Auto())   // 1.2.367: profiler marker only (group walk: drops, stage tick, compaction, alive refresh)
+            {
             if (!s_settledFrame) foreach (var kv in s_groups) if (kv.Value.Seen != s_frame) s_gone.Add(kv.Key);   // IndirectSettledWalk: a frame that walked only the changed groups has not stamped Seen on the rest; they must not be dropped
             bool dropped = s_gone.Count > 0;
             long ztDrop = dropped ? EbmSelfCost.ZT() : 0L;   // Debug: this frame's unbudgeted group drop
@@ -588,17 +628,20 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             StageTick();   // [Optimize] IndirectStagedSync: finished jobs, then commits under the budget (after the drops, so a dropped group's stage is gone first)
             MaybeCompactCells(dropped);   // 1.2.213 IndirectFusedCells: empty cells leave the walk (at most every 5 s)
             RefreshAlive();               // 1.2.213 IndirectCachedAlive: one Mesh / Material check per batch for this frame
+            }
             PhAcc(PhGroups, tPh);
+            VegPrepassFrameStart();   // 1.2.306 (Fire 11-11: branches flickered while loading in): last frame's prepass draws never run in a frame that does not reach Draw()
             var cam = Utils.GetMainCamera();
-            if (cam == null || s_live == 0) { LastCalls = 0; LastInstances = 0; IndirectStats.FrameEnd(); PhaseEnd(); return; }
+            if (cam == null || s_live == 0) { if (s_live == 0) GateZeroDetach(); LastCalls = 0; LastInstances = 0; IndirectStats.FrameEnd(); PhaseEnd(); return; }   // 1.2.401: with no instance live the caster command buffers come off the sun and the lights, once (GateZeroDetach has the why)
+            s_gateZeroDetached = false;   // 1.2.401: a frame that draws; the next empty frame detaches again
             try
             {
-                tPh = PhT(); PresizeTick(); EnsureBuffers(); EnsureCascadeBuffers(); PhAcc(PhEnsure, tPh);
-                tPh = PhT(); Upload(); UploadFlips(); PhAcc(PhUpload, tPh);   // UploadFlips: IndirectStagedSync's flipped batch ids only
+                tPh = PhT(); using (PhMarker[PhEnsure].Auto()) { PresizeTick(); EnsureBuffers(); EnsureCascadeBuffers(); } PhAcc(PhEnsure, tPh);   // 1.2.367: markers only, same calls in the same order
+                tPh = PhT(); using (PhMarker[PhUpload].Auto()) { Upload(); UploadFlips(); } PhAcc(PhUpload, tPh);   // UploadFlips: IndirectStagedSync's flipped batch ids only
                 s_drawCamera = cam;
-                tPh = PhT(); if (IndirectLooks.Upload()) s_bindingsDirty = true; PhAcc(PhLooks, tPh);   // A2: a new looks buffer = rebind every block
-                tPh = PhT(); Cull(cam); PhAcc(PhCull, tPh);
-                tPh = PhT(); Draw(); PhAcc(PhDraw, tPh);
+                tPh = PhT(); using (PhMarker[PhLooks].Auto()) { if (IndirectLooks.Upload()) s_bindingsDirty = true; } PhAcc(PhLooks, tPh);   // A2: a new looks buffer = rebind every block
+                tPh = PhT(); using (PhMarker[PhCull].Auto()) Cull(cam); PhAcc(PhCull, tPh);
+                tPh = PhT(); using (PhMarker[PhDraw].Auto()) Draw(); PhAcc(PhDraw, tPh);
             }
             catch (Exception e)
             {
@@ -612,8 +655,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         private static void EnsureBuffers()
         {
-            if (s_instBuf == null || s_instBuf.count < s_inst.Length)
+            if (s_instBuf == null || s_instBuf.count < s_inst.Length || (s_trimRemake && s_instBuf.count > s_inst.Length))   // 1.2.389 IndirectSlotTrim: also once after a trim
             {
+                long growT0 = System.Diagnostics.Stopwatch.GetTimestamp(); int growOld = s_instBuf != null ? s_instBuf.count : 0;   // 1.2.394: for the Debug line below
+                s_trimRemake = false;
                 var nInst = new GraphicsBuffer(GraphicsBuffer.Target.Structured, s_inst.Length, Marshal.SizeOf<GpuInstance>());
                 var nBatch = new GraphicsBuffer(GraphicsBuffer.Target.Structured, s_inst.Length, sizeof(uint));
                 var nLod = new GraphicsBuffer(GraphicsBuffer.Target.Structured, s_inst.Length, 16);
@@ -633,9 +678,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 Release(ref s_instBuf); Release(ref s_instBatchBuf); Release(ref s_instLodBuf);
                 s_instBuf = nInst; s_instBatchBuf = nBatch; s_instLodBuf = nLod;
                 s_bindingsDirty = true;
+                EasyBakeLog.Debug($"[Indirect] instance buffers re-made: {growOld} -> {s_inst.Length} slots ({s_high} in use) at frame {Time.frameCount}, t {Time.unscaledTime:0.0} s; {(System.Diagnostics.Stopwatch.GetTimestamp() - growT0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:0.00} ms on the main thread for the three buffers and the copy call (the GPU side of the copy is not in this figure)");   // 1.2.394 ([lead]): names the frame of a growth, so a leg can read the frame time around it
             }
             bool stable = StableOn;
             if (stable != s_lastStable) { s_lastStable = stable; s_layoutDirty = true; }   // a live flip relayouts once
+            if (MergedCastersReady() != s_mergeActive && s_lastCascadeDraws > 0) NoteCasterFlip("IndirectMergedCasters " + (MergedCastersReady() ? "on" : "off"));   // 1.2.384 ([visual]): the Info line comes with the re-record that follows the layout
+            if (MergedCastersReady() != s_mergeActive) s_layoutDirty = true;   // E9 IndirectMergedCasters: groups are made (or undone) only by a full layout
             int nb = s_batches.Count;
             if (!s_layoutDirty && s_batchBuf != null)
             {
@@ -644,14 +692,20 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 s_layoutDirty = true;   // no room (rows or visible space), or the key is off: one full layout
             }
             // full layout: each batch's visible range per view = its current count + headroom
-            int offset = 0;
             foreach (var b in s_batches)
             {
                 if (b.Mesh == null) b.Count = 0;   // a mesh another mod destroyed (FAP lazy bundles): the batch stays empty ([generator] 1)
                 b.Capacity = b.Count + b.Count / 4 + 32;   // 1.2.210 ([generator]): headroom, so +1 at a power of two no longer relayouts every batch
-                b.VisibleOffset = offset;
-                offset += b.Capacity;
                 b.PlaceQueued = false; b.Placed = true;
+            }
+            // E9: caster groups need every member's capacity first; a leader's range is the group's sum (Capacity stays its own, so the
+            // overflow checks in AddInstance still fire per batch and force the next full layout before any caster append can pass the sum)
+            BuildCasterGroups(nb);
+            int offset = 0;
+            foreach (var b in s_batches)
+            {
+                b.VisibleOffset = offset;
+                offset += RangeOf(b);
             }
             s_place.Clear();
             // 1.2.210 IndirectStableLayout: args rows for a power-of-two batch CAPACITY (draw = view x cap + batch), so a new batch takes a free
@@ -712,7 +766,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // proves GPU == what we uploaded, not that what we computed was sane): an instance matrix with an axis scale over 10 or under 0.05, a
         // near-zero determinant, or a world box over 150 m is NOT drawn (zeroed) and named: one Error with the batch mesh, the matrix, and the
         // caller's context (prefab / part path / zone, set by Sync and coverage); later ones Debug, counted on the [Integrity] line.
-        internal static string s_addContext;
+        // 1.2.356 ([2ic], lead 11-13 profiler: EbmIndirect.EndFrame -> String.Ctor 5.0 MB/min moving, "native under CoveredObject.Start" 4.8 MB): the
+        // [Integrity] context was a string built on EVERY group sync / covered add ("baked group of N at (x, y, z)", two gameObject.name reads for a
+        // covered part) and read only by the rare [Integrity] lines. Now the parts are kept as fields and the text is built only when a line prints.
+        private enum CtxKind : byte { None, Group, Covered, CoveredPart }
+        private static CtxKind s_ctxKind; private static int s_ctxCount; private static Vector3 s_ctxPos; private static Transform s_ctxT; private static Renderer s_ctxR;
+        internal static void SetGroupContext(int count, Vector3 pos) { s_ctxKind = CtxKind.Group; s_ctxCount = count; s_ctxPos = pos; s_ctxT = null; s_ctxR = null; }
+        internal static void SetCoveredContext(Transform t, Renderer partOrNull) { s_ctxKind = partOrNull != null ? CtxKind.CoveredPart : CtxKind.Covered; s_ctxT = t; s_ctxR = partOrNull; s_ctxPos = t != null ? t.position : Vector3.zero; }
+        private static string AddContext()
+        {
+            switch (s_ctxKind)
+            {
+                case CtxKind.Group: return "baked group of " + s_ctxCount + " at " + s_ctxPos.ToString("F0");
+                case CtxKind.Covered: return "covered '" + (s_ctxT != null ? s_ctxT.gameObject.name : "?") + "' (level back on) at " + s_ctxPos.ToString("F0");
+                case CtxKind.CoveredPart: return "covered '" + (s_ctxT != null ? s_ctxT.gameObject.name : "?") + "/" + (s_ctxR != null ? s_ctxR.gameObject.name : "?") + "' at " + s_ctxPos.ToString("F0");
+                default: return "?";
+            }
+        }
         private static int s_badInst; private static bool s_badInstSaid;
         // 1.2.237 (lead): real assets carry 100x rigs, so a raw axis scale is logged and still drawn. Hidden only: not finite, no volume, or a world box over the limit.
         private const int MaxNamedInstances = 512;
@@ -750,19 +820,22 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             }
             if (why == null)
             {
-                if (max > 10f || min < 0.05f)
+                // 1.2.378 ([ghost] / [lead]; BF spot-12 load O_20261114_130748: 512 lines, mostly vanilla FBX import scales: SwampTree2 root 1.5 x lod child 128.4826 = 192.72,
+                // Hildir_Firepit 148.4): an unusual scale is only worth a line when the size it produces is implausible too (the instance's world box, computed above).
+                if ((max > 10f || min < 0.05f) && (box > 150f || box < 0.05f))
                 {
                     string scaleName = mesh != null ? mesh.name : "?";   // 1.2.239: only here and below: a native string per call otherwise
                     if (s_scaleNamed.Count < MaxNamedInstances && s_scaleNamed.Add(scaleName + "|" + max.ToString("0.###") + "|" + min.ToString("0.###")))
-                        EasyBakeLog.Debug($"[Integrity] unusual scale, still drawn: mesh '{scaleName}' submesh {subMesh}, scales {sx:0.###} / {sy:0.###} / {sz:0.###}, context {s_addContext ?? "?"}, position {m.GetColumn(3)}");   // 1.2.239 (Fire): a normal asset is never red
+                        EasyBakeLog.Debug($"[Integrity] unusual scale, still drawn: mesh '{scaleName}' submesh {subMesh}, scales {sx:0.###} / {sy:0.###} / {sz:0.###}, context {AddContext()}, position {m.GetColumn(3)}");   // 1.2.239 (Fire): a normal asset is never red
                 }
                 return false;
             }
             string name = mesh != null ? mesh.name : "?";
             s_badInst++;
-            if (s_badNamed.Count < MaxNamedInstances && s_badNamed.Add(name + "|" + (s_addContext ?? "?")))
-                EasyBakeLog.Error($"[Integrity] BAD INSTANCE NOT DRAWN at frame {Time.frameCount}: {why}; mesh '{name}' submesh {subMesh}, context {s_addContext ?? "?"}; scales {sx:0.###} / {sy:0.###} / {sz:0.###}, position {m.GetColumn(3)}");
-            else EasyBakeLog.Debug($"[Integrity] bad instance #{s_badInst} not drawn: {why}; mesh '{name}', context {s_addContext ?? "?"}, position {m.GetColumn(3)}");
+            string ctx = AddContext();   // 1.2.356: built here, only on a bad instance
+            if (s_badNamed.Count < MaxNamedInstances && s_badNamed.Add(name + "|" + ctx))
+                EasyBakeLog.Error($"[Integrity] BAD INSTANCE NOT DRAWN at frame {Time.frameCount}: {why}; mesh '{name}' submesh {subMesh}, context {ctx}; scales {sx:0.###} / {sy:0.###} / {sz:0.###}, position {m.GetColumn(3)}");
+            else EasyBakeLog.Debug($"[Integrity] bad instance #{s_badInst} not drawn: {why}; mesh '{name}', context {ctx}, position {m.GetColumn(3)}");
             return true;
         }
 
@@ -803,6 +876,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static readonly int[] s_crPerCellWhy = new int[7];
         private static int s_crPerCellWhyNow, s_crPerCellMerges, s_crPerCellMergedCells, s_crPerCellRemoveOnly, s_crPerCellFull;
         private static bool CellReusePerCellOn => CellReuseOn && FiresEasyBakeMeshesPlugin.IndirectCellReusePerCell != null && FiresEasyBakeMeshesPlugin.IndirectCellReusePerCell.Value;
+        private static bool FaceRowsOnReuseOn => FiresEasyBakeMeshesPlugin.IndirectFaceRowsOnReuse != null && FiresEasyBakeMeshesPlugin.IndirectFaceRowsOnReuse.Value;   // 1.2.332
         private static string CellReusePerCellLine()
         {
             var sb = new System.Text.StringBuilder(160);
@@ -831,7 +905,15 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_crPerCellWhyNow = 5;
             for (int k = 0; k < s_cascadeCount; k++) { var a = s_cascadeSpheres[k]; var b = s_crCasc[k]; if ((new Vector3(a.x - b.x, a.y - b.y, a.z - b.z)).sqrMagnitude > 0.25f || Mathf.Abs(a.w - b.w) > 0.5f) return false; }
             s_crPerCellWhyNow = 6;
-            for (int k = 0; k < s_localCount; k++) if (s_localSpheres[k] != s_crLight[k]) return false;
+            // 1.2.296 ([lead] town 615: "0 of 2465 frames reused" while standing): vanilla LightFlicker jitters each torch's position (and the light set
+            // re-reads its range) every frame, so an exact compare never matched in a lit town. The CPU walk judged the lights with CpuSphereMargin (4 m)
+            // added, so a light that moved or grew by up to LightReuseSlack (1 m) is still inside last frame's verdict; the GPU test stays exact.
+            for (int k = 0; k < s_localCount; k++)
+            {
+                Vector4 a = s_localSpheres[k], b = s_crLight[k];
+                float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+                if (dx * dx + dy * dy + dz * dz > LightReuseSlack * LightReuseSlack || a.w > b.w + LightReuseSlack || a.w < b.w - 2f * CpuSphereMargin) return false;
+            }
             return true;
         }
         private static void CellReuseStore(Camera cam, int faceViews, float min)
@@ -866,6 +948,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // gives each queued batch its own range at the end of the used visible space (new batches also their args rows); false = no room
         private static bool PlaceQueued()
         {
+            if (PlaceNeedsFullLayout()) return false;   // E9: a batch in a caster group never moves alone (its leader's range is the group's sum)
             int need = 0;
             foreach (var b in s_place) need += b.Count + b.Count / 4 + 32;
             if (s_visibleUsed + need > s_visibleStride || s_visibleWaste + need > s_visibleStride / 2) return false;   // full, or too fragmented: relayout
@@ -903,7 +986,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_gpuBatches[i] = new GpuBatch
             {
                 Center = b.LocalBounds.center, Extents = b.LocalBounds.extents, VisibleOffset = (uint)b.VisibleOffset,
-                Flags = (b.Shadows != ShadowCastingMode.Off ? 1u : 0u) | (b.LodPerInstance ? 2u : 0u), Lod = b.Lod, StartHeight = b.StartHeight, EndHeight = b.EndHeight, Capacity = (uint)b.Capacity,
+                Flags = (b.Shadows != ShadowCastingMode.Off ? 1u : 0u) | (b.LodPerInstance ? 2u : 0u) | (b.LodLast ? 4u : 0u), Lod = b.Lod, StartHeight = b.StartHeight, EndHeight = b.EndHeight,
+                Capacity = (uint)RangeOf(b),   // E9: a caster leader's range holds its whole group's casters (own capacity otherwise)
+                Pad = (uint)CasterLeaderOf(i),  // E9: the caster leader the cull appends caster views to (own index = not merged, today's path)
             };
             if (b.Mesh == null)
             {
@@ -921,6 +1006,16 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             }
         }
 
+        // 1.2.388 [Optimize] IndirectCullBindCache ([seasons]' draft, [lead] / Fire: every EndFrame cut, each a live key): Cull bound the same nine buffers to the
+        // compute shader every frame (EbmClear's args + the cull kernel's instances / batch ids / LOD / batches / visible / args / receiver map / capture). A kernel's
+        // buffer binding is state on the ComputeShader object, so the binds are repeated only when a buffer object changed (EnsureBuffers, ReleaseAll), the kernel changed
+        // (IndirectCullGrouped), the shader object changed, or another camera's cull bound its own visible buffer on the same kernel (EbmIndirectViews bumps
+        // s_cullForeign). The ints, vectors and plane arrays stay per frame: other dispatches and the cascade prep command buffer overwrite them. Key off = every frame.
+        private static bool CullBindCacheOn => FiresEasyBakeMeshesPlugin.IndirectCullBindCache != null && FiresEasyBakeMeshesPlugin.IndirectCullBindCache.Value;
+        private static ComputeShader s_cbCs; private static int s_cbKernel = -1, s_cbForeign = -1;
+        private static GraphicsBuffer s_cbInst, s_cbInstBatch, s_cbInstLod, s_cbBatches, s_cbVisible, s_cbArgs, s_cbRx, s_cbCapture;
+        internal static int s_cullForeign;            // bumped by every other path that binds a different buffer on the cull kernel
+        internal static int s_cbBound, s_cbSkipped;   // Debug: since the last [Indirect] line
         // 1.2.210: the batches in (shader, material, mesh, submesh) order. Command buffers execute in the order they were recorded, so the
         // cascade and light casters recorded this way switch shader / material only when they must (fewer SetPass calls). Rebuilt per layout.
         private static int[] s_order = new int[0];
@@ -932,6 +1027,30 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             for (int i = 0; i < nb; i++) s_order[i] = i;
             Array.Sort(s_order, 0, nb, OrderCompare.Instance);
             s_orderCount = nb;
+            // 1.2.376 [Optimize] IndirectCameraDrawSort: the camera loop's order = the opaque batches in the state order above, then the transparent ones in index order (today's)
+            if (s_camOrder.Length < nb) s_camOrder = new int[Mathf.NextPowerOfTwo(nb)];
+            int co = 0;
+            for (int j = 0; j < nb; j++) if (IsOpaqueQueue(s_batches[s_order[j]])) s_camOrder[co++] = s_order[j];
+            for (int i = 0; i < nb; i++) if (!IsOpaqueQueue(s_batches[i])) s_camOrder[co++] = i;
+            s_camOrderCount = co;
+        }
+
+        // 1.2.376 [Optimize] IndirectCameraDrawSort ([lead], Fire's light scenes; [ghost]'s same-stand compare, Mistlands spot3: ours 668 draws / 651 SetPass vs the rival's
+        // 827 / 491, GPU 3.5-3.7 vs 3.1 ms): the camera loop below submitted one RenderMeshIndirect per batch in batch INDEX order, each with its own worldBounds, so
+        // Unity's opaque sort (front-to-back by each draw's bounds, then state) interleaved the materials. 0 = that (default). 1 = the opaque batches are submitted in
+        // (shader, material, mesh) order. 2 = 1 + every opaque batch's camera draw uses ONE worldBounds (camera position, far-clip extents), so the distance key ties and
+        // the state sort groups equal materials. Safe because: the CPU row camVis / CameraEmptySkip already decides whether a batch draws at all and the GPU culls per
+        // instance (the per-draw bounds only repeated that); these draws use no reflection or light probes (RenderParams' constructor sets both usages Off on this Unity,
+        // read from UnityEngine.CoreModule) and Valheim shades deferred (no per-object light list). Transparent batches (renderQueue >= 2500) keep their own bounds and
+        // order (back-to-front sorting untouched); shadow draws keep b.World.
+        private static int[] s_camOrder = new int[0];
+        private static int s_camOrderCount;
+        private static int s_saidSortMode;   // 1.2.378
+        private static int CameraDrawSortMode => FiresEasyBakeMeshesPlugin.IndirectCameraDrawSort != null ? Mathf.Clamp(FiresEasyBakeMeshesPlugin.IndirectCameraDrawSort.Value, 0, 2) : 0;
+        private static bool IsOpaqueQueue(Batch b)
+        {
+            if (b.OpaqueQueue < 0) b.OpaqueQueue = (sbyte)(b.Material != null && b.Material.renderQueue < 2500 ? 1 : 0);
+            return b.OpaqueQueue == 1;
         }
 
         private sealed class OrderCompare : IComparer<int>
@@ -960,6 +1079,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             return b.CasterPass >= 0;
         }
 
+        private const float LightReuseSlack = 1f;   // 1.2.296: a light may drift / grow this much and the reused cell verdict still holds (well inside CpuSphereMargin)
         private const float CpuSphereMargin = 4f;   // metres added to every cascade / light sphere in the CPU cull (lists do not flicker at an edge)
         private static Vector3 s_cullCamPos; private static float s_cullLodScale;
 
@@ -983,7 +1103,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     {
                         if ((bits & (1UL << bit)) == 0) continue;
                         int slot = (w << 6) + bit;
-                        if (slot >= s_high) break;
+                        if (slot >= s_inst.Length) break;   // 1.2.392 ([seasons] review; was: slot >= s_high): a FREED top slot's zero batch id must reach the GPU too. RemoveInstance lowers s_high past it before this upload, and a staged slot handed out there later rests on its batch id being 0 on both sides
                         if (runStart < 0) { runStart = runEnd = slot; continue; }
                         if (slot - runEnd > SparseGap) { UploadRun(runStart, runEnd - runStart + 1); runStart = slot; }
                         runEnd = slot;
@@ -1022,16 +1142,33 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             cs.SetInt(EbmIndirectAssets.IdDrawCount, s_batchCap * Views);   // 1.2.210: args rows per view = the batch capacity
             cs.SetInt(EbmIndirectAssets.IdDrawStart, 0);
             cs.SetInt(EbmIndirectAssets.IdViewMode, 0);
+            // 1.2.388 IndirectCullBindCache: decided before the clear dispatch, which needs its args bind first
+            int cullK = EbmIndirectAssets.CullKernel;
+            var cullRx = RxMapDummy(); var cullCap = CascadeCaptureBuffer != null ? CascadeCaptureBuffer : CaptureDummy();
+            bool cullBound = CullBindCacheOn && ReferenceEquals(s_cbCs, cs) && s_cbKernel == cullK && s_cbForeign == s_cullForeign
+                && ReferenceEquals(s_cbInst, s_instBuf) && ReferenceEquals(s_cbInstBatch, s_instBatchBuf) && ReferenceEquals(s_cbInstLod, s_instLodBuf)
+                && ReferenceEquals(s_cbBatches, s_batchBuf) && ReferenceEquals(s_cbVisible, s_visibleBuf) && ReferenceEquals(s_cbArgs, s_argsBuf)
+                && ReferenceEquals(s_cbRx, cullRx) && ReferenceEquals(s_cbCapture, cullCap);
+            if (!cullBound)
             cs.SetBuffer(EbmIndirectAssets.KernelClear, EbmIndirectAssets.IdArgs, s_argsBuf);
             cs.Dispatch(EbmIndirectAssets.KernelClear, Mathf.CeilToInt(s_batchCap * Views / (float)Group), 1, 1);
 
             int k = EbmIndirectAssets.CullKernel;   // G3: EbmCullGrouped when [Optimize] IndirectCullGrouped
+            if (!cullBound)
+            {
             cs.SetBuffer(k, EbmIndirectAssets.IdInstances, s_instBuf);
             cs.SetBuffer(k, EbmIndirectAssets.IdInstBatch, s_instBatchBuf);
             cs.SetBuffer(k, EbmIndirectAssets.IdInstLod, s_instLodBuf);
             cs.SetBuffer(k, EbmIndirectAssets.IdBatches, s_batchBuf);
             cs.SetBuffer(k, EbmIndirectAssets.IdVisible, s_visibleBuf);
             cs.SetBuffer(k, EbmIndirectAssets.IdArgs, s_argsBuf);
+            cs.SetBuffer(k, IdRxMap, cullRx);                 // 1.2.388: moved up from below with the capture bind (same values, same kernel)
+            cs.SetBuffer(k, IdCascadeCapture, cullCap);
+            s_cbBound++;
+            if (CullBindCacheOn) { s_cbCs = cs; s_cbKernel = k; s_cbForeign = s_cullForeign; s_cbInst = s_instBuf; s_cbInstBatch = s_instBatchBuf; s_cbInstLod = s_instLodBuf; s_cbBatches = s_batchBuf; s_cbVisible = s_visibleBuf; s_cbArgs = s_argsBuf; s_cbRx = cullRx; s_cbCapture = cullCap; }
+            else s_cbCs = null;   // key off: bind every frame; the first frame after it goes on binds once and remembers
+            }
+            else s_cbSkipped++;
             cs.SetVectorArray(EbmIndirectAssets.IdCamPlanes, s_camV);
             cs.SetVectorArray(EbmIndirectAssets.IdShadowPlanes, s_shadowV);
             cs.SetInt(EbmIndirectAssets.IdShadowPlaneCount, shadowPlanes);
@@ -1039,13 +1176,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             // 1.2.211 ([saddles] G6 v2): the cascade casters are culled in the shadow pass (EbmIndirectReceivers); the Update dispatch then leaves
             // views 2..5 at EbmClear's zero. Its receiver inputs are dummies (the kernel declares them).
             cs.SetInt(IdCascadeInMain, PlanCascadePrep(EnvMan.instance != null ? EnvMan.instance.m_dirLight : null, shadowPlanes));
-            cs.SetBuffer(k, IdRxMap, RxMapDummy());   // G3 merge: the kernel actually dispatched
-            cs.SetBuffer(k, IdCascadeCapture, CascadeCaptureBuffer != null ? CascadeCaptureBuffer : CaptureDummy());   // G3 merge: the kernel actually dispatched
+            // 1.2.388: the receiver-map and capture binds (G3 merge: the kernel actually dispatched) moved up into the bind block above (IndirectCullBindCache)
             cs.SetInt(IdRxOn, 0);
             var p = cam.transform.position;
             cs.SetVector(EbmIndirectAssets.IdCam, new Vector4(p.x, p.y, p.z, sizeScale * QualitySettings.lodBias));
             cs.SetFloat(EbmIndirectAssets.IdSizeScale, sizeScale);
             cs.SetFloat(EbmIndirectAssets.IdMinScreen, min);
+            cs.SetFloat(IdCasterLodBias, CoarseCastersBias());   // E8: far cascades (from cascade 2) pick the LOD at bias x the distance; 1 = off
             cs.SetInt(EbmIndirectAssets.IdInstanceCount, s_high);
             cs.SetInt(EbmIndirectAssets.IdBatchCount, s_batchCap);   // the args row stride
             cs.SetInt(EbmIndirectAssets.IdVisibleStride, s_visibleStride);
@@ -1069,10 +1206,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 s_cells.TrackDirty = perCell;
                 bool merge = perCell && s_crPerCellStored && s_crVersion != s_cells.Version && s_cells.DirtyMergeable;
                 bool reuse = CellReuseOn && CellReuseValid(cam, faceViews, min, merge);
+                s_cellVerdictSame = reuse && !(merge && s_cells.DirtyCount > 0);   // 1.2.330 IndirectLocalDirtyScan: the CPU rows are exactly last frame's
                 if (reuse)
                 {
                     s_cellReused++;
-                    if (perCell && faceViews > 0) s_faceWidth = s_crWidth;   // PrepareFaces zeroed it; without this a reused frame reads every face as wanting every batch
+                    // 1.2.332 [Fixes] IndirectFaceRowsOnReuse ([visual] / sp14: with per-cell reuse OFF a reused frame left s_faceWidth at 0, so FaceVis read every
+                    // point-light face as wanting every batch in the light's sphere and the face slots re-recorded over-full lists): the face rows of the reused verdict
+                    // are restored on EVERY reused frame with face views (s_faceVis is not re-culled on a reused frame, so it still holds that verdict).
+                    if ((perCell || FaceRowsOnReuseOn) && faceViews > 0) s_faceWidth = s_crWidth;   // PrepareFaces zeroed it; without this a reused frame reads every face as wanting every batch
                     if (merge)
                     {
                         int dirty = s_cells.DirtyCount;
@@ -1085,7 +1226,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                                               s_facePlanes, faceViews, s_faceVis, s_crPos, s_cullLodScale, mergeDirty: true);
                             s_crPerCellMerges++; s_crPerCellMergedCells += dirty;
                         }
-                        else s_crPerCellRemoveOnly++;
+                        else { s_crPerCellRemoveOnly++; s_emptyStamp++; }   // 1.2.388 ([seasons] review): a removal-only frame keeps the cell verdict, but a batch that reached 0 instances stops casting: the cascade scan looks again (IndirectCascadeScanReuse)
                         s_cells.DirtyReset();
                         s_crVersion = s_cells.Version;
                     }
@@ -1122,8 +1263,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 PhAcc(PhCellsSphere, tC);
             }
             int groups = Mathf.CeilToInt(s_high / (float)Group);
+            DepthCullBind(cs, k, cam);   // E2 ([seasons] 11-11): last frame's depth pyramid + the motion guard's verdict for view 0 (off = a 1x1 dummy, exactly as before)
             bool onePass = PrepareOnePass(cs);   // G4 ([wishbone]): lights + last frame's other cameras in this same dispatch ([Optimize] IndirectOneCullPass)
             cs.Dispatch(k, Mathf.Min(groups, 65535), Mathf.Max(1, Mathf.CeilToInt(groups / 65535f)), 1);
+            DepthCullAfterDispatch();   // E2 census readback after the cull wrote it (1.2.291 fix: it read the cleared buffer before)
             if (!onePass) CullLocal(cs, k, groups);   // 1.2.209 [wishbone]: views 7..10, the point / spot lights (only with IndirectCascadeShadows); G4: in the main pass instead
         }
 
@@ -1172,8 +1315,15 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             }
             bool cacheRp = FiresEasyBakeMeshesPlugin.IndirectDrawParamsCache != null && FiresEasyBakeMeshesPlugin.IndirectDrawParamsCache.Value;
             int calls = 0, camB = 0, shB = 0; long held = 0, camTris = 0, shTris = 0; long tLoop = PhT();
-            for (int i = 0; i < nb; i++)
+            VegPrepassBegin(s_drawCamera);   // 1.2.301 IndirectVegetationPrepass (OFF: detaches and returns)
+            int sortMode = CameraDrawSortMode;   // 1.2.376
+            if (sortMode != s_saidSortMode) { s_saidSortMode = sortMode; if (sortMode != 0) EasyBakeLog.Info($"[Indirect] camera draw sort mode {sortMode}: the baked batches' camera draws are submitted in shader / material order{(sortMode >= 2 ? ", the opaque ones with one shared bounds box" : "")} ({nb} batch(es) now)"); }   // 1.2.378 ([lead]): a state change, so a Measurement leg's log proves the mode ran
+            bool sorted = sortMode >= 1 && s_orderCount == nb && s_camOrderCount == nb;   // else index order (the order is rebuilt at a layout / when a batch is placed alone)
+            Bounds sharedBounds = sortMode >= 2 && s_drawCamera != null ? new Bounds(s_drawCamera.transform.position, Vector3.one * (2f * s_drawCamera.farClipPlane)) : default(Bounds);
+            bool share = sortMode >= 2 && s_drawCamera != null;
+            for (int j = 0; j < nb; j++)
             {
+                int i = sorted ? s_camOrder[j] : j;   // every use below is keyed by the batch index i, not the loop position
                 var b = s_batches[i];
                 if (b.Count <= 0 || !HasMesh(b)) continue;   // 1.2.213: cached alive check
                 held += b.Count;
@@ -1188,7 +1338,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 else
                 {
                     rp = new RenderParams(b.Material)
-                    {
+                    { motionVectorMode = MotionVectorGenerationMode.Camera, 
                         worldBounds = b.World, layer = b.Layer, renderingLayerMask = b.RenderingLayerMask, receiveShadows = b.ReceiveShadows,
                         shadowCastingMode = ShadowCastingMode.Off, matProps = b.CameraProps, camera = s_drawCamera,   // 1.2.209: main camera only; other cameras get their own view (EbmIndirectViews)
                     };
@@ -1196,15 +1346,22 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 }
                 if (camVis && !CameraEmptySkip(i))
                 {
-                    Graphics.RenderMeshIndirect(in rp, b.Mesh, s_argsBuf, 1, i);
+                    if (share && IsOpaqueQueue(b)) rp.worldBounds = sharedBounds;   // 1.2.376 mode 2: camVis above is what keeps an off-screen batch from drawing
+                    var preMat = VegPrepassFor(b, i);   // 1.2.301: a card batch gets its depth prepass draw + the depth-write-off copy for this draw
+                    if (preMat != null) { var rpp = rp; rpp.material = preMat; Graphics.RenderMeshIndirect(in rpp, b.Mesh, s_argsBuf, 1, i); }
+                    else Graphics.RenderMeshIndirect(in rp, b.Mesh, s_argsBuf, 1, i);
                     calls++; camB++; camTris += tris;
                 }
                 if (b.Shadows == ShadowCastingMode.Off || !shVis || CascadesOn) continue;   // 1.2.208: with per-cascade shadows the light's command buffers draw the casters
+                if (InCasterGroup(i)) continue;   // E9: the group's view-1 casters are in its leader's row, drawn once by DrawMergedSunOnly below
                 rp.shadowCastingMode = ShadowCastingMode.ShadowsOnly;
                 rp.matProps = b.ShadowProps;
+                rp.worldBounds = b.World;   // 1.2.376: the shadow draw keeps the batch's own bounds
                 Graphics.RenderMeshIndirect(in rp, b.Mesh, s_argsBuf, 1, s_batchCap + i);
                 calls++; shB++; shTris += tris;
             }
+            VegPrepassEnd();
+            { int merged = DrawMergedSunOnly(ref shTris); calls += merged; shB += merged; }   // E9: one ShadowsOnly draw per caster group (0 unless merged and cascades off)
             PhAcc(PhCamLoop, tLoop); s_phCamDraws += camB; s_phShadowDraws += shB;   // 1.2.240
             long tTail = PhT(); MaybeReadBack(nb);   // 1.2.208: Debug, every 30 s
             IntegrityTick(nb); PhAcc(PhDrawTicks, tTail);   // 1.2.226
@@ -1248,8 +1405,15 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             sb.Append($"[Indirect] ON: {TakenGroups} group(s) taken, {RefusedGroups} on the instanced path; {s_batches.Count} batch(es), {s_live} instance slot(s) of {s_high}, {LastCalls} indirect draw(s) a frame");
             // 1.2.210: how often the costly steps ran since the last line (the spike proof: both should sit near 0 while standing still)
             sb.Append($"; {s_layouts} full layout(s) + {s_moved} batch(es) placed alone, uploads {s_upSlots} slot(s) in {s_upRuns} run(s) ({s_upBytes / 1024} KB), {s_cascadeRecords} cascade + {s_localRecords} light-buffer re-record(s), {s_lastCascadeDraws} cascade + {s_lastLocalDraws} light caster draw(s) recorded in {s_slotCount} light buffer(s), other cameras {s_otherRenders} render(s) / {s_otherSent} draw(s)");
+            sb.Append($"; cascade draws recorded now {s_recCount[0]}/{s_recCount[1]}/{s_recCount[2]}/{s_recCount[3]} (replayed every frame; {s_lastCascadeDraws} in all)");   // 1.2.367 ([visual]): replay cost per frame is one indirect draw per count
+            sb.Append($"; caster material changes at the last full record {s_recMatSwitch[0]}/{s_recMatSwitch[1]}/{s_recMatSwitch[2]}/{s_recMatSwitch[3]} (the least SetPass calls those cascades can make; appended rows not counted); cascade scans skipped {s_recScanSkipped} (IndirectCascadeScanReuse)");   // 1.2.388
+            s_recScanSkipped = 0;
+            sb.Append($"; cull buffer binds {s_cbBound} done / {s_cbSkipped} skipped (IndirectCullBindCache)");   // 1.2.388
+            s_cbBound = 0; s_cbSkipped = 0;
+            sb.Append($"; cascade re-records by reason: {s_recForced} forced, {s_recGained} gained, {s_recStale} stale; {s_recAppends} append(s) of {s_recAppendedDraws} draw(s), appended now {s_appendCount[0]}/{s_appendCount[1]}/{s_appendCount[2]}/{s_appendCount[3]}; [Optimize] CascadeAppendOnGain {(AppendOnGainOn ? "on" : "off")}");   // 1.2.372 ([visual]): the re-record reasons and the appends since the last line
+            sb.Append($"; camera draw sort mode {CameraDrawSortMode}{(CameraDrawSortMode >= 1 && !(s_orderCount == s_batches.Count && s_camOrderCount == s_batches.Count) ? " (order not current: index order this frame)" : "")}");   // 1.2.376
             sb.Append($" [keys: sparse {(SparseOn ? "on" : "off")}, stable {(StableOn ? "on" : "off")}, caster cull {(CasterCullOn ? "on" : "off")}, point faces {(FacesOn ? "on" : "off")}]");
-            s_layouts = 0; s_cascadeRecords = 0; s_moved = 0; s_upSlots = 0; s_upRuns = 0; s_upBytes = 0; s_localRecords = 0; s_otherRenders = 0; s_otherSent = 0;
+            s_layouts = 0; s_cascadeRecords = 0; s_moved = 0; s_recForced = 0; s_recGained = 0; s_recStale = 0; s_recAppends = 0; s_recAppendedDraws = 0; s_upSlots = 0; s_upRuns = 0; s_upBytes = 0; s_localRecords = 0; s_otherRenders = 0; s_otherSent = 0;
             if (s_refusedWhy.Count > 0) { sb.Append("; refused:"); foreach (var kv in s_refusedWhy) sb.Append(' ').Append(kv.Value).Append("x ").Append(kv.Key).Append(';'); }
             s_refusedWhy.Clear();
             return sb.ToString();
@@ -1261,11 +1425,15 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static void ReleaseAll()
         {
             try { global::FiresEasyBakeMeshes.EasyBake.EbmShaderWarm.ResetForWorld(); } catch { }   // review 11-09: warm-up tied to the world session (freed on logout, next world warms)
+            GateReset();   // 1.2.401 IndirectSelfGate: the next world starts on, nothing queued
             StageReleaseAll();   // [Optimize] IndirectStagedSync: jobs finished, native memory freed, staged / flip bits cleared
             DetachCascades();
+            VegPrepassRelease(); DetachDepthCull();   // 1.2.380 ([visual], hot-swap audit): the two camera buffers that outlived a live IndirectRenderer off (they replayed last frame's draws on buffers freed below)
+            s_cbCs = null; s_cbInst = s_cbInstBatch = s_cbInstLod = s_cbBatches = s_cbVisible = s_cbArgs = s_cbRx = s_cbCapture = null;   // 1.2.388 IndirectCullBindCache: no reference to a released buffer
             ReleaseLocal();   // 1.2.209 [wishbone]
             ReleaseReceivers();   // 1.2.209 ([saddles])
             EbmIndirectAssets.ReleaseClones();
+            ReleaseMergedCasters();   // E9: the shared caster materials; groups are rebuilt by the next layout
             IndirectLooks.Release();   // A2
             s_cells.Clear(); s_hasCaster.Clear(); s_refused.Clear(); s_groups.Clear(); s_byKey.Clear(); s_visWidth = 0; s_batches.Clear(); s_free.Clear();
             Array.Clear(s_instBatch, 0, s_instBatch.Length);
@@ -1276,6 +1444,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_visibleStride = 0;
             global::FiresEasyBakeMeshes.EasyBake.GpuReleaseFence.FlushAll();   // review 11-09 (matches [visual]'s 1257): free the fence queue at shutdown
             PresizeReset();
+            SlotCompactReset();   // 1.2.392
             s_orderCount = 0; ClearWork(); s_walkAll = true;   // 1.2.210: the record order is rebuilt with the next layout
         }
 

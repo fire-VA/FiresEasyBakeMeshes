@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using BepInEx.Configuration;
 using UnityEngine;
@@ -38,7 +38,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (config == null || s_bound) return;
             s_bound = true;
             const string s = "Far Impostors";
-            CfgEnabled = config.Bind(s, "Enabled", false /* 1.2.212: back to OFF - Fire parked impostors; opt-in until he says */, "Draw far trees (and other registered far objects) as baked impostors out to the impostor distance. Off = nothing is baked or drawn.");
+            CfgEnabled = config.Bind(s, "Enabled", true /* 1.2.344 ([ghost], Fire 11-12: "we DO need to work just as well as farlands, showing distant vegetation and builds"; was parked OFF since 1.2.212): ON on his word; the rig gate after hand-back measures it (census below) */, "Draw far trees (and other registered far objects) as baked impostors out to the impostor distance. Off = nothing is baked or drawn.");
             CfgSharpness = config.Bind(s, "Sharpness", Sharpness.Medium, "How sharp far trees look: Low 64, Medium 128, High 192, Ultra 256 pixels per view. Higher costs video memory (about 0.7 / 2.7 / 6 / 11 MB a kind). A change re-bakes in the background; the old look stays until the new one is ready.");
             CfgSmoothViews = config.Bind(s, "Smooth views", true, "Blend the 3 nearest baked views (smooth turning). Off = 1 view, a little cheaper.");
             CfgMidLod = config.Bind(s, "Mid-LOD trees", false, "Draw real far-LOD tree meshes between the game's own trees and the impostors (closer far trees look solid). Costs GPU time.");
@@ -55,7 +55,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static bool SmoothViews => CfgSmoothViews == null || CfgSmoothViews.Value;
         internal static bool MidLodOn => CfgMidLod != null && CfgMidLod.Value;
         internal static float MidDistance => CfgMidDistance != null ? CfgMidDistance.Value : 1200f;
-        internal static float Distance => CfgDistance != null ? CfgDistance.Value : 2500f;
+        internal static float Distance => Mathf.Clamp(FarReach.Or(CfgDistance != null ? CfgDistance.Value : 2500f), 600f, 6000f);   // 1.2.344: [Far] Far reach wins when set
         internal static bool CacheOnDisk => CfgCacheOnDisk == null || CfgCacheOnDisk.Value;
         internal static float BakeBudgetMs => CfgBakeBudget != null ? CfgBakeBudget.Value : 2f;
         internal static float UploadBudgetMs => CfgUploadBudget != null ? CfgUploadBudget.Value : 0.5f;

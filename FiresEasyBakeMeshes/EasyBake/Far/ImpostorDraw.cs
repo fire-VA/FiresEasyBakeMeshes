@@ -22,7 +22,21 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static bool Running;
         private static bool s_registered, s_saidOn, s_kindsDirty = true, s_poolDirty = true;
         private static string s_downWhy; private static float s_nextDownCheck;
-        private static ComputeBuffer s_kindsBuf, s_impVisible, s_impArgs, s_midVisible, s_midCount, s_midBase, s_midCap, s_midParts, s_midArgs;
+        private static ComputeBuffer s_kindsBuf, s_impVisible, s_midVisible, s_midCount, s_midBase, s_midCap, s_midParts;
+        // 1.2.350 ([visual], [ghost]'s capture 010313 frame 2086: ev 29845 FiresEBM_FarQuad x34,079 and the mid-LOD parts sat in Unity's per-object motion-vector pass under
+        // Hidden/Internal-MotionVectors, smearing wrong vectors): the two draws moved from Graphics.DrawMeshInstancedIndirect (no motion-mode argument) to
+        // Graphics.RenderMeshIndirect with RenderParams.motionVectorMode = Camera, so the args live in GraphicsBuffers (IndirectArguments | Structured for the cull compute).
+        private static GraphicsBuffer s_impArgs, s_midArgs;
+        // 1.2.352 ([2ic], [lead] 11-13 overnight): one 5-uint args buffer per mid-LOD part, each drawn from command 0. 1.2.350 drew part i with
+        // RenderMeshIndirect(..., s_midArgs, 1, i) on ONE stride-4 buffer that the cull writes at uint i*5; Unity's docs give startCommand only as "the first
+        // command" and build the buffer with stride IndirectDrawIndexedArgs.size, and do not say how startCommand maps to bytes on a stride-4 buffer, so
+        // every part after the first could have read the wrong args. With startCommand 0 always, the byte offset is 0 whatever the stride rule is.
+        // The cull compute is unchanged (no bundle rebuild): FillMidArgs runs once per part with that part's own one-entry _MidParts and _MidArgs.
+        private static readonly List<GraphicsBuffer> s_partArgs = new List<GraphicsBuffer>();
+        private static readonly List<ComputeBuffer> s_partOne = new List<ComputeBuffer>();
+        // 1.2.352: the 30 s proof line reads what the GPU kept (async, no stall: the request completes frames later)
+        private static int s_seenImp = -1, s_seenMid = -1, s_seenFrame; private static bool s_readPending; private static string s_readWhy;
+        private static uint[] s_midCountRead = new uint[0];
         private static readonly List<(ImpostorKinds.Kind kind, ImpostorKinds.MidPart part)> s_midList = new List<(ImpostorKinds.Kind, ImpostorKinds.MidPart)>();
         private static Material s_impMat; private static MaterialPropertyBlock s_impMpb; private static readonly List<MaterialPropertyBlock> s_midMpbs = new List<MaterialPropertyBlock>();
         private static Mesh s_quad;
@@ -106,7 +120,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 s_impMpb = new MaterialPropertyBlock();
                 s_quad = MakeQuad();
                 var cs = ImpostorAssets.Cull; kClear = cs.FindKernel("ClearArgs"); kCull = cs.FindKernel("Cull"); kFill = cs.FindKernel("FillMidArgs");
-                s_impArgs = new ComputeBuffer(5, 4, ComputeBufferType.IndirectArguments) { name = "FiresEBM_FarImpArgs" };
+                s_impArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured, 5, 4) { name = "FiresEBM_FarImpArgs" };   // 1.2.350
             }
             if (s_kindsBuf == null || s_kindsBuf.count < kinds) { s_kindsBuf?.Release(); s_kindsBuf = new ComputeBuffer(Math.Max(16, kinds), 64) { name = "FiresEBM_FarKinds" }; s_kindsDirty = true; }
             if (s_kindsDirty) { UploadKinds(kinds); s_kindsDirty = false; ImpostorPool.CountsChanged = true; }
@@ -163,14 +177,28 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 pd[i * 4] = (uint)k.Id; pd[i * 4 + 1] = p.Mesh.GetIndexCount(p.SubMesh); pd[i * 4 + 2] = p.Mesh.GetIndexStart(p.SubMesh); pd[i * 4 + 3] = (uint)p.Mesh.GetBaseVertex(p.SubMesh);
             }
             s_midParts.SetData(pd);
-            Realloc(ref s_midArgs, parts * 5, 4, ComputeBufferType.IndirectArguments, "FiresEBM_FarMidArgs");
+            ReallocArgs(ref s_midArgs, parts * 5, "FiresEBM_FarMidArgs");   // 1.2.350 (1.2.352: kept only for the no-part dispatch that clamps the impostor count)
             while (s_midMpbs.Count < s_midList.Count) s_midMpbs.Add(new MaterialPropertyBlock());
+            // 1.2.352: one args buffer + one part record per mid-LOD part (see s_partArgs)
+            while (s_partArgs.Count < s_midList.Count)
+            {
+                int n = s_partArgs.Count;
+                s_partArgs.Add(new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured, 5, 4) { name = "FiresEBM_FarMidArgs_" + n });
+                s_partOne.Add(new ComputeBuffer(1, 16) { name = "FiresEBM_FarMidPart_" + n });
+            }
+            var one = new uint[4];
+            for (int i = 0; i < s_midList.Count; i++) { Array.Copy(pd, i * 4, one, 0, 4); s_partOne[i].SetData(one); }   // whole 16-byte element, no element-count ambiguity
         }
 
         private static void Realloc(ref ComputeBuffer b, int count, int stride, ComputeBufferType type, string name)
         {
             if (b != null && b.count >= count) return;
             b?.Release(); b = new ComputeBuffer(Math.Max(1, count), stride, type) { name = name };
+        }
+        private static void ReallocArgs(ref GraphicsBuffer b, int count, string name)   // 1.2.350: indirect args as a GraphicsBuffer (RenderMeshIndirect), still RW-bound in the cull compute
+        {
+            if (b != null && b.count >= count) return;
+            b?.Release(); b = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Structured, Math.Max(1, count), 4) { name = name };
         }
 
         private static void Snow()
@@ -213,8 +241,49 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (ImpostorPool.HighWater > 0) cs.Dispatch(kCull, (ImpostorPool.HighWater + 63) / 64, 1, 1);
 
             cs.SetBuffer(kFill, "_ImpArgs", s_impArgs); cs.SetBuffer(kFill, "_MidCount", s_midCount); cs.SetBuffer(kFill, "_MidCap", s_midCap);
-            cs.SetBuffer(kFill, "_MidParts", s_midParts); cs.SetBuffer(kFill, "_MidArgs", s_midArgs);
-            cs.Dispatch(kFill, Math.Max(1, (s_midList.Count + 63) / 64), 1, 1);
+            if (s_midList.Count == 0)
+            {
+                // no mid parts: one thread still clamps the impostor count to the visible buffer (FillMidArgs id 0)
+                cs.SetInt("_PartCount", 0);
+                cs.SetBuffer(kFill, "_MidParts", s_midParts); cs.SetBuffer(kFill, "_MidArgs", s_midArgs);
+                cs.Dispatch(kFill, 1, 1, 1);
+            }
+            else
+            {
+                // 1.2.352: one dispatch per part, each writing that part's own args at offset 0 (also clamps the impostor count each time: same value)
+                cs.SetInt("_PartCount", 1);
+                for (int i = 0; i < s_midList.Count; i++)
+                {
+                    cs.SetBuffer(kFill, "_MidParts", s_partOne[i]); cs.SetBuffer(kFill, "_MidArgs", s_partArgs[i]);
+                    cs.Dispatch(kFill, 1, 1, 1);
+                }
+            }
+            if (Time.unscaledTime >= s_nextLog - 1f && s_readFor != s_nextLog) { s_readFor = s_nextLog; ReadBack(); }   // 1.2.352: once, about a second before each 30 s line
+        }
+        private static float s_readFor = -1f;
+
+        // 1.2.352: proof of what the GPU kept, for the 30 s line: the impostor args' instance count and the mid-LOD count per kind, read back async
+        // (AsyncGPUReadback: no pipeline stall; the answer lands a few frames later). Skipped where the GPU has no async read-back.
+        private static void ReadBack()
+        {
+            if (s_readPending) return;
+            if (!SystemInfo.supportsAsyncGPUReadback) { s_readWhy = "no async GPU read-back on this GPU"; return; }
+            s_readPending = true; int frame = Time.frameCount;
+            AsyncGPUReadback.Request(s_impArgs, req =>
+            {
+                if (!req.hasError) { var d = req.GetData<uint>(); if (d.Length > 1) { s_seenImp = (int)d[1]; s_seenFrame = frame; } }
+                else s_readWhy = "read-back error";
+            });
+            AsyncGPUReadback.Request(s_midCount, req =>
+            {
+                s_readPending = false;
+                if (req.hasError) { s_readWhy = "read-back error"; return; }
+                var d = req.GetData<uint>(); if (s_midCountRead.Length != d.Length) s_midCountRead = new uint[d.Length];
+                d.CopyTo(s_midCountRead);
+                long sum = 0; int kinds = Math.Min(s_midCountRead.Length, ImpostorKinds.Count);
+                for (int i = 0; i < kinds; i++) sum += s_midCountRead[i];
+                s_seenMid = (int)Math.Min(int.MaxValue, sum);
+            });
         }
 
         // ── draw ──
@@ -232,7 +301,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             s_impMpb.SetFloat("_ImpViews", ImpostorKinds.Views);
             s_impMpb.SetFloat("_ImpDistance", ImpostorEngine.Distance);
             s_impMpb.SetFloat("_FarSnow", s_snow); s_impMpb.SetFloat("_FarAltSnow", altSnow); s_impMpb.SetFloat("_FarSnowLine", 110f);
-            Graphics.DrawMeshInstancedIndirect(s_quad, 0, s_impMat, bounds, s_impArgs, 0, s_impMpb, ShadowCastingMode.Off, true, 0, cam, LightProbeUsage.Off);
+            var rpImp = new RenderParams(s_impMat) { worldBounds = bounds, matProps = s_impMpb, shadowCastingMode = ShadowCastingMode.Off, receiveShadows = true, layer = 0, camera = cam, lightProbeUsage = LightProbeUsage.Off, motionVectorMode = MotionVectorGenerationMode.Camera };   // 1.2.350
+            Graphics.RenderMeshIndirect(in rpImp, s_quad, s_impArgs, 1, 0);
             if (FiresEasyBakeMeshes.EasyBake.Indirect.IndirectStats.SplitOn) FiresEasyBakeMeshes.EasyBake.Indirect.IndirectStats.NoteSplitImpostors(1 + s_midList.Count);   // 1.2.254
 
             for (int i = 0; i < s_midList.Count; i++)
@@ -245,7 +315,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 mpb.SetMatrix("_PartMatrix", p.ToRoot);
                 mpb.SetFloat("_ImpDistance", ImpostorEngine.Distance);
                 mpb.SetFloat("_FarSnow", s_snow); mpb.SetFloat("_FarAltSnow", altSnow); mpb.SetFloat("_FarSnowLine", 110f);
-                Graphics.DrawMeshInstancedIndirect(p.Mesh, p.SubMesh, p.Material, bounds, s_midArgs, i * 20, mpb, ShadowCastingMode.Off, true, 0, cam, LightProbeUsage.Off);
+                var rpMid = new RenderParams(p.Material) { worldBounds = bounds, matProps = mpb, shadowCastingMode = ShadowCastingMode.Off, receiveShadows = true, layer = 0, camera = cam, lightProbeUsage = LightProbeUsage.Off, motionVectorMode = MotionVectorGenerationMode.Camera };   // 1.2.350: the args already carry the part's index count / start / base vertex (MidSegments), so no submesh argument is needed
+                Graphics.RenderMeshIndirect(in rpMid, p.Mesh, s_partArgs[i], 1, 0);   // 1.2.352: the part's own args, command 0
             }
         }
 
@@ -278,6 +349,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (s_frames == 0) return;
             long vram = ImpostorAtlas.Current != null ? ImpostorAtlas.Current.Bytes : 0;
+            // 1.2.352: what the GPU kept on one frame (async read-back) next to what the CPU holds, so "drawn" means drawn
+            int baked = 0, kinds = ImpostorKinds.Count, midKinds = 0; foreach (var k in ImpostorKinds.All) { if (k.HasSlice) baked++; if (k.Mid.Count > 0) midKinds++; }
+            string seen = s_seenImp >= 0 ? $"{s_seenImp} impostor card(s) + {s_seenMid} mid-LOD tree(s) (frame {s_seenFrame})" : (s_readWhy ?? "no read-back yet");
+            EasyBakeLog.Debug(ImpostorEngine.Tag + $"GPU kept on one frame: {seen}, of {ImpostorPool.LiveInstances} live instance(s); kinds baked {baked} of {kinds} ({midKinds} with mid-LOD meshes, {s_midList.Count} mid part draw(s) a frame); reach {ImpostorEngine.Distance:0} m, mid-LOD to {(ImpostorEngine.MidLodOn ? ImpostorEngine.MidDistance.ToString("0") + " m" : "off")}");
             EasyBakeLog.Debug(ImpostorEngine.Tag + $"last 30 s: cull dispatch {s_cullMs / s_frames * 1000:0} us, draw submit {s_drawMs / s_frames * 1000:0} us a frame; bake {ImpostorBaker.SpentMs:0} ms total (worst view {ImpostorBaker.WorstViewMs:0.0} ms, {ImpostorBaker.KindsBaked} kind(s) done{(ImpostorBaker.Busy ? ", baking " + ImpostorBaker.BakingName : "")}); upload {ImpostorPool.SpentMs:0} ms, {ImpostorPool.Uploaded} instance(s); {ImpostorPool.StatusText()}; atlas {vram / (1024 * 1024)} MB; zones handed off {ImpostorHandOff.StandingZones}; snow {(s_vedrSnow ? "Vedr " + s_snow.ToString("0.00") : "by altitude")}");
             s_cullMs = s_drawMs = 0; s_frames = 0; ImpostorBaker.SpentMs = 0; ImpostorBaker.WorstViewMs = 0; ImpostorPool.SpentMs = 0; ImpostorPool.Uploaded = 0;
         }
@@ -291,8 +366,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             ImpostorBaker.Release();
             ImpostorPool.Clear(); ImpostorHandOff.Clear();
             if (why == "world unloaded") { ImpostorKinds.Clear(); ImpostorAtlas.Clear(); }
-            foreach (var b in new[] { s_kindsBuf, s_impVisible, s_impArgs, s_midVisible, s_midCount, s_midBase, s_midCap, s_midParts, s_midArgs }) b?.Release();
-            s_kindsBuf = s_impVisible = s_impArgs = s_midVisible = s_midCount = s_midBase = s_midCap = s_midParts = s_midArgs = null;
+            foreach (var b in new[] { s_kindsBuf, s_impVisible, s_midVisible, s_midCount, s_midBase, s_midCap, s_midParts }) b?.Release();
+            s_impArgs?.Release(); s_midArgs?.Release();   // 1.2.350
+            foreach (var b in s_partArgs) b?.Release(); foreach (var b in s_partOne) b?.Release(); s_partArgs.Clear(); s_partOne.Clear();   // 1.2.352
+            s_seenImp = s_seenMid = -1; s_readPending = false; s_readFor = -1f;
+            s_kindsBuf = s_impVisible = s_midVisible = s_midCount = s_midBase = s_midCap = s_midParts = null; s_impArgs = null; s_midArgs = null;
             if (s_impMat != null) UnityEngine.Object.Destroy(s_impMat); s_impMat = null;
             if (s_quad != null) UnityEngine.Object.Destroy(s_quad); s_quad = null;
             s_midList.Clear(); s_kindsDirty = true; s_poolDirty = true;

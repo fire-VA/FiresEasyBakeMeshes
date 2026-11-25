@@ -68,6 +68,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // Fastest possible bail: no ZSync component, nothing to disable.
             var zsync = go.GetComponent<ZSyncTransform>();
             if (zsync == null) return;
+            if (!zsync.enabled) return;   // 1.2.381: already off (ours from an earlier pass, or another mod's): never tracked twice, never re-enabled by us if it was not ours
 
             _evaluatedCount++;
 
@@ -86,6 +87,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (!cachedOk) return;
                 zsync.enabled = false;
                 _disabledCount++;
+                Track(zsync);   // 1.2.381
                 return;
             }
 
@@ -97,6 +99,70 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             zsync.enabled = false;
             _disabledCount++;
+            Track(zsync);   // 1.2.381
+        }
+
+        // 1.2.381 ([visual], [lead] hot-swap audit 4c, Fire: off / on tests toggle keys live in one run): the key was read only when a piece was created, and what it
+        // disabled was not remembered ("No bookkeeping on our side"), so turned OFF mid-run every ZSyncTransform already disabled stayed disabled (the OFF arm kept the
+        // ON arm's saving) and turned ON only pieces created afterwards were taken. The components this class disabled are remembered now; a flip re-enables them (off)
+        // or runs the same TryDisable over every loaded object (on). The Fixtures key re-judges: all back on, then the loaded objects again under the new rule.
+        private static readonly List<ZSyncTransform> s_disabled = new List<ZSyncTransform>();
+        private static int s_disabledPruneAt = 1024;
+
+        private static void Track(ZSyncTransform zsync)
+        {
+            s_disabled.Add(zsync);
+            if (s_disabled.Count >= s_disabledPruneAt) { s_disabled.RemoveAll(z => z == null); s_disabledPruneAt = Mathf.Max(1024, s_disabled.Count * 2); }   // destroyed pieces leave the list
+        }
+
+        private static int ReenableTracked()
+        {
+            int n = 0;
+            for (int i = 0; i < s_disabled.Count; i++) { var z = s_disabled[i]; if (z != null && !z.enabled) { z.enabled = true; n++; } }
+            s_disabled.Clear(); s_disabledPruneAt = 1024;
+            return n;
+        }
+
+        // 1.2.383 ([lead], town run O_20261114_163205: "turned on: 0 loaded static piece(s)" could not tell an empty walk from "no piece here carries a ZSyncTransform"):
+        // the walk reports itself. s_walked = loaded objects visited, s_seen = those with a ZSyncTransform at all (enabled or not); the return value = newly disabled.
+        private static int s_walked, s_seen;
+        private static int DisableLoaded()
+        {
+            s_walked = 0; s_seen = 0;
+            var instances = ZoneTracker.SceneInstances();
+            if (instances == null) return 0;
+            int before = _disabledCount;
+            foreach (var kv in instances)
+            {
+                if (kv.Value == null) continue;
+                s_walked++;
+                if (kv.Value.GetComponent<ZSyncTransform>() != null) s_seen++;
+            }
+            foreach (var kv in instances) if (kv.Value != null) TryDisable(kv.Value.gameObject);
+            return _disabledCount - before;
+        }
+
+        internal static void KeyChanged()
+        {
+            if (FiresEasyBakeMeshesPlugin.ZSyncStaticSkipEnabled.Value)
+            {
+                int acted = DisableLoaded();
+                EasyBakeLog.Info($"[ZSync-skip] turned on: walked {s_walked} loaded object(s), {s_seen} with a ZSyncTransform, acted on {acted} (static pieces taken out of the per-frame sync list){(acted == 0 ? "; no targets in this scene" : "")}");
+            }
+            else
+            {
+                int tracked = s_disabled.Count;
+                int acted = ReenableTracked();
+                EasyBakeLog.Info($"[ZSync-skip] turned off: {tracked} tracked, acted on {acted} (put back on the game's per-frame sync){(acted == 0 ? "; nothing had been taken this session" : "")}");
+            }
+        }
+
+        // After Reset() cleared the per-prefab verdicts (the Fixtures key changed).
+        internal static void Rejudge()
+        {
+            int back = ReenableTracked();
+            int again = FiresEasyBakeMeshesPlugin.ZSyncStaticSkipEnabled.Value ? DisableLoaded() : 0;
+            EasyBakeLog.Info($"[ZSync-skip] fixtures rule changed: {back} piece(s) put back; walked {s_walked} loaded object(s), {s_seen} with a ZSyncTransform, acted on {again} under the new rule");
         }
 
         public static void MaybeReport()

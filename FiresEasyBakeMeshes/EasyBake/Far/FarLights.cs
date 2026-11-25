@@ -37,6 +37,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             public FarLightKinds.Kind Kind; public ZDOID Id; public Vector3 Pos;
             public int State = 1; public float Fuel; public long LastTicks;
             public bool Burning, Live; public float Phase; public int Sweep;
+            public Quaternion Rot = Quaternion.identity;   // 1.2.427: the piece's rotation (anchor = Pos + Rot * Kind.LightLocal); identity for cache-only records
+            public float Show; public GameObject Inst; public Renderer[] Rends;   // 1.2.427: glow fade 0..1; the live instance and its renderers (is the real lantern drawn?)
         }
         private static readonly Dictionary<ZDOID, Rec> s_recs = new Dictionary<ZDOID, Rec>();
 
@@ -89,7 +91,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             {
                 s_saidOn = true;
                 EasyBakeLog.Info($"[FarLights] on: {FarLightKinds.Count} glow kind(s), material {s_ps.GetComponent<ParticleSystemRenderer>().sharedMaterial.name}, "
-                    + $"source {(ZNet.instance.IsServer() ? "host scan (every ZDO)" : "client ZDOs + far cache")}, max {s_maxDistance.Value:0} m, falloff {s_falloff.Value:0.##}");
+                    + $"source {(ZNet.instance.IsServer() ? "host scan (every ZDO)" : "client ZDOs + far cache")}, max {FarReach.Or(s_maxDistance.Value):0} m, falloff {s_falloff.Value:0.##}");
             }
             if (!s_cacheAsked && FarCache.Ready) { s_cacheAsked = true; LoadCache(); }
 
@@ -120,7 +122,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
         private static void Scan(Vector3 at)
         {
-            int radius = Mathf.CeilToInt(s_maxDistance.Value / SectorSize) + 1;
+            int radius = Mathf.CeilToInt(FarReach.Or(s_maxDistance.Value) / SectorSize) + 1;
             if (radius != s_offsetsRadius) { s_offsets = Spiral(radius); s_offsetsRadius = radius; s_scanning = false; }
             if (!s_scanning)
             {
@@ -142,6 +144,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (!s_recs.TryGetValue(zdo.m_uid, out var r)) { r = new Rec { Kind = kind, Id = zdo.m_uid, Phase = Hash01(zdo.m_uid) * 6.283f }; s_recs[zdo.m_uid] = r; s_dirty = true; }
                     var p = zdo.GetPosition();
                     if ((p - r.Pos).sqrMagnitude > 0.01f) { r.Pos = p; s_dirty = true; }
+                    r.Rot = zdo.GetRotation();   // 1.2.427
                     Snapshot(r, zdo);
                     r.Live = true; r.Sweep = s_sweep;
                 }
@@ -260,14 +263,20 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (!hide && dark > 0.001f)
             {
                 Vector3 eye = cam.transform.position;
-                float maxD = s_maxDistance.Value, maxD2 = maxD * maxD, falloff = s_falloff.Value;
+                float maxD = FarReach.Or(s_maxDistance.Value), maxD2 = maxD * maxD, falloff = s_falloff.Value;
                 float pixelToMetres = 2f * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) / Mathf.Max(1, Screen.height);
                 s_near.Clear();
                 foreach (var r in s_recs.Values)
                 {
                     if (!r.Burning) continue;
                     float d2 = (r.Pos - eye).sqrMagnitude;
-                    if (d2 > maxD2 || d2 < r.Kind.Range * r.Kind.Range * 0.36f) continue;
+                    if (d2 > maxD2) continue;
+                    // 1.2.427 (Fire: the near lanterns show their own glow; the round glow only where the real lantern is NOT drawn): per light, the target is 0 while its
+                    // live instance has a renderer the camera draws (LOD not culled, in view), else 1; it eases 0.25 a draw (10 Hz: ~0.4 s) so the hand-off never pops.
+                    // Replaces the old distance hand-off (0.6-1.2 x the light's range), which overlapped the real lantern far beyond its range.
+                    float want = RealDrawn(r) ? 0f : 1f;
+                    r.Show = Mathf.MoveTowards(r.Show, want, 0.25f);
+                    if (r.Show <= 0.001f) continue;
                     s_near.Add(new KeyValuePair<float, Rec>(d2, r));
                 }
                 if (s_near.Count > MaxDrawn) s_near.Sort((a, b) => a.Key.CompareTo(b.Key));
@@ -276,7 +285,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 for (int i = 0; i < s_near.Count && count < MaxDrawn; i++)
                 {
                     var r = s_near[i].Value; float d = Mathf.Sqrt(s_near[i].Key);
-                    float handoff = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(r.Kind.Range * 0.6f, r.Kind.Range * 1.2f, d));
+                    float handoff = Mathf.SmoothStep(0f, 1f, r.Show);   // 1.2.427: shown only where the real light is not drawn
                     float k = d / 800f;
                     float b = dark * handoff * Fog(d) / (1f + falloff * k * k);
                     float size = r.Kind.Size, minSize = d * pixelToMetres * MinPixels;
@@ -286,7 +295,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     var c = r.Kind.Color;
                     s_parts[count++] = new ParticleSystem.Particle
                     {
-                        position = r.Pos + Vector3.up * (r.Kind.Fire ? 0.6f : 0.3f),
+                        position = r.Pos + r.Rot * r.Kind.LightLocal,   // 1.2.427: at the light point (was root + 0.3 / 0.6 m up)
                         startSize = size, remainingLifetime = 1e5f, startLifetime = 1e5f,
                         startColor = new Color(c.r, c.g, c.b, Mathf.Clamp01(b)),
                     };
@@ -294,6 +303,21 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             }
             s_ps.SetParticles(s_parts, count);
             s_drawn = count;
+        }
+
+        // 1.2.427: is this light's real piece drawn now? Its live instance (vanilla's own ZDO -> instance map) with any renderer Unity rendered last frame
+        // (Renderer.isVisible: false once its LOD culls it or it is out of every view). No instance (zone unloaded, a cache-only record) = not drawn.
+        private static bool RealDrawn(Rec r)
+        {
+            var scene = ZNetScene.instance;
+            if (scene == null || !r.Live) return false;
+            var zdo = ZDOMan.instance.GetZDO(r.Id);
+            var nv = zdo != null ? scene.FindInstance(zdo) : null;
+            var go = nv != null ? nv.gameObject : null;
+            if (go == null) { r.Inst = null; r.Rends = null; return false; }
+            if (!ReferenceEquals(go, r.Inst) || r.Rends == null) { r.Inst = go; r.Rends = go.GetComponentsInChildren<Renderer>(false); }
+            foreach (var rd in r.Rends) if (rd != null && !(rd is ParticleSystemRenderer) && rd.isVisible) return true;
+            return false;
         }
 
         // ---- 1.2.216 sleep by day

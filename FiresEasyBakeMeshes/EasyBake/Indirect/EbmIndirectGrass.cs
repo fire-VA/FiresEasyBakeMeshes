@@ -111,7 +111,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (s_on) return true;
             if (s_fault || !KeyOn || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null || Time.unscaledTime < s_nextTry) return false;
             s_nextTry = Time.unscaledTime + 5f;
-            if (!SystemInfo.supportsComputeShaders) { Say("off: this GPU has no compute shaders (vanilla grass)"); return false; }
+            { string capWhy = EbmGpuCaps.WhyNot(); if (capWhy != null) { Warn1(capWhy); return false; } }   // 1.2.279: the same capability check as the indirect path
             if (!s_looked)
             {
                 s_looked = true;
@@ -123,7 +123,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     catch (Exception e) { s_cs = null; EasyBakeLog.Info("[Indirect] grass: the EbmGrass kernels did not load (" + e.Message + ")"); }
                 }
             }
-            if (s_cs == null || s_shader == null || !s_shader.isSupported) { Say("off: EBM's bundle has no EbmGrass compute / EBM/GrassIndirect shader (vanilla grass)"); return false; }
+            if (s_cs == null || s_shader == null || !s_shader.isSupported) { Warn1(s_shader != null && !s_shader.isSupported ? "EBM/GrassIndirect cannot run on this graphics card" : "EBM's bundle has no EbmGrass compute / EBM/GrassIndirect shader"); return false; }
             string foreign = ForeignOwner();
             if (foreign != null) { Say("off: " + foreign + " also patches InstanceRenderer (vanilla grass, left to it)"); return false; }
             if (s_layer < 0) s_layer = LayerMask.NameToLayer("InstanceRenderer");
@@ -179,6 +179,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         private static string s_lastSay = "";
         private static void Say(string what) { if (what == s_lastSay) return; s_lastSay = what; EasyBakeLog.Info("[Indirect] grass: " + what); }
+        // 1.2.264 (Fire 11-10: IndirectGrass default ON): a machine that cannot run it keeps vanilla grass and says so ONCE as a Warning
+        private static void Warn1(string why) { string what = "off: " + why; if (what == s_lastSay) return; s_lastSay = what; EasyBakeLog.Warn("[Indirect] grass: the GPU grass path is off for this session (" + why + "); the game draws grass as usual. Nothing is missing."); }
 
         // another mod patching what we replace = vanilla's path, left to it (checked at start and every 30 s)
         private static string ForeignOwner()
@@ -370,6 +372,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_rowScratch[0] = default;   // Flags 0 = not live
             s_patch.SetData(s_rowScratch, 0, p.Row, 1);
             s_rows[p.Row] = null; s_freeRows.Push(p.Row); p.Row = -1;
+            if (s_freeRows.Count == s_rowHigh) { s_freeRows.Clear(); s_rowHigh = 0; }   // 1.2.401 ([visual], [lead]): the last live row left, so the row count starts again at 0 and OnPreCull's "s_rowHigh == 0" return skips the three dispatches and the draws. Before, the count never came down and the cull + expand ran over every row ever used with no grass in sight.
         }
 
         // the instance pool: doubled on demand, the old rows kept by a GPU copy (EbmGrassCopy)
@@ -604,7 +607,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 {
                     if (k.Members <= 0 || k.Mesh == null || k.Clone == null || k.Source == null) continue;
                     var rp = new RenderParams(k.Clone)
-                    {
+                    { motionVectorMode = MotionVectorGenerationMode.Camera, 
                         worldBounds = k.World, layer = s_layer, shadowCastingMode = k.Shadow, receiveShadows = true,
                         matProps = k.Props, lightProbeUsage = LightProbeUsage.BlendProbes, reflectionProbeUsage = ReflectionProbeUsage.BlendProbes,
                     };

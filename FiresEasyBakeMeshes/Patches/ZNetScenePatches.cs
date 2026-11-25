@@ -16,7 +16,7 @@ namespace FiresEasyBakeMeshes.Patches
         {
             "IndirectRenderer", "IndirectCascadeShadows", "IndirectCoverage", "IndirectCoverageDisableRenderers", "IndirectCoverageDisablePrefabs",
             "IndirectSparseUpload", "IndirectStableLayout", "IndirectCasterCpuCull", "IndirectPointFaces", "IndirectExactCascadeSpheres",
-            "IndirectShadowReceiverCull", "IndirectShadowSameFrame", "IndirectCullGrouped", "IndirectOneCullPass",
+            "IndirectShadowReceiverCull", "IndirectCasterReceiverCull", "IndirectCasterReceiverCullVerify", "IndirectShadowSameFrame", "WaterSplitLitTiles", "WaterSplitLitTilesVerify", "WaterHideBuriedTiles", "WaterHideBuriedTilesVerify", "WaterTightTileBounds", "WaterTightTileBoundsVerify", "WaterHideOccludedTiles", "WaterHideOccludedTilesVerify", "IndirectCullGrouped", "IndirectOneCullPass",
             "IndirectVertexDebug", "IndirectCascadeEmptySkip", "IndirectCellsJob", "IndirectDrawParamsCache", "IndirectGpuGrow", "IndirectCompactSlots", "IndirectFusedCells", "IndirectCachedAlive", "IndirectLocalSteady", "IndirectCellFastSkip", "IndirectLooksChangeDriven", "IndirectCasterSizeSkip", "SectorMirrorSlicedRebuild", "DestroyLeanEarmark", "IndirectCoverageReach", "IndirectCoverageLocationProps", "FarBuildingsChangedZonesOnly", "IndirectCoverageLodLevels", "IndirectCellReuse",   // 1.2.216: read per frame / per pass in their code
             "ObjectStreamPacer", "StreamPacerEveryFramePass", "IdleObjectAreaSkip", "EventDrivenObjectArea", "DestroyMoversFirst", "RemovalIdleScanLimit", "TeleportCreateGate", "DistantPrefabStreaming",   // 1.2.250
         };
@@ -141,10 +141,10 @@ namespace FiresEasyBakeMeshes.Patches
                 EasyBake.UnloadStressTest.Register();   // 1.2.96
                 // 1.2.102: what EBM does with the piece under the crosshair (read-only), and a forced rebake (devcommands).
                 new Terminal.ConsoleCommand("ebm_why",
-                    "FiresEasyBakeMeshes: what EBM does with the piece you look at - silenced, instanced, combined, skipped - and what it draws (read-only).",
+                    "[prefab] FiresEasyBakeMeshes: what EBM does with the piece you look at (or the nearest created piece of [prefab]) - silenced, instanced, combined, skipped - and what it draws (read-only).",
                     new Terminal.ConsoleEvent(args =>
                     {
-                        foreach (var line in EasyBake.ZoneTracker.Why()) { EasyBakeLog.Debug(line); args.Context?.AddString(line); }
+                        foreach (var line in EasyBake.ZoneTracker.Why(args.Length > 1 ? args[1] : null)) { EasyBakeLog.Debug(line); args.Context?.AddString(line); }
                     }));
                 new Terminal.ConsoleCommand("ebm_drawtest",
                     "[prefab] FiresEasyBakeMeshes (diagnostic): for 30 s draw the piece you look at (or the nearest piece of [prefab]) as numbered copies 2 m above it, one per draw path, to see which one fails.",
@@ -334,6 +334,10 @@ namespace FiresEasyBakeMeshes.Patches
         [HarmonyPostfix]
         public static void Postfix(GameObject __result)
         {
+            using (EasyBake.EbmPatchMarkers.CreatePost.Auto()) CreatedBody(__result);   // 1.2.360: profiler marker only
+        }
+        private static void CreatedBody(GameObject __result)
+        {
             if (__result == null) return;
 
             long t = EasyBake.Probe.Start();
@@ -380,6 +384,10 @@ namespace FiresEasyBakeMeshes.Patches
         // that do not describe the active area; destroying against them unloads everything it just created.
         [HarmonyPrefix]
         public static bool Prefix(ZNetScene __instance, List<ZDO> currentNearObjects, List<ZDO> currentDistantObjects, bool __runOriginal)
+        {
+            using (EasyBake.EbmPatchMarkers.RemoveObjects.Auto()) return RemoveBody(__instance, currentNearObjects, currentDistantObjects, __runOriginal);   // 1.2.360: profiler marker only
+        }
+        private static bool RemoveBody(ZNetScene __instance, List<ZDO> currentNearObjects, List<ZDO> currentDistantObjects, bool __runOriginal)
         {
             if (!__runOriginal)
             {

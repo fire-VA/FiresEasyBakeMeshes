@@ -82,7 +82,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Optimize", "WarmEbmShaders", false,
+            Enabled = config.Bind("Optimize", "WarmEbmShaders", true /* 1.2.264 Fire 11-10: on to test */,
                 "When you enter the world, EBM's own graphics shaders are prepared once, before the first building that needs them appears, so that first appearance does not stutter. Nothing is drawn. Slightly longer first second in the world.");
         }
 
@@ -131,7 +131,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             var bounds = new Bounds(cam.transform.position + cam.transform.forward * 2f, Vector3.one);
             foreach (var mat in s_mats)
             {
-                var rp = new RenderParams(mat) { worldBounds = bounds, shadowCastingMode = ShadowCastingMode.On, receiveShadows = true, matProps = s_props };
+                var rp = new RenderParams(mat) { motionVectorMode = MotionVectorGenerationMode.Camera,  worldBounds = bounds, shadowCastingMode = ShadowCastingMode.On, receiveShadows = true, matProps = s_props };
                 Graphics.RenderMeshIndirect(in rp, s_tri, s_args, 1, 0);
             }
             s_warmMs += sw.Elapsed.TotalMilliseconds;

@@ -500,7 +500,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // piece is silenced turns Ready and shows its combined meshes (and its instance groups start drawing).
         public static void PumpSuppression()
         {
-            if (s_pendingBakes.Count == 0) return;
+            if (s_pendingBakes.Count == 0 && s_swaps.Count == 0) return;   // 1.2.374: swaps share the pump and its budget
             float budgetMs = FiresEasyBakeMeshesPlugin.SuppressBudgetMs.Value * PerformanceProfile.Budget;   // 1.2.135
             var clock = System.Diagnostics.Stopwatch.StartNew();
             int done = 0;
@@ -530,7 +530,71 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (onReady != null) { try { onReady(result); } catch (Exception e) { EasyBakeLog.Warn("[EbmApi] zone announce threw: " + e.Message); } }
                 }
             }
-            BakeProfile.NoteSuppressSlice(clock.ElapsedTicks, done, s_pendingBakes.Count);
+            // 1.2.374: the ZDO full bake's this-visit swaps, after the fresh bakes, under what is left of the same budget
+            while (s_swaps.Count > 0 && s_pendingBakes.Count == 0)
+            {
+                var swap = s_swaps[0];
+                var pending = swap.Pending;
+                while (pending.Count > 0)
+                {
+                    if (budgetMs > 0f && done > 0 && clock.Elapsed.TotalMilliseconds >= budgetMs) break;
+                    int last = pending.Count - 1;
+                    var go = pending[last];
+                    pending.RemoveAt(last);
+                    done++;
+                    if (go == null) continue;
+                    var suppression = EasyBakeSuppressedVisuals.SuppressPiece(go);
+                    if (suppression != null) swap.Bake.SuppressedPieces.Add(suppression);
+                }
+                if (pending.Count > 0) break;
+                s_swaps.RemoveAt(0);
+                FinishSwap(swap);
+            }
+            BakeProfile.NoteSuppressSlice(clock.ElapsedTicks, done, s_pendingBakes.Count + s_swaps.Count);
+        }
+
+        // 1.2.374 ([visual] + [seasons], Fire 11-14: the background full bake is swapped into the zone THIS visit). A zone attached from its ZDOs draws
+        // instance groups; its combine candidates were created live and draw themselves. When the background combine has built their batches (under
+        // `batchParent`, kept INACTIVE), the live covered pieces are silenced here under the suppression budget and the batches are shown in the frame the
+        // last one is silenced: nothing is drawn twice. BakeResult.Ready is NOT used for this: a bake that is not Ready stops drawing its instance groups
+        // too (ZoneTracker), and this bake's groups are the town on screen.
+        internal sealed class BatchSwap
+        {
+            public BakeResult Bake;
+            public GameObject BatchParent;                                   // inactive until the swap is done
+            public readonly List<GameObject> Pending = new List<GameObject>();   // live covered pieces still drawing themselves
+            public bool Done, Cancelled;
+            public Action<BatchSwap> OnDone;                                 // main thread, in the frame the batches are shown
+        }
+        private static readonly List<BatchSwap> s_swaps = new List<BatchSwap>();
+
+        // Queues the swap. `livePieces` = the roots of the covered pieces that exist as objects right now (pieces skipped at creation need nothing).
+        internal static BatchSwap QueueBatchSwap(BakeResult bake, GameObject batchParent, List<GameObject> livePieces, Action<BatchSwap> onDone)
+        {
+            var swap = new BatchSwap { Bake = bake, BatchParent = batchParent, OnDone = onDone };
+            if (batchParent != null) batchParent.SetActive(false);
+            if (livePieces != null) for (int i = 0; i < livePieces.Count; i++) if (livePieces[i] != null) swap.Pending.Add(livePieces[i]);
+            s_swaps.Add(swap);
+            return swap;
+        }
+
+        private static void FinishSwap(BatchSwap swap)
+        {
+            swap.Done = true;
+            if (swap.BatchParent != null) swap.BatchParent.SetActive(true);
+            Indirect.EbmIndirect.RequestFullWalk();
+            var onDone = swap.OnDone; swap.OnDone = null;
+            if (onDone != null) { try { onDone(swap); } catch (Exception e) { EasyBakeLog.Warn("[Cache] ZDO full bake swap callback threw: " + e.Message); } }
+        }
+
+        // The zone was torn down, unloaded or went Dirty before the swap finished: nothing more is silenced (what was silenced is restored by Restore, as
+        // for any suppressed piece) and the batches are never shown; the caller destroys `BatchParent`.
+        internal static void CancelBatchSwap(BatchSwap swap)
+        {
+            if (swap == null || swap.Done) return;
+            swap.Cancelled = true; swap.Done = true; swap.OnDone = null;
+            swap.Pending.Clear();
+            s_swaps.Remove(swap);
         }
 
         // A bake torn down or unloaded before its queue ran out: nothing more to silence (what was silenced is restored by
@@ -555,6 +619,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static void Restore(BakeResult result)
         {
             if (result == null) return;
+            MeshCacheStore.FinishPendingFor(result);   // 1.2.361: a sliced cache save still reading this bake's meshes finishes before they are destroyed
             DropPending(result);
 
             if (result.SuppressedPieces != null)
@@ -773,10 +838,31 @@ namespace FiresEasyBakeMeshes.EasyBake
         // batch them in with everything else. A prefab the combiner cannot take has no such alternative - its pieces either
         // join an instanced group or stay live objects - so any number of them is worth a group, as long as one of them is
         // invulnerable and can therefore also be skipped. A prefab can arrive as both kinds, so every candidate is checked.
+        // 1.2.336 ([generator]'s review): true when DamageableLowCountGroups is the ONLY reason this under-minimum key forms a group (the combiner
+        // would take the prefab, so its invulnerable copies belong in the merge, not in a small indirect group); the callers then add the damageable
+        // copies only. A combiner-refused prefab keeps today's whole-list group.
+        private static bool LowCountDamageableOnly(int prefabHash, List<WearNTear> candidates, int minInstances)
+        {
+            if (candidates.Count >= minInstances) return false;
+            if (FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups == null || !FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups.Value) return false;
+            var sample = candidates[0];
+            if (sample == null || sample.gameObject == null) return false;
+            return WhyCombinerRefuses(prefabHash, sample.gameObject) == null;
+        }
+
         private static bool OnlyInstancingCanDraw(int prefabHash, List<WearNTear> candidates)
         {
             var sample = candidates[0];
             if (sample == null || sample.gameObject == null) return false;
+            // 1.2.336 ([Batching] DamageableLowCountGroups, lead 11-12; census-town-rugs :3325 "8886 damageable pieces the bake does not draw, fewer
+            // copies of its prefab in the zone", census-rug-why: jute_carpet / rug_fur "not in the zone's bake"): a DAMAGEABLE candidate has no combine
+            // path at all (:283 takes invulnerable pieces only), so for it, as for a combiner-refused prefab, an instanced group is the only way the bake
+            // can draw it; with the key on, any number of them is worth a group. OFF = the per-zone minimum applies to them as before (the A/B decides:
+            // it trades 1-2 vanilla draws for one small indirect group per prefab).
+            if (FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups != null && FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups.Value
+                && FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value)
+                for (int i = 0; i < candidates.Count; i++)
+                    if (candidates[i] != null && !InvulnerableClassifier.IsInvulnerable(candidates[i])) return true;
             if (WhyCombinerRefuses(prefabHash, sample.gameObject) == null) return false;
 
             // "Can be skipped" is the test, and what can be skipped widens with SkipDamageablePieces. Left as
@@ -846,6 +932,34 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         private static readonly Dictionary<int, string> _combinerRefusals = new Dictionary<int, string>();
+
+        // 1.2.377 ([visual], [lead]; the 1.2.375 verifier leg 1315_1A: EXTRA 11 in zone (-19,14) = darkwood_roof_45 x8 + darkwood_roof_top_45 x3, the ZDO
+        // file had 20 groups where the live bake had 18, from the same 901 pieces). The ZDO path kept its own copy of the two low-count rules below and
+        // its copy of OnlyInstancingCanDraw stopped at "the combiner refuses the prefab": it left out the live rule's last test (a candidate is
+        // invulnerable, or damageable pieces may be skipped), so a below-minimum key of DAMAGEABLE pieces got a group the live bake never makes. These
+        // are the SAME rules stated on what a ZDO gives (no live piece), so both paths decide alike; the ZDO path calls these and keeps no copy.
+        internal static bool OnlyInstancingCanDrawFromZdo(int prefabHash, WearLook look, bool anyDamageable, bool anyInvulnerable)
+        {
+            if (FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups != null && FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups.Value
+                && FiresEasyBakeMeshesPlugin.BatchingDamageablePieces.Value && anyDamageable) return true;
+            if (!CombinerRefusesFromZdo(prefabHash, look)) return false;
+            return anyInvulnerable || SkipEligibility.DamageableSkipAllowed;
+        }
+
+        internal static bool LowCountDamageableOnlyFromZdo(int prefabHash, WearLook look)
+        {
+            if (FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups == null || !FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups.Value) return false;
+            return !CombinerRefusesFromZdo(prefabHash, look);
+        }
+
+        // The combiner's verdict without a live piece: the one a live copy already earned this session, else what the prefab asset says for that look
+        // (a non-readable mesh in its drawn renderers). A refusal that only a LIVE copy can show (a renderer given per-object material values at
+        // runtime) is unknown until one exists and counts as "the combiner takes it", as before.
+        internal static bool CombinerRefusesFromZdo(int prefabHash, WearLook look)
+        {
+            if (_combinerRefusals.TryGetValue(prefabHash, out string refusal)) return refusal != null;
+            return ZdoCombine.AssetRefuses(prefabHash, look);
+        }
 
         // 1.2.253: the verdict a live copy already earned, without computing one from the prefab asset: WhyCombinerRefuses reads activeness and property
         // blocks of a live piece, and caches the first answer it gives.
@@ -957,6 +1071,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             foreach (var entry in candidatesByKey)
             {
                 if (entry.Value.Count < minInstances && !OnlyInstancingCanDraw(entry.Key.PrefabHash, entry.Value)) continue;
+                bool damageableOnly = LowCountDamageableOnly(entry.Key.PrefabHash, entry.Value, minInstances);   // 1.2.336 ([generator]): the key never pulls invulnerable siblings out of the merge
 
                 InstanceDefinition definition;
                 if (!InstanceDefinitionCache.TryGet(entry.Key, out definition)) continue;
@@ -966,9 +1081,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     var piece = entry.Value[i];
                     var pc = s_instancedInfo[piece];
+                    if (damageableOnly && pc.Invulnerable) continue;   // stays on the combine path
                     group.Add(pc.Static ? pc.Matrix : piece.transform.localToWorldMatrix, pc.Identity);
                     instanced.Add(piece);
                 }
+                if (group.Matrices.Count == 0) continue;
                 group.RecomputeBounds();
                 into.Add(group);
             }
@@ -1042,14 +1159,17 @@ namespace FiresEasyBakeMeshes.EasyBake
                 foreach (var entry in prep.ByKey)
                 {
                     if (entry.Value.Count < minInstances && !OnlyInstancingCanDraw(entry.Key.PrefabHash, entry.Value)) continue;
+                    bool damageableOnly = LowCountDamageableOnly(entry.Key.PrefabHash, entry.Value, minInstances);   // 1.2.336: the prep agrees with the bake
                     if (!InstanceDefinitionCache.TryGet(entry.Key, out InstanceDefinition definition)) continue;
                     var group = new ZoneInstanceGroup { PrefabHash = entry.Key.PrefabHash, Look = entry.Key.Look, Definition = definition };
                     foreach (var piece in entry.Value)
                     {
                         var pc = prep.Info[piece];
+                        if (damageableOnly && pc.Invulnerable) continue;
                         group.Add(pc.Static ? pc.Matrix : piece.transform.localToWorldMatrix, pc.Identity);
                         instanced.Add(piece);
                     }
+                    if (group.Matrices.Count == 0) continue;
                     group.RecomputeBounds();
                     groups.Add(group);
                 }
@@ -1123,6 +1243,46 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Dictionary<WearNTear, PieceClass> s_classes = new Dictionary<WearNTear, PieceClass>();
         private static readonly Queue<WearNTear> s_classQueue = new Queue<WearNTear>();
         private static int s_classSweepAt = 65536;
+        private static float s_classSweepDueAt;   // 1.2.392: a dead-key sweep is due at this time (0 = none); set 30 s after a zone unload
+        private static int s_classForgot, s_classSwept;   // 1.2.392: entries dropped at zone unload / by the sweep, this session (the [Heap] line)
+        // 1.2.392 ([lead]: a few-ms sweep is a hitch): the sweep is sliced. A due sweep copies the table's keys once (references only, no Unity call), then
+        // each frame tests keys from where it stopped, in runs of 64, until ClassSweepSliceMs is spent; a destroyed key is removed from the table.
+        private static readonly List<WearNTear> s_classSweepKeys = new List<WearNTear>();
+        private static int s_classSweepCursor = -1, s_classSweepFramesNow;   // -1 = no sweep running
+        private const double ClassSweepSliceMs = 0.2;
+        internal static double ClassSweepMaxMs;   // the worst single frame's slice this session (the key copy counts in its frame)
+        internal static int ClassSweepLastFrames, ClassSweeps;   // frames the last finished sweep took; sweeps finished this session
+
+        private static void ClassSweepTick()
+        {
+            bool running = s_classSweepCursor >= 0;
+            if (!running && !(s_classes.Count > s_classSweepAt || (s_classSweepDueAt > 0f && Time.unscaledTime >= s_classSweepDueAt))) return;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (!running)
+            {
+                s_classSweepDueAt = 0f;
+                s_classSweepKeys.Clear(); s_classSweepKeys.AddRange(s_classes.Keys);
+                s_classSweepCursor = 0; s_classSweepFramesNow = 0;
+            }
+            s_classSweepFramesNow++;
+            int n = s_classSweepKeys.Count;
+            long budget = (long)(System.Diagnostics.Stopwatch.Frequency * ClassSweepSliceMs / 1000.0);
+            while (s_classSweepCursor < n)
+            {
+                int end = Math.Min(n, s_classSweepCursor + 64);
+                for (; s_classSweepCursor < end; s_classSweepCursor++)
+                {
+                    var key = s_classSweepKeys[s_classSweepCursor];
+                    if (key == null && s_classes.Remove(key)) s_classSwept++;   // destroyed since it was classified
+                }
+                if (System.Diagnostics.Stopwatch.GetTimestamp() - t0 >= budget) break;
+            }
+            ClassSweepMaxMs = Math.Max(ClassSweepMaxMs, (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            if (s_classSweepCursor < n) return;
+            s_classSweepKeys.Clear(); s_classSweepCursor = -1;   // Clear drops the references; the list keeps its array for the next sweep
+            ClassSweepLastFrames = s_classSweepFramesNow; ClassSweeps++;
+            s_classSweepAt = Mathf.Max(65536, s_classes.Count * 2);
+        }
 
         private static PieceClass Classify(WearNTear wnt, ZDO zdo)
         {
@@ -1157,6 +1317,31 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (wnt != null) s_classes.Remove(wnt);
         }
 
+        // 1.2.392: a zone unloads (ZoneTracker, before it clears the zone's piece set). The game destroys these pieces AFTER the set is cleared, so the
+        // OnDestroy path ("Pieces.Remove(wnt) && ForgetClassed(wnt)") no longer finds them and each stayed here as a destroyed key, holding the dead
+        // WearNTear and what it references. A sweep 30 s later takes what was classified after this (the classify queue still holds some of them).
+        internal static void ForgetClasses(HashSet<WearNTear> pieces)
+        {
+            if (pieces == null) return;
+            foreach (var wnt in pieces) if (!ReferenceEquals(wnt, null) && s_classes.Remove(wnt)) s_classForgot++;
+            ArmClassSweep();
+        }
+
+        // A sweep 30 s from now unless one is already due.
+        internal static void ArmClassSweep() { if (s_classSweepDueAt <= 0f) s_classSweepDueAt = Time.unscaledTime + 30f; }
+
+        // ZoneTracker.Reset ([2ic], [lead]): its two callers are ZNetScene.Shutdown (the world closes: every piece dies) and the plugin's RemovePatches (EBM
+        // switched off or unloaded: nothing bakes until it is on again, and a piece with no class is classified again by the bake). So the whole table goes;
+        // the sweep is armed for a piece the classify queue still reaches this frame. A sweep that is running walks its own key list and finds nothing left.
+        internal static void ClearClasses() { s_classForgot += s_classes.Count; s_classes.Clear(); ArmClassSweep(); }
+
+        // 1.2.392, the [Heap] line: plain counters only (no walk over the table here: that is the sweep's job, sliced). sweepListSlots = the kept key list's array.
+        internal static int ClassCounts(out int forgot, out int swept, out int sweepListSlots)
+        {
+            forgot = s_classForgot; swept = s_classSwept; sweepListSlots = s_classSweepKeys.Capacity;
+            return s_classes.Count;
+        }
+
         // ForgetClass inside a condition that must stay true (the piece was in the zone).
         internal static bool ForgetClassed(WearNTear wnt)
         {
@@ -1168,13 +1353,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // pieces that were destroyed once the table has doubled.
         public static void PumpClassify()
         {
-            if (s_classes.Count > s_classSweepAt)
-            {
-                var dead = new List<WearNTear>();
-                foreach (var key in s_classes.Keys) if (key == null) dead.Add(key);
-                foreach (var key in dead) s_classes.Remove(key);
-                s_classSweepAt = Mathf.Max(65536, s_classes.Count * 2);
-            }
+            ClassSweepTick();   // 1.2.392: was one pass over the whole table past the size bar; now also 30 s after a zone unload, and sliced
             if (s_classQueue.Count == 0 && s_classUrgent.Count == 0 && s_preps.Count == 0) return;
             float budgetMs = FiresEasyBakeMeshesPlugin.ClassifyBudgetMs.Value * PerformanceProfile.Budget;   // 1.2.135
             if (budgetMs <= 0f) { s_classQueue.Clear(); s_classUrgent.Clear(); s_preps.Clear(); return; }   // 0 = the old behaviour: all of it at bake time

@@ -81,7 +81,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
             return Kind.None;
         }
 
-        private static Verdict Judge(GameObject go)
+        internal static Verdict Judge(GameObject go)   // 1.2.272: internal for CoverageRegistry verify
         {
             var v = new Verdict { Kind = KindOf(go), ExcludedPaths = new HashSet<string>() };
             if (go == null) { v.Refusal = "prefab not found"; return v; }
@@ -179,28 +179,39 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect.Coverage
         /// LODGroup = always drawn (Start +inf, End 0). Returns false when the renderer is under a LODGroup but in none of its levels
         /// (Unity never draws those, so neither do we).
         /// </summary>
+        internal static int ParkedRefused;   // 1.2.268: renderers refused because their LOD point is parked (a hidden fish), for the census line
+        private static readonly HarmonyLib.AccessTools.FieldRef<Fish, bool> s_fishLodVisible = HarmonyLib.AccessTools.FieldRefAccess<Fish, bool>("m_lodVisible");   // vanilla Fish.cs:156
         internal static bool RangeFor(Renderer r, out IndirectLodRange range)
         {
             range = new IndirectLodRange { ReferencePointWorld = r.bounds.center, WorldSize = 0f, StartHeight = float.PositiveInfinity, EndHeight = 0f };
             var lg = r.GetComponentInParent<LODGroup>();
             if (lg == null || !lg.enabled) return true;
             var lods = lg.GetLODs();
-            float start = float.PositiveInfinity; bool found = false; float first = 0f, last = 0f;
+            float start = float.PositiveInfinity; bool found = false, lastLevel = false; float first = 0f, last = 0f;
             for (int i = 0; i < lods.Length; i++)
             {
                 bool inLevel = false;
                 var rs = lods[i].renderers;
                 if (rs != null) for (int k = 0; k < rs.Length; k++) if (rs[k] == r) { inLevel = true; break; }
-                if (inLevel) { if (!found) first = start; found = true; last = lods[i].screenRelativeTransitionHeight; }
+                if (inLevel) { if (!found) first = start; found = true; last = lods[i].screenRelativeTransitionHeight; lastLevel = i == lods.Length - 1; }
                 start = lods[i].screenRelativeTransitionHeight;
             }
             if (!found) return false;
             var gt = lg.transform;
             var s = gt.lossyScale;
+            // 1.2.268 ([generator] READ_vpo220_vs_ours item 5, the fish duplicate VPO fixed): vanilla Fish.SetVisible (Fish.cs:980-994) hides a fish nobody
+            // owns by PARKING its LODGroup.localReferencePoint at 999999, not by turning renderers off. With no LodFadeInOut on the object, a parked point
+            // means "hidden now": not covered (Unity draws nothing of it either), so EBM never draws a hidden fish. The fade-in case keeps reading the real point.
+            // [ghost] review: for a fish, decide from the Fish's own visibility flag (vanilla's m_lodVisible), so a fish prefab that also carries LodFadeInOut is
+            // caught too (LocalReferencePoint would read the fade's original point and call it visible); the parked-point rule stays for everything else.
+            var fish = lg.GetComponentInParent<Fish>();
+            if (fish != null) { if (!s_fishLodVisible(fish)) { ParkedRefused++; return false; } }
+            else if (lg.localReferencePoint.x >= 99999f && lg.GetComponent<LodFadeInOut>() == null) { ParkedRefused++; return false; }
             range.ReferencePointWorld = gt.TransformPoint(LocalReferencePoint(lg));
             range.WorldSize = lg.size * Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
             range.StartHeight = first;
             range.EndHeight = last;
+            range.Last = lastLevel;   // E8
             return true;
         }
 

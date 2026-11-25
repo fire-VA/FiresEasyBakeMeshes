@@ -14,6 +14,19 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly List<Vector3> s_pos = new List<Vector3>(65536);
         private static int s_bad; private static bool s_said;
         internal static int Checked, Bad, Wide; private static int s_saidChecked; private static float s_sayAt;
+        private const int ScratchStart = 65536;   // 1.2.392: the lists' start size (the two "new List" above)
+        private static float s_lastUseAt; private static int s_trims;   // 1.2.392
+
+        // 1.2.392, from the 60 s heap tick: the two scratch lists kept the size of the largest mesh ever checked (4 B an index, 12 B a vertex) for the
+        // session. After a minute without a check they go back to their start size; the next large mesh grows them again.
+        internal static void TrimIdle(float now)
+        {
+            if (now - s_lastUseAt < 60f || (s_idx.Capacity <= ScratchStart && s_pos.Capacity <= ScratchStart)) return;
+            s_idx.Clear(); s_pos.Clear();
+            s_idx.Capacity = ScratchStart; s_pos.Capacity = ScratchStart;
+            s_trims++;
+        }
+        internal static long HeapBytes(out int trims) { trims = s_trims; return s_idx.Capacity * 4L + s_pos.Capacity * 12L; }
 
         // an Info line (proof) whenever the counts moved, at most once a minute
         private static void SayCounts()
@@ -27,6 +40,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (m == null) return true;
             Checked++;
+            s_lastUseAt = Time.unscaledTime;   // 1.2.392 (TrimIdle)
             string why = null;
             int nv = m.vertexCount;
             bool wide = m.indexFormat == IndexFormat.UInt32; if (wide) Wide++;

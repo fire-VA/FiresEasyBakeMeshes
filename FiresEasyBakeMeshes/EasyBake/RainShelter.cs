@@ -34,6 +34,10 @@ namespace FiresEasyBakeMeshes
         // 1.2.169: PluginEnabled off. FTS reads Active and takes its own hider back.
         internal static void HandBack()
         {
+            // 1.2.348 ([visual], [seasons]/[lead] 11-13, one rule for all three hiders: a restore re-enables ONLY systems the CURRENT weather still uses):
+            // this path ran Release() straight away, so a weather change in the 0.25 s since the last Tick (or while the key / plugin went off) turned
+            // the OLD weather's systems back on with nobody left to switch them off. Prune to the current env first, exactly as Tick does.
+            PruneToCurrentEnv("hand-back");
             Release();
             s_inside = false;
             s_cache.Clear();
@@ -61,7 +65,11 @@ namespace FiresEasyBakeMeshes
 
             bool inside = player.InShelter();
             Bail(psystems == null && envObject == null ? "the current env has no particle systems or env object (nothing to hide)" : null);
-            if (envChanged && s_inside) { Release(); s_inside = false; }   // a new env: vanilla just (re)enabled its own systems
+            // 1.2.280 (lead 11-11, Norger's Vedr find, mirrored in Vedr 0.8.230): a weather change while sheltered used to Release() every held system,
+            // i.e. emission back ON for systems of the OLD environment, which vanilla had just switched off (EnvMan.SetParticleArrayEnabled), so the old
+            // storm started again and nothing switched it off. Now the held list is DROPPED without touching emission (vanilla owns the old env's systems),
+            // except systems the new env also uses: those stay stopped and come back when the player steps outside.
+            if (envChanged && s_inside && s_stopped.Count > 0) ForgetOldEnv(psystems, envObject);
             bool flipped = inside != s_inside;   // 1.2.254
             if (inside != s_inside)
             {
@@ -185,6 +193,39 @@ namespace FiresEasyBakeMeshes
                 if (keep != null) { if (into == s_cache) Say(ps, $"kept (keep word '{keep}')"); continue; }
                 into.Add(ps);
             }
+        }
+
+        private static readonly List<ParticleSystem> s_newEnv = new List<ParticleSystem>();
+        private static readonly List<ParticleSystem> s_keep = new List<ParticleSystem>();
+        private static void ForgetOldEnv(GameObject[] psystems, GameObject envObject)
+        {
+            s_newEnv.Clear();
+            if (psystems != null) foreach (var go in psystems) Collect(go, s_newEnv);
+            Collect(envObject, s_newEnv);
+            s_keep.Clear();
+            int left = 0;
+            foreach (var ps in s_stopped)
+            {
+                if (ps == null) continue;
+                if (s_newEnv.Contains(ps)) s_keep.Add(ps); else left++;   // not in the new env: vanilla switched it off with its env; never touched again
+            }
+            s_stopped.Clear(); s_stoppedSet.Clear();
+            foreach (var ps in s_keep) { s_stopped.Add(ps); s_stoppedSet.Add(ps); }
+            EasyBakeLog.Debug($"[EBM] shelter weather: weather changed: {left} left to the game, {s_keep.Count} stay stopped until you step outside");
+        }
+
+        // 1.2.348: drop held systems that are not in the current env (vanilla owns them) before any Release outside Tick's own env-change check
+        private static void PruneToCurrentEnv(string why)
+        {
+            if (s_stopped.Count == 0) return;
+            var env = EnvMan.instance;
+            if (env == null || s_pSystems == null || s_envObject == null) return;
+            var psystems = s_pSystems(env); var envObject = s_envObject(env);
+            bool envChanged = !ReferenceEquals(psystems, s_lastPSystems) || !ReferenceEquals(envObject, s_lastEnvObject);
+            s_lastPSystems = psystems; s_lastEnvObject = envObject;
+            if (!envChanged) return;
+            EasyBakeLog.Info($"[EBM] shelter weather: {why} met a weather change since the last tick: the held systems are pruned to the current weather before any is restored");
+            ForgetOldEnv(psystems, envObject);
         }
 
         private static void Release()

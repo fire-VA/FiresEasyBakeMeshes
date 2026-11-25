@@ -114,6 +114,10 @@ namespace FiresEasyBakeMeshes.Patches
         [HarmonyPrefix]
         public static bool Prefix(ZNetScene __instance, bool __runOriginal)
         {
+            using (EasyBake.EbmPatchMarkers.CreateDestroy.Auto()) return CreateDestroyBody(__instance, __runOriginal);   // 1.2.360: profiler marker only
+        }
+        private static bool CreateDestroyBody(ZNetScene __instance, bool __runOriginal)
+        {
             if (!__runOriginal)
             {
                 if (!s_standDownLogged)
@@ -304,19 +308,8 @@ namespace FiresEasyBakeMeshes.Patches
         }
     }
 
-    [HarmonyPatch]
-    public static class ZdoEventDirty_SectorPatches
-    {
-        private static System.Collections.Generic.IEnumerable<MethodBase> TargetMethods()
-        {
-            yield return AccessTools.Method(typeof(ZDOMan), "AddToSector");
-            yield return AccessTools.Method(typeof(ZDOMan), "InitialAddToSector");
-            yield return AccessTools.Method(typeof(ZDOMan), "RemoveFromSector");
-        }
-
-        [HarmonyPostfix]
-        public static void Postfix() => ZdoEventDirty.Dirty = true;
-    }
+    // 1.2.271: ZdoEventDirty's sector postfixes (AddToSector / InitialAddToSector / RemoveFromSector) moved into EasyBake.SectorHooks, EBM's one
+    // postfix per vanilla sector method.
 
     // Runs even when FGN's prefix replaces the method's body.
     [HarmonyPatch(typeof(ZNetScene), "CreateObjects")]
@@ -324,6 +317,6 @@ namespace FiresEasyBakeMeshes.Patches
     {
         [HarmonyPostfix]
         public static void Postfix(System.Collections.Generic.List<ZDO> currentNearObjects, System.Collections.Generic.List<ZDO> currentDistantObjects)
-            => ZdoEventDirty.AfterPass(currentNearObjects, currentDistantObjects, EasyBake.DestroyTimeSlicer.Pending);
+        { using (EasyBake.EbmPatchMarkers.DirtyAfterPass.Auto()) ZdoEventDirty.AfterPass(currentNearObjects, currentDistantObjects, EasyBake.DestroyTimeSlicer.Pending); }   // 1.2.360: profiler marker only
     }
 }

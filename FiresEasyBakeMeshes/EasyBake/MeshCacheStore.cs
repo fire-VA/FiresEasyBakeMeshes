@@ -87,7 +87,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         // The settings whose values change what a bake contains. Compared as a unit on load; any difference
         // rejects the cache exactly as a version mismatch does, so only the zones affected by a retune pay to
         // rebake and nobody has to remember to clear a cache by hand.
-        private static int CurrentBakeSettingsKey()
+        internal static int CurrentBakeSettingsKey()   // 1.2.374: internal for the ZDO-built file ([seasons], ZoneTrackerZdoBake.cs)
         {
             unchecked
             {
@@ -112,6 +112,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 // reading caches that predate it. A piece with no recorded transform cannot be skipped at all,
                 // because ZdoMatches has no cached rotation, scale or look to compare against.
                 key = key * 31 + ((FiresEasyBakeMeshesPlugin.SkipDamageablePieces?.Value ?? false) ? 1 : 0);
+                // 1.2.338 ([visual]; [generator]'s dlcg-ruglook read: the "fewer copies" row stayed 9239 OFF and ON): DamageableLowCountGroups decides
+                // whether a damageable prefab under MinInstancesPerPrefab gets a group, so it changes what a bake CONTAINS; left out of this key, the
+                // ON leg reused every bake written with it off (ON log: "99 from cache, 0 fresh") and the key never ran. Its census row only re-labelled
+                // small groups the old combiner-refused path had already built (the "drawn by the bake" row fell by the same 141).
+                key = key * 31 + ((FiresEasyBakeMeshesPlugin.BatchingDamageableLowCountGroups?.Value ?? false) ? 1 : 0);
                 // SkipVegetation belongs here for exactly the same reason, and more strongly: it decides whether
                 // the bake contains vegetation instance groups AND their PieceTransforms at all.
                 key = key * 31 + ((FiresEasyBakeMeshesPlugin.SkipVegetation?.Value ?? false) ? 1 : 0);
@@ -122,7 +127,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 key = key * 31 + ModdedPrefabGate.SettingsKey();   // 1.2.85: which modded prefabs may bake
                 // 1.2.152: which built-in classes are never baked (feasts 1.2.148, fuel-toggled Fireplaces 1.2.152). A cache written
                 // before a new class was excluded still holds those pieces and would draw them a second time beside the live one.
-                key = key * 31 + "never-baked:feast,fireplace-fuel".GetStableHashCode();
+                key = key * 31 + "never-baked:feast,fireplace-fuel,interactable-v1".GetStableHashCode();
                 return key;
             }
         }
@@ -199,6 +204,23 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static bool RejectChangedPrefabsOn => FiresEasyBakeMeshesPlugin.CacheRejectChangedPrefabs == null || FiresEasyBakeMeshesPlugin.CacheRejectChangedPrefabs.Value;
         private static bool KeepOtherSettingsOn => FiresEasyBakeMeshesPlugin.CacheKeepOtherSettings == null || FiresEasyBakeMeshesPlugin.CacheKeepOtherSettings.Value;
         private static bool PreloadNearOnlyOn => FiresEasyBakeMeshesPlugin.CachePreloadNearOnly != null && FiresEasyBakeMeshesPlugin.CachePreloadNearOnly.Value;
+        // 1.2.389 ([seasons] 11-15, [lead]; Tools\EBM_1388_managed_heap_stores_20261115.md row 1: the whole world's saved bakes stayed decoded in managed memory for the
+        // session, ~214 MB on the rig's client folder of 129 files). [Cache] PreloadSlim, read live: see PumpNearOnly, SlimVisit, HasSavedBake and TryGetOrLoad.
+        private static bool SlimOn => FiresEasyBakeMeshesPlugin.CachePreloadSlim != null && FiresEasyBakeMeshesPlugin.CachePreloadSlim.Value;
+        private const float SlimIdleSeconds = 30f;   // as [Cache] ReleaseIdleSeconds' default: a queued background write of the zone has landed by then
+        private static volatile bool s_heldNear;   // this session's preload holds less than the whole world (PreloadNearOnly or PreloadSlim was on at some point)
+        private static Vector2s s_nearCenter;
+        private static bool s_saidSlim;
+        private static int s_slimDropped, s_slimSyncLoads; private static long s_slimDroppedBytes, s_slimSyncTicks;
+        private static byte[] s_syncBuffer;   // main thread only (TryGetOrLoad)
+        // 1.2.390: zones whose file was read and is not usable now (ReadCachedZoneData returned null: [Cache] KeepOtherSettings keeps a file baked under another
+        // settings fingerprint on disk, unused). Such a zone is in the disk table and never in _preloaded, so without this the pump read its file again every 2 s.
+        private static readonly ConcurrentDictionary<Vector2s, byte> s_unusable = new ConcurrentDictionary<Vector2s, byte>();
+        private static int s_unusableKey;   // the settings fingerprint the set was filled under (main thread, the pump)
+        private static byte[] s_nearBuffer;   // the near worker's read buffer, kept between its runs (one worker at a time: s_nearWorker)
+        private static readonly List<KeyValuePair<int, Vector2s>> s_nearScratch = new List<KeyValuePair<int, Vector2s>>();
+        private static readonly Comparison<KeyValuePair<int, Vector2s>> s_nearestFirst = (a, b) => a.Key.CompareTo(b.Key);
+        private static readonly Action<Vector2s, MeshBaker.BakeResult, bool> s_slimVisit = SlimVisit;
         private static long WorldCapBytes => (long)(FiresEasyBakeMeshesPlugin.CacheMaxMBPerWorld?.Value ?? 0) << 20;
         private static long AllWorldsCapBytes => (long)(FiresEasyBakeMeshesPlugin.CacheMaxMBAllWorlds?.Value ?? 0) << 20;
 
@@ -223,19 +245,129 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static string WorldFolder(long uid)
         {
             string hex = uid.ToString("x16");
-            if (FiresEasyBakeMeshesPlugin.CacheSeparateRoleFolders != null && !FiresEasyBakeMeshesPlugin.CacheSeparateRoleFolders.Value) return hex;
+            if (FiresEasyBakeMeshesPlugin.CacheSeparateRoleFolders != null && !FiresEasyBakeMeshesPlugin.CacheSeparateRoleFolders.Value) return hex + s_coldSuffix;   // 1.2.382: + the cold test suffix (null outside ebm_coldcache)
             var net = ZNet.instance;
             if (net == null) return uid == _preloadWorldUid ? _preloadFolder : null;
-            return hex + (net.IsServer() ? "_host" : "_client");
+            return hex + (net.IsServer() ? "_host" : "_client") + s_coldSuffix;   // 1.2.382: + the cold test suffix (null outside ebm_coldcache)
+        }
+
+        // 1.2.382 ([lead], Fire: off / on tests inside ONE run; TD's REBAKE is warm only: the cache files and the in-memory preload stay): the console command
+        // ebm_coldcache on | off | status. ON moves this SESSION's saved zones to the test folder "<world>_client_coldtest" (or _host_coldtest): the test folder
+        // is emptied (only a folder whose name ends in the suffix is ever deleted from), the in-memory preload and the file listing are dropped and the empty
+        // folder is preloaded, so every zone is a first visit again once the zones are rebuilt (PluginEnabled off -> on). The world's real folder is neither read
+        // nor written while it is on. OFF goes back to the real folder (its files are preloaded again: a warm arm later in the same run). The suffix is a static:
+        // it never reaches the cfg, a new launch or another world. Not a key on purpose: a saved key would run a player cold in every later session.
+        // The far cache and the prewarm lists are separate stores and stay warm in both arms.
+        internal const string ColdSuffix = "_coldtest";
+        private static string s_coldSuffix;
+        private static bool s_coldNoTrim;
+        internal static bool ColdSession => s_coldSuffix != null;
+
+        // 1.2.384 ([visual]'s review note on 1.2.382, [lead]): the cold test folder ended only when ANOTHER world's id arrived, so a logout and login to the same world in the
+        // same launch stayed cold with no line saying so. It now ends when the world closes (ZNetScene.Shutdown): the next login preloads the real folder (KickPreload sees
+        // a different folder name and re-arms). One Info line, only when it was on.
+        internal static void ColdSessionWorldClosed()
+        {
+            if (s_coldSuffix == null) return;
+            s_coldSuffix = null;
+            EasyBakeLog.Info("[Cache] ebm_coldcache ended with the world: the next login uses the world's real cache folder again");
+        }
+
+        internal static string ColdSessionStatus()
+        {
+            long uid = TryGetWorldUid();
+            string folder = uid != 0L ? WorldFolder(uid) : null;
+            return $"ebm_coldcache status: {(s_coldSuffix != null ? "ON (cold test folder)" : "off (the world's real folder)")}, folder {folder ?? "(no world yet)"}, preload {(_preloadKicked ? (_preloadFinished ? "finished" : "RUNNING") : "not started")}, {_preloaded.Count} zone(s) in memory, {s_disk.Count} file(s) listed";
+        }
+
+        // Main thread (a console command). Returns the line to show; changes nothing unless it says so.
+        internal static string SwitchColdSession(bool on)
+        {
+            long uid = TryGetWorldUid();
+            if (uid == 0L || _cacheRoot == null) return "ebm_coldcache: no world yet; nothing changed";
+            if (_preloadKicked && !_preloadFinished) return "ebm_coldcache: the cache preload is still running; nothing changed, run the command again in a second";
+            string before = s_coldSuffix;
+            s_coldSuffix = on ? ColdSuffix : null;
+            string folder = WorldFolder(uid);
+            if (folder == null) { s_coldSuffix = before; return "ebm_coldcache: this world's cache folder is not known yet; nothing changed"; }
+            int deleted = 0;
+            try
+            {
+                if (s_sliceJobs.Count > 0) { EasyBakeLog.Debug($"[Cache] {s_sliceJobs.Count} pending sliced save(s) dropped: ebm_coldcache switches the session's cache folder"); s_sliceJobs.Clear(); }   // as DeleteWorld: a job finishing later would mirror its zone into the new session's preload
+                AsyncSaves.FlushIfBusy();   // a write still queued must not land after the delete below
+                if (on)
+                {
+                    // The ONLY delete: zone files directly under a folder whose name ends in the test suffix. Anything else is refused.
+                    if (!folder.EndsWith(ColdSuffix, StringComparison.Ordinal)) { s_coldSuffix = before; return $"ebm_coldcache: REFUSED, the folder name '{folder}' does not end in {ColdSuffix}; nothing changed"; }
+                    var dir = Path.Combine(_cacheRoot, folder);
+                    if (Directory.Exists(dir))
+                        foreach (var file in Directory.GetFiles(dir, "zone_*.bin")) { File.Delete(file); deleted++; }
+                }
+            }
+            catch (Exception ex)
+            {
+                s_coldSuffix = before;
+                return $"ebm_coldcache: FAILED ({ex.GetType().Name}: {ex.Message}); nothing changed";
+            }
+            // Drop what is in memory for the folder being left and preload the folder now named (KickPreload returns at once for an unchanged folder name, so it is cleared here).
+            _preloadGeneration++;
+            _preloadFinished = true;
+            _preloaded.Clear();
+            s_disk.Clear(); s_unusable.Clear(); Interlocked.Exchange(ref s_diskBytes, 0L);
+            _preloadFolder = null;
+            s_coldNoTrim = true;   // [visual]: TrimOtherWorlds treats every folder but the current one as another world; with the test folder current, this world's REAL folder would be an eviction candidate
+            try { KickPreload(uid); } finally { s_coldNoTrim = false; }
+            string line = on
+                ? $"[Cache] ebm_coldcache on: this session's saved zones now live in {folder} ({deleted} old test file(s) removed, so it starts empty); the world's real folder is untouched and not read; far / prewarm caches stay warm. Rebuild the zones (PluginEnabled off -> on) for a cold first visit"
+                : $"[Cache] ebm_coldcache off: back to the world's real folder {folder} (its saved zones are preloaded again); rebuild the zones (PluginEnabled off -> on) for a warm visit";
+            EasyBakeLog.Info(line);
+            return line;
         }
         private static int s_nearWorker, s_evicted, s_worldsEvicted, s_badFiles;
         private static int s_hits, s_missNoFile, s_missPrint, s_missOffset, s_missOther;
+        private static int s_missSettings, s_missSettingsKept, s_missMaterial; private static string s_firstPrint, s_firstMaterial;   // 1.2.319: + the first missing material, fully named (DescribeMissingMaterial); 1.2.317 [Cache] summary: the reason split + the first changed prefab
         private static float s_nextEvict, s_nextNearPump;
         private static bool s_saidPrint, s_saidOffset, s_saidCaps, s_saidKeepOther, s_saidNearOnly;
+        // 1.2.338 (lead 11-12, after the DamageableLowCountGroups gate ran on cached bakes): ONE Info line at the first cache decision of the session,
+        // so a leg log says which fingerprint this launch bakes under and whether the first zone read was reused or rebuilt. Keep KeyCount equal to
+        // the number of terms folded in CurrentBakeSettingsKey (ModdedPrefabGate.SettingsKey and the never-baked string count one each; a new bake-content key = +1 here and a term there, in the same build).
+        private const int BakeSettingsKeyCount = 15;
+        private static int s_saidFingerprint;   // Interlocked: the preload worker (ReadCachedZoneData) and the main thread can both get here first
+        private static void SayFingerprint(Vector2s coord, string outcome)
+        {
+            if (System.Threading.Interlocked.Exchange(ref s_saidFingerprint, 1) != 0) return;
+            EasyBakeLog.Info($"[Cache] bake cache: fingerprint {CurrentBakeSettingsKey()} ({BakeSettingsKeyCount} keys); first zone ({coord.x},{coord.y}): {outcome}");
+        }
 
         internal static int StatTotal => s_hits + s_missNoFile + s_missPrint + s_missOffset + s_missOther + Volatile.Read(ref s_evicted) + Volatile.Read(ref s_badFiles);
 
-        internal static void NoteNoFile() => s_missNoFile++;
+        private static int s_missKeptZone, p_keptZone;   // 1.2.392: zones created while their file is a read, not usable one (kept other-settings file)
+        internal static void NoteNoFile(Vector2s coord) { s_missNoFile++; if (s_unusable.ContainsKey(coord)) s_missKeptZone++; }   // 1.2.392: the total stays in s_missNoFile (StatTotal, CacheSummary unchanged); the kept-file share was taken from the file READ count before
+
+        // 1.2.317 ([lead] 11-11, Fire's hand-over rebaked the whole town on every arrival with no line to say why): ONE Info line, at most every 30 s and
+        // only when something happened, with counters only (no per-zone lines): zones baked fresh by reason, attached from cache, zone files written,
+        // pieces given back / re-adopted around unloads, and host skips next to the deletions the guard blocked. Called from the plugin's LateUpdate.
+        private static float s_sumNext;
+        private static int p_hits, p_noFile, p_print, p_offset, p_other, p_settings, p_settingsKept, p_material, p_saves, p_given, p_readopt, p_hostSkips, p_blocked;
+        internal static void SummaryTick()
+        {
+            float now = Time.unscaledTime;
+            if (now < s_sumNext) return;
+            s_sumNext = now + 30f;
+            int hits = s_hits - p_hits, settings = (s_missSettings - p_settings) + (s_missKeptZone - p_keptZone), material = s_missMaterial - p_material, print = s_missPrint - p_print;   // 1.2.392: zones created over a kept file, not file reads
+            int noFile = Math.Max(0, (s_missNoFile - p_noFile) - (s_missKeptZone - p_keptZone));   // 1.2.392: minus the zones created over a kept file (was: minus the file reads)
+            int keptReads = s_missSettingsKept - p_settingsKept;   // 1.2.392: reads of kept other-settings files (preload / near pump / on demand), whether or not the zone is ever built
+            int other = Math.Max(0, (s_missOther - p_other) - (s_missSettings - p_settings) - material) + (s_missOffset - p_offset);
+            int saves = ZoneTracker.SavesTotal - p_saves, given = ZoneTracker.UnloadGivenBack - p_given, readopt = ZoneTracker.UnloadReadopted - p_readopt;
+            int hostSkips = ZoneTracker.HostSkipsTotal - p_hostSkips, blocked = FiresEasyBakeMeshes.Patches.ZDOMan_DestroyZDO_SkipGuard_Patch.BlockedDeletions - p_blocked;
+            int fresh = settings + print + material + noFile + other;
+            p_hits = s_hits; p_noFile = s_missNoFile; p_print = s_missPrint; p_offset = s_missOffset; p_other = s_missOther; p_settings = s_missSettings; p_settingsKept = s_missSettingsKept; p_material = s_missMaterial; p_keptZone = s_missKeptZone;
+            p_saves = ZoneTracker.SavesTotal; p_given = ZoneTracker.UnloadGivenBack; p_readopt = ZoneTracker.UnloadReadopted; p_hostSkips = ZoneTracker.HostSkipsTotal; p_blocked = FiresEasyBakeMeshes.Patches.ZDOMan_DestroyZDO_SkipGuard_Patch.BlockedDeletions;
+            if (fresh + hits + saves + given + readopt + hostSkips + blocked + keptReads == 0) return;
+            // 1.2.363 ([visual] read of 1.2.362: "EBM LateUpdate: CacheSummary" ~50 ms every 30 s; every value read here is a plain field): build vs log write, markers only
+            string sumLine; using (SummaryMarkers.BuildLine.Auto()) sumLine = ($"[Cache] last 30 s: zones baked fresh {fresh} (rejected: settings {settings} / changed prefab {print}{(print > 0 && s_firstPrint != null ? $" (first '{s_firstPrint}')" : "")} / missing material {material}{(material > 0 && s_firstMaterial != null ? $" (first {s_firstMaterial})" : "")} / no cache file {noFile} / other {other}); material matched by identity after a runtime change (1.2.320) {s_idFallbacks} so far{(s_firstIdFallback != null ? $" (first {s_firstIdFallback})" : "")}; prefabs with no materials yet (a stub; asked again later) {s_emptyPrefabs} so far; "
+                + $"attached from cache {hits}; old-settings files read and skipped {keptReads} (kept on disk, no rebake by itself); zone files written {saves}; pieces given back at unload {given}, re-adopted at reload {readopt}; host skips {hostSkips} (1.2.318: kept from the game's delete by the create-loop gate), deletions blocked by the guard {blocked}"); using (SummaryMarkers.LogWrite.Auto()) EasyBakeLog.InfoFirst("Cache 30 s", sumLine);   // 1.2.364: first Info, then Debug (repeating)
+        }
 
         internal static string CacheSummary()
         {
@@ -311,7 +443,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
-        private static int[] ZonePrints(MeshBaker.BakeResult bake)
+        internal static int[] ZonePrints(MeshBaker.BakeResult bake)   // 1.2.374: internal for the ZDO-built file
         {
             s_printSeen.Clear();
             if (bake.ContributorIdentities != null) foreach (var id in bake.ContributorIdentities) s_printSeen.Add(id.PrefabHash);
@@ -342,6 +474,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void NoteDisk(Vector2s coord, long bytes)
         {
             long now = DateTime.UtcNow.Ticks;
+            s_unusable.TryRemove(coord, out _);   // 1.2.390: a save replaces the file
             var entry = s_disk.GetOrAdd(coord, _ => new DiskEntry());
             Interlocked.Add(ref s_diskBytes, bytes - Interlocked.Exchange(ref entry.Bytes, bytes));
             entry.LastUse = now; entry.Stamped = now;
@@ -349,6 +482,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void NoteGone(Vector2s coord)
         {
+            s_unusable.TryRemove(coord, out _);   // 1.2.390
             if (s_disk.TryRemove(coord, out var entry)) Interlocked.Add(ref s_diskBytes, -Interlocked.Read(ref entry.Bytes));
         }
 
@@ -381,8 +515,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (path == null) continue;
                 freed += Interlocked.Read(ref entries[i].Value.Bytes);
                 s_touched.TryAdd(entries[i].Key, 0);
+                NoteGone(entries[i].Key);   // 1.2.389: the disk row first (LoadOne afterPreload)
                 _preloaded.TryRemove(entries[i].Key, out _);
-                NoteGone(entries[i].Key);
                 AsyncSaves.Queue(path, null);
                 removed++;
             }
@@ -445,20 +579,52 @@ namespace FiresEasyBakeMeshes.EasyBake
         // (a teleport) may miss its cache that visit and be built from live pieces: the visible cost of the key.
         internal static void PumpNearOnly(Vector2s center)
         {
-            if (!PreloadNearOnlyOn || !_preloadFinished || Time.unscaledTime < s_nextNearPump) return;
+            if (!_preloadFinished) return;
+            bool slim = SlimOn;
+            if (!slim && !PreloadNearOnlyOn)
+            {
+                if (!s_heldNear) return;
+                // 1.2.389: the key went off while playing. Every saved zone that is not in memory is read again, so the session is back to holding the whole world.
+                s_heldNear = false;
+                int asked = 0;
+                foreach (var kv in s_disk)
+                    if (!_preloaded.ContainsKey(kv.Key) && !s_unusable.ContainsKey(kv.Key) && s_nearLoading.TryAdd(kv.Key, 0)) { s_nearQueue.Enqueue(kv.Key); asked++; }
+                EasyBakeLog.Info($"[Cache] PreloadSlim / PreloadNearOnly off: {asked} saved zone(s) of this world are read back into memory");
+                StartNearWorker();
+                return;
+            }
+            s_heldNear = true;
+            if (center.x != s_nearCenter.x || center.y != s_nearCenter.y) { s_nearCenter = center; s_nextNearPump = 0f; }   // 1.2.389: at once when the player's zone changes (a teleport), not up to 2 s later
+            if (Time.unscaledTime < s_nextNearPump) return;
             s_nextNearPump = Time.unscaledTime + 2f;
+            int fingerprint = CurrentBakeSettingsKey();
+            if (fingerprint != s_unusableKey) { s_unusableKey = fingerprint; s_unusable.Clear(); }   // 1.2.390
+            if (slim)
+            {
+                if (!s_saidSlim) { s_saidSlim = true; EasyBakeLog.Info("[Cache] PreloadSlim on: a built zone's saved copy leaves memory once its file holds the same bake, zones not built are held near you only, and a zone asked for sooner is read from its file right then"); }
+                ZoneTracker.ForEachBakedZone(s_slimVisit);
+            }
+            s_nearScratch.Clear();
             foreach (var kv in s_disk)
             {
                 var d = EbmZones.Delta(center, kv.Key);
-                if (Mathf.Abs(d.x) <= NearOnlyRadiusZones && Mathf.Abs(d.y) <= NearOnlyRadiusZones && !_preloaded.ContainsKey(kv.Key) && s_nearLoading.TryAdd(kv.Key, 0))
-                    s_nearQueue.Enqueue(kv.Key);
+                int far = Mathf.Max(Mathf.Abs(d.x), Mathf.Abs(d.y));
+                if (far <= NearOnlyRadiusZones && !_preloaded.ContainsKey(kv.Key) && !s_unusable.ContainsKey(kv.Key) && !(slim && ZoneTracker.IsTracked(kv.Key)) && s_nearLoading.TryAdd(kv.Key, 0))
+                    s_nearScratch.Add(new KeyValuePair<int, Vector2s>(far, kv.Key));
             }
+            if (s_nearScratch.Count > 1) s_nearScratch.Sort(s_nearestFirst);   // 1.2.389: nearest first
+            for (int i = 0; i < s_nearScratch.Count; i++) s_nearQueue.Enqueue(s_nearScratch[i].Value);
             int release = NearOnlyRadiusZones + NearOnlyReleaseExtra;
             foreach (var kv in _preloaded)
             {
                 var d = EbmZones.Delta(center, kv.Key);
                 if ((Mathf.Abs(d.x) > release || Mathf.Abs(d.y) > release) && s_disk.ContainsKey(kv.Key)) _preloaded.TryRemove(kv.Key, out _);
             }
+            StartNearWorker();
+        }
+
+        private static void StartNearWorker()
+        {
             if (!s_nearQueue.IsEmpty && Interlocked.CompareExchange(ref s_nearWorker, 1, 0) == 0)
             {
                 long uid = _preloadWorldUid; int generation = _preloadGeneration;
@@ -466,17 +632,34 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
+        // 1.2.389 [Cache] PreloadSlim, main thread, every pump: a tracked, baked zone needs its preload copy only for its next save, and Save already reads a zone's
+        // own file when the arrays are not held (DiskBatch, the [Cache] ReleaseBakedCpuCopies path). Dropped under the same conditions as that key frees the mesh
+        // copies: not stale (the file holds this bake), a file on disk, saved SlimIdleSeconds ago or not in this session, no sliced save still reading it.
+        private static void SlimVisit(Vector2s coord, MeshBaker.BakeResult bake, bool stale)
+        {
+            if (stale || !s_disk.ContainsKey(coord) || SavedAgo(coord) < SlimIdleSeconds || SavePending(coord)) return;
+            if (_preloaded.TryRemove(coord, out var gone)) { s_slimDropped++; s_slimDroppedBytes += ZoneDataBytes(gone); }
+        }
+
+        /// <summary>1.2.389: for the [Heap] census line.</summary>
+        internal static string SlimSummary()
+        {
+            double ms = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            return $"preload hold: {(SlimOn ? "slim" : PreloadNearOnlyOn ? "near only" : "whole world")}, {_preloaded.Count} of {s_disk.Count} saved zone(s) in memory, {s_unusable.Count} file(s) not usable under these settings; slim dropped {s_slimDropped} built zone(s) ({s_slimDroppedBytes >> 20} MB), read on demand {s_slimSyncLoads} ({s_slimSyncTicks * ms:0.0} ms)";
+        }
+
         private static void NearWorker(long worldUid, int generation)
         {
             try
             {
-                byte[] buffer = null; int removed = 0;
+                byte[] buffer = s_nearBuffer; int removed = 0;   // 1.2.390: the last run's buffer (was a new one per run)
                 while (generation == _preloadGeneration && s_nearQueue.TryDequeue(out var coord))
                 {
                     var path = Path.Combine(_cacheRoot, _preloadFolder, $"zone_{coord.x}_{coord.y}.bin");   // never ZNet here: the folder was fixed on the main thread
-                    LoadOne(path, worldUid, coord, generation, ref buffer, ref removed);
+                    LoadOne(path, worldUid, coord, generation, ref buffer, ref removed, true);   // 1.2.389: after the preload, the disk table decides (see LoadOne)
                     s_nearLoading.TryRemove(coord, out _);
                 }
+                s_nearBuffer = buffer != null && buffer.Length <= KeepSaveBufferBytes ? buffer : null;
             }
             catch (Exception ex) { EasyBakeLog.Warn($"[Cache] near-only preload stopped: {ex.GetType().Name}: {ex.Message}"); }
             finally { Interlocked.Exchange(ref s_nearWorker, 0); }
@@ -618,23 +801,53 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static Material FindMaterial(string name)
         {
             if (string.IsNullOrEmpty(name)) return null;
-            _materialsByName.TryGetValue(name, out var mat);
-            return mat;
+            if (_materialsByName.TryGetValue(name, out var mat)) return mat;
+            // 1.2.320 ([lead] 11-11: the cache key must not fail on what other mods change at runtime): the exact key (name / shader / main texture /
+            // look) missed. Another mod may have swapped the shader in place (FTS FiresPiece, FiresPieceShaderLoader.cs:194) or tuned a colour / gloss,
+            // which changes the key but not the look's identity. Fall back to the IDENTITY part only, name + main texture, and draw with that live
+            // material (the registry holds the prefab's own shared material, as it is NOW). Only when exactly ONE live material has that name + texture:
+            // VA bundles carry several materials of one name (1.2.168), so an ambiguous identity still misses and the zone bakes fresh as before.
+            string id = IdentityOfKey(name);
+            if (id != null && _materialsById.TryGetValue(id, out mat) && mat != null && !_ambiguousIds.Contains(id)) { s_idFallbacks++; if (s_firstIdFallback == null) s_firstIdFallback = name.Replace(MaterialKeySeparator, '/') + " -> live '" + MaterialKey(mat).Replace(MaterialKeySeparator, '/') + "'"; return mat; }
+            return null;
         }
 
-        private static void IndexRendererMaterials(GameObject root)
+        // 1.2.320: name + main texture, the identity a runtime shader / colour swap leaves alone
+        private static readonly Dictionary<string, Material> _materialsById = new Dictionary<string, Material>();
+        private static readonly HashSet<string> _ambiguousIds = new HashSet<string>();
+        internal static int s_idFallbacks; internal static string s_firstIdFallback;
+        private static string IdentityOf(Material mat)
         {
+            Texture main = mat.HasProperty("_MainTex") ? mat.GetTexture("_MainTex") : null;
+            return StripInstance(mat.name) + MaterialKeySeparator + (main != null ? main.name : "");
+        }
+        private static string IdentityOfKey(string key)
+        {
+            var parts = key.Split(MaterialKeySeparator);
+            return parts.Length >= 3 ? StripInstance(parts[0]) + MaterialKeySeparator + parts[2] : null;   // key = name / shader / main texture / look
+        }
+        private static string StripInstance(string n) => n != null && n.EndsWith(" (Instance)", StringComparison.Ordinal) ? n.Substring(0, n.Length - 11) : n;
+
+        // 1.2.321: returns how many non-null materials it saw (0 = a renderer-less stub; the caller does not mark it indexed)
+        internal static int s_emptyPrefabs;
+        private static int IndexRendererMaterials(GameObject root)
+        {
+            int seen = 0;
             var renderers = root.GetComponentsInChildren<MeshRenderer>(includeInactive: true);
             for (int r = 0; r < renderers.Length; r++)
             {
                 var mats = renderers[r].sharedMaterials;
                 for (int m = 0; m < mats.Length; m++)
-                    RegisterMaterial(mats[m]);
+                    if (mats[m] != null) { RegisterMaterial(mats[m]); seen++; }
             }
             // 1.2.88: a bake records the shared variation material a MaterialVariation(World) copy came from; register those too.
             foreach (var mat in MaterialVariants.VariationMaterials(root))
-                RegisterMaterial(mat);
+                if (mat != null) { RegisterMaterial(mat); seen++; }
+            return seen;
         }
+
+        // 1.2.374 ([visual]): ZdoCombine names a batch's material from the prefab ASSET (no live batch exists); registered so FindMaterial resolves it.
+        internal static void RegisterAssetMaterial(Material mat) => RegisterMaterial(mat);
 
         private static void RegisterMaterial(Material mat)
         {
@@ -642,6 +855,10 @@ namespace FiresEasyBakeMeshes.EasyBake
             string key = MaterialKey(mat);
             if (!_materialsByName.ContainsKey(key))
                 _materialsByName[key] = mat;
+            // 1.2.320: the identity index; two DIFFERENT materials with one identity make it ambiguous (never used for a fallback)
+            string id = IdentityOf(mat);
+            if (_materialsById.TryGetValue(id, out var had)) { if (!ReferenceEquals(had, mat)) _ambiguousIds.Add(id); }
+            else _materialsById[id] = mat;
         }
 
         // 1.2.85 ([ghost]: bundle material names collide across mods - "Wood", "Material", "default" - and a FAP mock slot
@@ -679,9 +896,12 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (_indexedPrefabs.Contains(identity.PrefabHash)) continue;
                 var prefab = FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(identity.PrefabHash);
                 if (prefab == null) continue;
-                _indexedPrefabs.Add(identity.PrefabHash);
                 SnowFeed.SwapPrefabMaterials(prefab);   // 1.2.164: a cached batch's key names the shader, so swap before indexing
-                IndexRendererMaterials(prefab);
+                // 1.2.321 ([saddles] / [generator] MATERIALS_FAP item F): a prefab that yields NO materials is not marked indexed. FAP's lazy bundles hand back
+                // a renderer-less STUB while a realize fails (VALazyBundles.cs:256-261, "[LazyBundles] ... the stub stays"); marking it indexed then made every
+                // zone holding it reject "missing material" for the whole session. Unmarked, the next zone check asks GetPrefab again and indexes the real one.
+                if (IndexRendererMaterials(prefab) > 0) _indexedPrefabs.Add(identity.PrefabHash);
+                else s_emptyPrefabs++;
             }
         }
 
@@ -693,6 +913,30 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             var prefab = ZNetScene.instance != null ? FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(key.PrefabHash) : null;
             EasyBakeLog.Debug($"[Cache] Zone ({coord.x},{coord.y}): instanced prefab '{(prefab != null ? prefab.name : "not in ZNetScene")}' ({key.PrefabHash}, {key.Look}) no longer resolves ({InstanceDefinitionCache.WhyNot(key)}); discarding cache so the zone rebakes (expected once after a mod changes that prefab; the new cache leaves it out).");
+        }
+
+        // 1.2.319 ([lead] 11-11 hand-over: 34 of 36 fresh bakes "missing material" with Core + FAP + FTS): names the first miss fully, so the log shows
+        // WHAT differs. The cached key is name/shader/main texture/look; the same-named material on a contributor prefab is looked up live and its key
+        // printed beside it: the shader part differing = a shader swap (FTS FiresPiece), the texture part = a lazy / swapped bundle (FAP), the look part =
+        // a colour / gloss change, and no prefab carrying the name = the prefab's materials were replaced outright. Once per session (the first miss).
+        private static string DescribeMissingMaterial(CachedZoneData data, string cachedKey)
+        {
+            try
+            {
+                string name = cachedKey; int cut = name.IndexOf('/'); if (cut >= 0) name = name.Substring(0, cut);
+                if (data.ContributorIdentities != null && ZNetScene.instance != null)
+                    foreach (var id in data.ContributorIdentities)
+                    {
+                        var prefab = FiresEasyBakeMeshes.EasyBake.SafePrefab.Get(id.PrefabHash);
+                        if (prefab == null) continue;
+                        foreach (var r in prefab.GetComponentsInChildren<MeshRenderer>(true))
+                            foreach (var m in r.sharedMaterials)
+                                if (m != null && m.name == name)
+                                    return $"'{cachedKey}' on '{prefab.name}', live key '{MaterialKey(m).Replace(MaterialKeySeparator, '/')}', zone ({data.Coord.x},{data.Coord.y})";
+                    }
+                return $"'{cachedKey}', zone ({data.Coord.x},{data.Coord.y}); no contributor prefab carries a material named '{name}' now";
+            }
+            catch (System.Exception e) { return $"'{cachedKey}' (prefab lookup threw: {e.Message})"; }
         }
 
         private static string FirstMissingMaterial(List<CachedBatchData> batches)
@@ -734,6 +978,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static void KickPreload(long worldUid)
         {
             if (worldUid == 0L || _cacheRoot == null) return;
+            if (s_coldSuffix != null && _preloadWorldUid != 0L && worldUid != _preloadWorldUid) s_coldSuffix = null;   // 1.2.382: another world never inherits ebm_coldcache
             string folder = WorldFolder(worldUid);
             if (folder == null) return;
             if (_preloadKicked && worldUid == _preloadWorldUid && folder == _preloadFolder) return;
@@ -748,12 +993,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             _preloadWorldUid = worldUid;
             _preloadFolder = folder;
             if (!s_saidFolder) { s_saidFolder = true; EasyBakeLog.Info($"[Cache] saved zones for this session are in folder {folder}"); }
-            s_disk.Clear(); Interlocked.Exchange(ref s_diskBytes, 0L); s_touched.Clear(); s_nearLoading.Clear();
+            s_disk.Clear(); s_unusable.Clear(); Interlocked.Exchange(ref s_diskBytes, 0L); s_touched.Clear(); s_nearLoading.Clear();
             while (s_nearQueue.TryDequeue(out _)) { }
 
             var dir = Path.Combine(_cacheRoot, folder);
             try { if (Directory.Exists(dir)) Directory.SetLastWriteTimeUtc(dir, DateTime.UtcNow); } catch { }   // the all-worlds LRU stamp
-            Task.Run(() => TrimOtherWorlds(folder));
+            if (!s_coldNoTrim && s_coldSuffix == null) Task.Run(() => TrimOtherWorlds(folder));   // 1.2.382: never while ebm_coldcache switches or is on (the real folder must not be evicted as another world)
             if (!Directory.Exists(dir))
             {
                 _preloadFinished = true;
@@ -785,8 +1030,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 Array.Sort(files, (x, y) => y.LastWriteTimeUtc.CompareTo(x.LastWriteTimeUtc));
                 long cap = WorldCapBytes, kept = 0;
                 byte[] buffer = null;
-                bool nearOnly = PreloadNearOnlyOn;
-                if (nearOnly && !s_saidNearOnly) { s_saidNearOnly = true; EasyBakeLog.Info("[Cache] PreloadNearOnly on: only zones near you are held in memory; a far zone reached quickly may rebuild from its live pieces that visit"); }
+                bool nearOnly = PreloadNearOnlyOn || SlimOn;   // 1.2.389: PreloadSlim lists the files and reads none here, as PreloadNearOnly
+                if (nearOnly) s_heldNear = true;
+                if (PreloadNearOnlyOn && !s_saidNearOnly) { s_saidNearOnly = true; EasyBakeLog.Info("[Cache] PreloadNearOnly on: only zones near you are held in memory; a far zone reached quickly may rebuild from its live pieces that visit"); }
                 for (int i = 0; i < files.Length; i++)
                 {
                     if (generation != _preloadGeneration) return;
@@ -830,7 +1076,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         // Worker threads only: one zone file, read whole (the buffer is reused for the whole pass), checked, parsed and published. No Unity API.
-        private static void LoadOne(string file, long worldUid, Vector2s coord, int generation, ref byte[] buffer, ref int unreadableRemoved)
+        // 1.2.389 afterPreload (the near worker, TryGetOrLoad): s_touched only guards the world-load pass (a zone saved in its first seconds stayed "touched" for the
+        // session and could never be read again). After that pass a read is published only while the disk table still lists the zone, so a deleted or evicted
+        // zone's old file cannot come back; a zone saved meanwhile is already in memory (TryAdd then loses).
+        private static void LoadOne(string file, long worldUid, Vector2s coord, int generation, ref byte[] buffer, ref int unreadableRemoved, bool afterPreload = false)
         {
             try
             {
@@ -848,13 +1097,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 using (var br = new BinaryReader(ms))
                 {
                     var data = ReadCachedZoneData(br, worldUid, coord, buffer, length);
-                    if (data == null) { _preloadZonesFailed++; return; }
-                    if (generation != _preloadGeneration || s_touched.ContainsKey(coord)) return;
+                    if (data == null) { _preloadZonesFailed++; if (!_preloaded.ContainsKey(coord)) s_unusable.TryAdd(coord, 0); return; }   // 1.2.390: not asked again until its file changes; never a zone saved meanwhile (a late read of the old file, [visual])
+                    if (generation != _preloadGeneration || (afterPreload ? !s_disk.ContainsKey(coord) : s_touched.ContainsKey(coord))) return;
                     if (_preloaded.TryAdd(coord, data))
                     {
                         _preloadZonesLoaded++;
                         // A Delete between the test above and the add must still win; remove only this entry, so a newer Save stays.
-                        if (s_touched.ContainsKey(coord)) ((ICollection<KeyValuePair<Vector2s, CachedZoneData>>)_preloaded).Remove(new KeyValuePair<Vector2s, CachedZoneData>(coord, data));
+                        if (afterPreload ? !s_disk.ContainsKey(coord) : s_touched.ContainsKey(coord)) ((ICollection<KeyValuePair<Vector2s, CachedZoneData>>)_preloaded).Remove(new KeyValuePair<Vector2s, CachedZoneData>(coord, data));
                     }
                 }
             }
@@ -894,6 +1143,26 @@ namespace FiresEasyBakeMeshes.EasyBake
             return _preloaded.TryGetValue(coord, out data);
         }
 
+        // 1.2.389 [Cache] PreloadSlim: "this zone has a saved bake" without holding it. Key off = exactly TryGetPreloaded(coord, out _). A dictionary lookup either way.
+        internal static bool HasSavedBake(Vector2s coord)
+        {
+            return _preloaded.ContainsKey(coord) || (SlimOn && _preloadFinished && s_disk.ContainsKey(coord) && !s_unusable.ContainsKey(coord));
+        }
+
+        // 1.2.389 [Cache] PreloadSlim, main thread: the zone is being built now. In memory = as TryGetPreloaded. Not in memory but on disk (the pump has not reached it
+        // yet: a teleport) = its file is read here, a few ms, instead of baking the zone from its live pieces. Key off = exactly TryGetPreloaded.
+        internal static bool TryGetOrLoad(Vector2s coord, out CachedZoneData data)
+        {
+            if (_preloaded.TryGetValue(coord, out data)) return true;
+            if (!SlimOn || !_preloadFinished || _cacheRoot == null || _preloadFolder == null || !s_disk.ContainsKey(coord) || s_unusable.ContainsKey(coord)) return false;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            int removed = 0;
+            LoadOne(Path.Combine(_cacheRoot, _preloadFolder, $"zone_{coord.x}_{coord.y}.bin"), _preloadWorldUid, coord, _preloadGeneration, ref s_syncBuffer, ref removed, true);
+            if (s_syncBuffer != null && s_syncBuffer.Length > KeepSaveBufferBytes) s_syncBuffer = null;
+            s_slimSyncLoads++; s_slimSyncTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            return _preloaded.TryGetValue(coord, out data);
+        }
+
         // --- Construction (main thread) ----------------------------------------
 
         // Turns the intermediate arrays into a live BakeResult with real Unity
@@ -909,8 +1178,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (data.BakeSettings != CurrentBakeSettingsKey())
             {
                 _preloaded.TryRemove(data.Coord, out _);
+                SayFingerprint(data.Coord, $"rebuilt (preloaded zone was baked under fingerprint {data.BakeSettings})");
                 s_missOther++;
-                EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): baked under other settings; baking the zone fresh.");
+                s_missSettings++; EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): baked under other settings; baking the zone fresh.");
                 return null;
             }
 
@@ -922,6 +1192,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     _preloaded.TryRemove(data.Coord, out _);
                     s_missPrint++;
+                    if (s_firstPrint == null) s_firstPrint = changed;   // 1.2.317
                     if (!s_saidPrint) { s_saidPrint = true; EasyBakeLog.Info($"[Cache] RejectChangedPrefabs: a building model changed since its zone was saved (first: '{changed}'); zones using a changed model rebuild once"); }
                     EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): prefab '{changed}' changed since this zone was baked; baking the zone fresh.");
                     return null;
@@ -937,7 +1208,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 _preloaded.TryRemove(data.Coord, out _);
                 s_missOther++;
                 // Debug since 1.2.88: nothing is lost, the zone bakes fresh from its live pieces and the cache file is rewritten.
-                EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): cached material '{missing}' is not loaded; baking the zone fresh instead.");
+                if (s_firstMaterial == null) s_firstMaterial = DescribeMissingMaterial(data, missing);   // 1.2.319 ([lead]: WHICH material)
+                s_missMaterial++; EasyBakeLog.Debug($"[Cache] Zone ({data.Coord.x},{data.Coord.y}): cached material '{missing}' is not loaded; baking the zone fresh instead.");
                 return null;
             }
 
@@ -1024,6 +1296,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 s_missOther++;
                 return null;
             }
+            SayFingerprint(data.Coord, "reused");
             s_hits++;
             NoteUsed(data.Coord);
             return result;
@@ -1033,47 +1306,182 @@ namespace FiresEasyBakeMeshes.EasyBake
             List<MeshBaker.BatchInstance> into, bool farTier)
         {
             if (cached == null) return;
-            for (int i = 0; i < cached.Count; i++)
+            for (int i = 0; i < cached.Count; i++) BuildLiveBatch(data.Coord, cached[i], parent, into, farTier);   // 1.2.374: the loop body moved to BuildLiveBatch, unchanged
+        }
+
+        // 1.2.374 ([visual], [lead]: the file-parity check for the ZDO full bake). Compares a LIVE bake's combined batches of one tier with the batches
+        // ZdoCombine built for the same zone, matched by material key + renderer flags: same batches, same vertex and index counts. Main thread (it reads
+        // the live renderers). Returns true when they are equal; `report` always says what was compared (for the verifier's line).
+        internal static bool BatchParity(List<MeshBaker.BatchInstance> live, List<CachedBatchData> built, out string report)
+        {
+            var liveBy = new Dictionary<string, long[]>();   // key -> { vertices, indices, batches }
+            if (live != null)
+                for (int i = 0; i < live.Count; i++)
+                {
+                    var mesh = live[i].Mesh;
+                    var mr = live[i].Combined != null ? live[i].Combined.GetComponent<MeshRenderer>() : null;
+                    if (mesh == null || mr == null) continue;
+                    string key = MaterialKey(mr.sharedMaterial) + "|" + (int)mr.shadowCastingMode + (mr.receiveShadows ? "r" : "-") + (int)mr.lightProbeUsage + (int)mr.reflectionProbeUsage + (int)mr.motionVectorGenerationMode;
+                    if (!liveBy.TryGetValue(key, out var a)) liveBy[key] = a = new long[3];
+                    a[0] += mesh.vertexCount; a[1] += (long)mesh.GetIndexCount(0); a[2]++;
+                }
+            var builtBy = new Dictionary<string, long[]>();
+            if (built != null)
+                for (int i = 0; i < built.Count; i++)
+                {
+                    var b = built[i];
+                    if (b == null || b.Vertices == null) continue;
+                    string key = b.MaterialName + "|" + (int)b.ShadowCastingMode + (b.ReceiveShadows != 0 ? "r" : "-") + (int)b.LightProbeUsage + (int)b.ReflectionProbeUsage + (int)b.MotionVectorMode;
+                    if (!builtBy.TryGetValue(key, out var a)) builtBy[key] = a = new long[3];
+                    a[0] += b.Vertices.Length; a[1] += b.Indices != null ? b.Indices.Length : 0; a[2]++;
+                }
+            int same = 0, countDiffer = 0, onlyLive = 0, onlyBuilt = 0;
+            long liveVertices = 0, builtVertices = 0;
+            var sb = new System.Text.StringBuilder();
+            foreach (var kv in liveBy)
             {
-                var b = cached[i];
-                var mat = FindMaterial(b.MaterialName);
-                if (mat == null) continue;
-
-                string batchName = b.MaterialName.Split(MaterialKeySeparator)[0] + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
-                var mesh = new Mesh { name = $"EasyBakeCached_{data.Coord.x}_{data.Coord.y}_{batchName}" };
-                if (b.IndexFormatUInt32 || (b.Vertices != null && b.Vertices.Length > 65535)) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;   // 1.2.234: never 16-bit over 65,535 vertices, whatever the cache file says
-                EbmTrace.Step("cache mesh build", mesh.GetInstanceID(), "zone " + data.Coord.x + "," + data.Coord.y + " " + batchName + " verts " + (b.Vertices != null ? b.Vertices.Length : 0));
-                mesh.SetVertices(b.Vertices);
-                if (b.Normals  != null) mesh.SetNormals(b.Normals);
-                if (b.Tangents != null) mesh.SetTangents(b.Tangents);
-                if (b.Uvs      != null) mesh.SetUVs(0, b.Uvs);
-                mesh.SetIndices(b.Indices, MeshTopology.Triangles, 0);
-                mesh.RecalculateBounds();
-
-                var go = new GameObject($"Batch_{batchName}");
-                go.transform.parent = parent.transform;
-                go.transform.position = Vector3.zero;
-                go.isStatic = true;
-                var mf = go.AddComponent<MeshFilter>();
-                mf.sharedMesh = mesh;
-                var mr = go.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = mat;
-                mr.shadowCastingMode      = (UnityEngine.Rendering.ShadowCastingMode)b.ShadowCastingMode;
-                mr.receiveShadows         = b.ReceiveShadows != 0;
-                mr.lightProbeUsage        = (UnityEngine.Rendering.LightProbeUsage)b.LightProbeUsage;
-                mr.reflectionProbeUsage   = (UnityEngine.Rendering.ReflectionProbeUsage)b.ReflectionProbeUsage;
-                mr.motionVectorGenerationMode = (MotionVectorGenerationMode)b.MotionVectorMode;
-                if (!EbmMeshCheck.Sane(mesh, "cache rebuild " + data.Coord.x + "," + data.Coord.y)) mr.forceRenderingOff = true;   // 1.2.234
-                if (farTier) go.SetActive(false);
-
-                b.SourceMeshId = mesh.GetInstanceID();   // 1.2.253: this mesh was built from these arrays
-                into.Add(new MeshBaker.BatchInstance { Combined = go, Mesh = mesh });
+                liveVertices += kv.Value[0];
+                string name = kv.Key.Split(MaterialKeySeparator)[0];
+                if (!builtBy.TryGetValue(kv.Key, out var b)) { onlyLive++; if (onlyLive + onlyBuilt + countDiffer <= 6) sb.Append($"; only live '{name}' ({kv.Value[0]} v)"); continue; }
+                if (b[0] == kv.Value[0] && b[1] == kv.Value[1]) same++;
+                else { countDiffer++; if (onlyLive + onlyBuilt + countDiffer <= 6) sb.Append($"; '{name}' live {kv.Value[0]} v / {kv.Value[1]} i vs built {b[0]} v / {b[1]} i"); }
             }
+            foreach (var kv in builtBy)
+            {
+                builtVertices += kv.Value[0];
+                if (liveBy.ContainsKey(kv.Key)) continue;
+                onlyBuilt++; if (onlyLive + onlyBuilt + countDiffer <= 6) sb.Append($"; only built '{kv.Key.Split(MaterialKeySeparator)[0]}' ({kv.Value[0]} v)");
+            }
+            bool equal = countDiffer == 0 && onlyLive == 0 && onlyBuilt == 0;
+            report = $"batches live {liveBy.Count} / built {builtBy.Count}: {same} equal, {countDiffer} differ in counts, {onlyLive} only live, {onlyBuilt} only built; vertices live {liveVertices} / built {builtVertices}{sb}";
+            return equal;
+        }
+
+        // 1.2.375 ([visual], [lead] via [seasons]): the same comparison for a zone where the live bake MERGED pieces the ZDO file leaves live (bake-safe
+        // prefabs that are not skippable). Their geometry (count x what one copy feeds each batch, read from the prefab by ZdoCombine.PartCounts) is taken
+        // off the LIVE side first, so what is left must equal the built batches. A batch on one side only is reported apart: the zone-level
+        // [Batching] MinPiecesPerBatch count is different once those pieces are out, so a batch can exist in the live bake alone (or the reverse)
+        // without the combine being wrong. True = every batch both sides have is equal and nothing was over-subtracted.
+        internal static bool BatchParity(List<MeshBaker.BatchInstance> live, List<CachedBatchData> built, List<ZdoCombine.LeftLive> leftLive, bool farTier, out string report)
+        {
+            var liveBy = new Dictionary<string, long[]>();
+            if (live != null)
+                for (int i = 0; i < live.Count; i++)
+                {
+                    var mesh = live[i].Mesh;
+                    var mr = live[i].Combined != null ? live[i].Combined.GetComponent<MeshRenderer>() : null;
+                    if (mesh == null || mr == null) continue;
+                    string key = MaterialKey(mr.sharedMaterial) + "|" + (int)mr.shadowCastingMode + (mr.receiveShadows ? "r" : "-") + (int)mr.lightProbeUsage + (int)mr.reflectionProbeUsage + (int)mr.motionVectorGenerationMode;
+                    if (!liveBy.TryGetValue(key, out var a)) liveBy[key] = a = new long[3];
+                    a[0] += mesh.vertexCount; a[1] += (long)mesh.GetIndexCount(0); a[2]++;
+                }
+            int subtractedPieces = 0, subtractedNoBatch = 0;
+            var parts = new List<KeyValuePair<string, long[]>>();
+            if (leftLive != null)
+                for (int n = 0; n < leftLive.Count; n++)
+                {
+                    parts.Clear();
+                    ZdoCombine.PartCounts(leftLive[n].PrefabHash, leftLive[n].Look, farTier, parts);
+                    subtractedPieces += leftLive[n].Count;
+                    for (int k = 0; k < parts.Count; k++)
+                    {
+                        if (!liveBy.TryGetValue(parts[k].Key, out var a)) { subtractedNoBatch++; continue; }   // the live bake has no such batch: that piece's part was not merged there
+                        a[0] -= parts[k].Value[0] * leftLive[n].Count; a[1] -= parts[k].Value[1] * leftLive[n].Count;
+                    }
+                }
+            var builtBy = new Dictionary<string, long[]>();
+            if (built != null)
+                for (int i = 0; i < built.Count; i++)
+                {
+                    var b = built[i];
+                    if (b == null || b.Vertices == null) continue;
+                    string key = b.MaterialName + "|" + (int)b.ShadowCastingMode + (b.ReceiveShadows != 0 ? "r" : "-") + (int)b.LightProbeUsage + (int)b.ReflectionProbeUsage + (int)b.MotionVectorMode;
+                    if (!builtBy.TryGetValue(key, out var a)) builtBy[key] = a = new long[3];
+                    a[0] += b.Vertices.Length; a[1] += b.Indices != null ? b.Indices.Length : 0; a[2]++;
+                }
+            int same = 0, countDiffer = 0, onlyLive = 0, onlyBuilt = 0, emptied = 0, overSubtracted = 0, said = 0;
+            var sb = new System.Text.StringBuilder();
+            foreach (var kv in liveBy)
+            {
+                string name = kv.Key.Split(MaterialKeySeparator)[0];
+                bool has = builtBy.TryGetValue(kv.Key, out var b);
+                if (kv.Value[0] < 0 || kv.Value[1] < 0) { overSubtracted++; if (said++ < 6) sb.Append($"; over-subtracted '{name}' ({kv.Value[0]} v left)"); continue; }
+                if (kv.Value[0] == 0 && !has) { emptied++; continue; }   // the batch held only left-live pieces: nothing for the ZDO file to build
+                if (!has) { onlyLive++; if (said++ < 6) sb.Append($"; only live '{name}' ({kv.Value[0]} v after subtraction)"); continue; }
+                if (b[0] == kv.Value[0] && b[1] == kv.Value[1]) same++;
+                else { countDiffer++; if (said++ < 6) sb.Append($"; '{name}' live {kv.Value[0]} v / {kv.Value[1]} i (after subtraction) vs built {b[0]} v / {b[1]} i"); }
+            }
+            foreach (var kv in builtBy)
+            {
+                if (liveBy.ContainsKey(kv.Key)) continue;
+                onlyBuilt++; if (said++ < 6) sb.Append($"; only built '{kv.Key.Split(MaterialKeySeparator)[0]}' ({kv.Value[0]} v)");
+            }
+            report = $"batches live {liveBy.Count} / built {builtBy.Count} after taking {subtractedPieces} left-live piece(s) off the live side: {same} equal, {countDiffer} differ in counts, {overSubtracted} over-subtracted; batch on one side only (the MinPiecesPerBatch count differs without those pieces): {onlyLive} only live, {onlyBuilt} only built; {emptied} live batch(es) held left-live pieces only, {subtractedNoBatch} left-live part(s) had no live batch{sb}";
+            return countDiffer == 0 && overSubtracted == 0;
+        }
+
+        // 1.2.374 ([visual] + [seasons]): ONE cached batch as a live batch object under `parent` (ConstructTier's loop body, unchanged), so a zone that
+        // gets its combined batches while it is loaded (the ZDO full bake's this-visit swap) can build them one per step. False = its material is not known.
+        internal static bool BuildLiveBatch(Vector2s coord, CachedBatchData b, GameObject parent, List<MeshBaker.BatchInstance> into, bool farTier)
+        {
+            var mat = FindMaterial(b.MaterialName);
+            if (mat == null) return false;
+
+            string batchName = b.MaterialName.Split(MaterialKeySeparator)[0] + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
+            var mesh = new Mesh { name = $"EasyBakeCached_{coord.x}_{coord.y}_{batchName}" };
+            if (b.IndexFormatUInt32 || (b.Vertices != null && b.Vertices.Length > 65535)) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;   // 1.2.234: never 16-bit over 65,535 vertices, whatever the cache file says
+            EbmTrace.Step("cache mesh build", mesh.GetInstanceID(), "zone " + coord.x + "," + coord.y + " " + batchName + " verts " + (b.Vertices != null ? b.Vertices.Length : 0));
+            mesh.SetVertices(b.Vertices);
+            if (b.Normals  != null) mesh.SetNormals(b.Normals);
+            if (b.Tangents != null) mesh.SetTangents(b.Tangents);
+            if (b.Uvs      != null) mesh.SetUVs(0, b.Uvs);
+            mesh.SetIndices(b.Indices, MeshTopology.Triangles, 0);
+            mesh.RecalculateBounds();
+
+            var go = new GameObject($"Batch_{batchName}");
+            go.transform.parent = parent.transform;
+            go.transform.position = Vector3.zero;
+            go.isStatic = true;
+            var mf = go.AddComponent<MeshFilter>();
+            mf.sharedMesh = mesh;
+            var mr = go.AddComponent<MeshRenderer>();
+            mr.sharedMaterial = mat;
+            mr.shadowCastingMode      = (UnityEngine.Rendering.ShadowCastingMode)b.ShadowCastingMode;
+            mr.receiveShadows         = b.ReceiveShadows != 0;
+            mr.lightProbeUsage        = (UnityEngine.Rendering.LightProbeUsage)b.LightProbeUsage;
+            mr.reflectionProbeUsage   = (UnityEngine.Rendering.ReflectionProbeUsage)b.ReflectionProbeUsage;
+            mr.motionVectorGenerationMode = (MotionVectorGenerationMode)b.MotionVectorMode;
+            if (!EbmMeshCheck.Sane(mesh, "cache rebuild " + coord.x + "," + coord.y)) mr.forceRenderingOff = true;   // 1.2.234
+            if (farTier) go.SetActive(false);
+
+            b.SourceMeshId = mesh.GetInstanceID();   // 1.2.253: this mesh was built from these arrays
+            into.Add(new MeshBaker.BatchInstance { Combined = go, Mesh = mesh });
+            return true;
         }
 
         // --- Save (main thread; runs after a successful Bake) ------------------
 
         // True when the bytes were written or queued; false only when this save failed (ZoneTracker retries it once).
+        // 1.2.374 ([visual] + [seasons], Fire 11-14): a zone's FULL file built from its ZDOs in the background (groups from ZoneTrackerZdoBake, combined
+        // batches from ZdoCombine), with no live BakeResult to read. The same file and the same preload copy Save makes, written by the same writer thread.
+        // The caller built `data` from a complete, settled classification of the zone and nothing edits it afterwards. False = not written (no cache folder).
+        internal static bool SaveZdoBuilt(long worldUid, Vector2s coord, CachedZoneData data)
+        {
+            if (_cacheRoot == null || worldUid == 0L || data == null) return false;
+            if ((data.Batches == null || data.Batches.Count == 0) && (data.InstanceGroups == null || data.InstanceGroups.Count == 0)) return false;
+            var path = GetZonePath(worldUid, coord);
+            if (path == null) return false;
+            if (!_preloadFinished) s_touched.TryAdd(coord, 0);   // D4, as Save
+            data.Coord = coord;
+            _preloaded[coord] = data;
+            long written = ZoneDataBytes(data);
+            AsyncSaves.QueueData(path, worldUid, data);
+            NoteDisk(coord, written);
+            s_savedAt[coord] = Time.realtimeSinceStartup;
+            EvictOverCap(worldUid);
+            return true;
+        }
+
         public static bool Save(long worldUid, Vector2s coord, MeshBaker.BakeResult bake)
         {
             if (_cacheRoot == null || worldUid == 0L) return true;
@@ -1178,6 +1586,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Dictionary<Vector2s, float> s_savedAt = new Dictionary<Vector2s, float>();   // main thread
 
         internal static bool HasDiskFile(Vector2s coord) => s_disk.ContainsKey(coord);
+        internal static bool DiskListingDone => _preloadFinished;   // 1.2.373 ([seasons]): HasDiskFile is a full answer only once the preload listing has run
         /// <summary>Seconds since this session last saved the zone; infinity when it has not (its file is from an earlier session or the preload).</summary>
         internal static float SavedAgo(Vector2s coord) => s_savedAt.TryGetValue(coord, out float t) ? Time.realtimeSinceStartup - t : float.PositiveInfinity;
 
@@ -1193,10 +1602,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var path = GetZonePath(s_saveUid, s_saveCoord);
                 if (path != null && File.Exists(path))
                 {
+                    using (EbmPatchMarkers.SaveDiskReread.Auto())   // 1.2.362: profiler marker only
+                    {
                     byte[] bytes = File.ReadAllBytes(path);
                     using (var ms = new MemoryStream(bytes, 0, bytes.Length, false))
                     using (var br = new BinaryReader(ms))
                         s_diskCopy = ReadCachedZoneData(br, s_saveUid, s_saveCoord, bytes, bytes.Length);
+                    }
                 }
                 EbmBakeMemRelease.NoteReread(sw.Elapsed.TotalMilliseconds);
             }
@@ -1215,9 +1627,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             try
             {
+                DropPendingSave(coord, "its cache file is being deleted");   // 1.2.361: a pending sliced save must never write it back
                 if (!_preloadFinished) s_touched.TryAdd(coord, 0);   // D4: before the remove, so the worker cannot bring it back
+                NoteGone(coord);   // 1.2.389: the disk row first (LoadOne afterPreload)
                 _preloaded.TryRemove(coord, out _);
-                NoteGone(coord);
                 var path = GetZonePath(worldUid, coord);
                 if (path != null && (SaveOffThreadOn || AsyncSaves.Busy)) { AsyncSaves.Queue(path, null); return; }   // 1.2.253: in order with any queued write of this zone
                 if (path != null && File.Exists(path)) File.Delete(path);
@@ -1233,10 +1646,11 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             try
             {
+                if (s_sliceJobs.Count > 0) { EasyBakeLog.Debug($"[Cache] {s_sliceJobs.Count} pending sliced save(s) dropped: the world's cache is being cleared"); s_sliceJobs.Clear(); }   // 1.2.361
                 _preloadGeneration++;
                 _preloadFinished = true;
                 _preloaded.Clear();
-                s_disk.Clear(); Interlocked.Exchange(ref s_diskBytes, 0L);
+                s_disk.Clear(); s_unusable.Clear(); Interlocked.Exchange(ref s_diskBytes, 0L);
                 if (_cacheRoot == null || worldUid == 0L) return;
                 string folder = WorldFolder(worldUid);
                 if (folder == null) return;
@@ -1256,6 +1670,190 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static bool SaveOffThreadOn => FiresEasyBakeMeshesPlugin.SaveOffThread != null && FiresEasyBakeMeshesPlugin.SaveOffThread.Value;
 
         internal static void FlushPendingSaves(int waitMs) => AsyncSaves.Flush(waitMs);
+
+        // ═══ 1.2.361 [Cache] SaveSliced ([seasons] 11-13, [lead] / Fire: "make the reads, get the fixes in") ═══════════════════════════════════════════
+        // Proof row: O town circle with 1.2.360's markers, (rig path), STALL FRAMES: "frame 250: 358.3 ms; top self: EBM bake:save
+        // zone 342.4 ms", "frame 612: 174.4 ms; ... save zone 149.6 ms", "frame 721: 118.5 ms; ... save zone 111.1 ms" (the worst EBM step: 603 ms over 3 frames;
+        // MeshBaker.Bake itself in no stall frame). With SaveOffThread + SaveSerializeOffThread on (the defaults) the file is already serialised and written on
+        // the writer thread; Save's main-thread work is ExtractBatchDataFromLive: mesh.vertices / normals / tangents / uv / GetIndices of EVERY combined mesh
+        // of the zone, near and far, in the bake frame. Here the same reads run one batch per step (ExtractOneBatch = the old loop body, same bytes, same
+        // reuse of the preload copy, same E25 disk fallback), within SaveSliceBudgetMs a frame, at least one step a frame, from the zone tracker's pumps
+        // (never inside the bake pass). The last step builds the preload copy and queues the write exactly as Save did, from one frame's consistent view.
+        // Guards: MeshBaker.Restore finishes a pending save at once before it destroys the meshes (teardown, hidden release, world exit = as before);
+        // Delete / DeleteWorld drop it (a deleted file must not come back); EbmBakeMemRelease skips a zone with a save pending. Off = Save as before.
+        private sealed class SliceJob
+        {
+            public long Uid; public Vector2s Coord; public MeshBaker.BakeResult Bake; public string Path; public Action<bool> Done;
+            public int Step; public CachedZoneData Prior; public List<CachedBatchData> Near, Far;
+            public CachedZoneData DiskCopy; public bool DiskTried;
+            public int Steps, Frames, LastFrame = -1; public double WorstMs, TotalMs; public float StartedAt;
+        }
+        private static readonly List<SliceJob> s_sliceJobs = new List<SliceJob>();
+        private static bool s_saidSliced;
+        private static int s_slicePumpFrame = -1;
+
+        private static bool SaveSlicedOn => SaveOffThreadOn && SaveSerializeOffThreadOn && FiresEasyBakeMeshesPlugin.SaveSliced != null && FiresEasyBakeMeshesPlugin.SaveSliced.Value;
+
+        internal static bool SavePending(Vector2s coord)
+        {
+            for (int i = 0; i < s_sliceJobs.Count; i++) if (s_sliceJobs[i].Coord.Equals(coord)) return true;
+            return false;
+        }
+
+        /// <summary>Starts a sliced save; false = not taken (the caller saves at once, as before). `done(ok)` runs once, when the file is queued or the save failed.</summary>
+        internal static bool TrySaveSliced(long worldUid, Vector2s coord, MeshBaker.BakeResult bake, Action<bool> done) => TrySaveSliced(worldUid, coord, bake, done, out _);
+
+        // 1.2.363 ([visual] read of the 1.2.362 circle O_20261114_005404: "EBM bake:save zone" 377.9 / 237.9 / 45.5 ms SELF again while sliced saves also ran): the reason a
+        // save was NOT taken, so SaveZone can say it (the code shows no path that should refuse with the rig's keys on; the next leg's log answers it).
+        internal static bool TrySaveSliced(long worldUid, Vector2s coord, MeshBaker.BakeResult bake, Action<bool> done, out string notWhy)
+        {
+            notWhy = !SaveSlicedOn ? $"SaveSliced needs SaveOffThread ({SaveOffThreadOn}), SaveSerializeOffThread ({SaveSerializeOffThreadOn}) and SaveSliced ({FiresEasyBakeMeshesPlugin.SaveSliced != null && FiresEasyBakeMeshesPlugin.SaveSliced.Value}) on"
+                   : _cacheRoot == null ? "no cache folder" : worldUid == 0L ? "no world uid" : bake == null ? "no bake" : !bake.HasRenderableContent ? "bake has no content" : null;
+            if (notWhy != null) return false;
+            var path = GetZonePath(worldUid, coord);
+            if (path == null) { notWhy = "no zone path for this world"; return false; }
+            for (int i = 0; i < s_sliceJobs.Count; i++)
+            {
+                var j = s_sliceJobs[i];
+                if (!j.Coord.Equals(coord)) continue;
+                if (ReferenceEquals(j.Bake, bake) && j.Uid == worldUid) { j.Done = done; return true; }   // this very bake is already being saved: one save, the latest caller told
+                s_sliceJobs.RemoveAt(i);
+                EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): a newer bake replaces its pending sliced save ({j.Steps} step(s) done); the new bake is saved instead");
+                break;
+            }
+            if (!s_saidSliced)
+            {
+                s_saidSliced = true;
+                EasyBakeLog.Info($"[Cache] SaveSliced on: a freshly baked zone's cache save reads its meshes one batch per step over the next frames, about {SliceBudgetMs():0.#} ms a frame (one save read them all at once: up to 342 ms in a single frame on the town circle); the zone draws from its bake meanwhile, only the file lands later");
+            }
+            s_sliceJobs.Add(new SliceJob { Uid = worldUid, Coord = coord, Bake = bake, Path = path, Done = done, StartedAt = Time.unscaledTime });
+            return true;
+        }
+
+        private static float SliceBudgetMs() => Mathf.Max(0.1f, (FiresEasyBakeMeshesPlugin.SaveSliceBudgetMs != null ? FiresEasyBakeMeshesPlugin.SaveSliceBudgetMs.Value : 2f) * PerformanceProfile.Budget);
+
+        /// <summary>Zone tracker pumps, once a frame: steps of the oldest pending save within the budget; at least one step a frame so a save always ends.</summary>
+        internal static void PumpSlicedSaves()
+        {
+            if (s_sliceJobs.Count == 0 || s_slicePumpFrame == Time.frameCount) return;
+            s_slicePumpFrame = Time.frameCount;
+            long budget = (long)(SliceBudgetMs() * System.Diagnostics.Stopwatch.Frequency / 1000.0), start = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool first = true;
+            while (s_sliceJobs.Count > 0 && (first || System.Diagnostics.Stopwatch.GetTimestamp() - start < budget))
+            {
+                first = false;
+                RunSliceStep(s_sliceJobs[0]);
+            }
+        }
+
+        /// <summary>MeshBaker.Restore, before it destroys a bake's meshes: a save still pending for that bake finishes now (the file it would have written, as before 1.2.361).</summary>
+        internal static void FinishPendingFor(MeshBaker.BakeResult bake)
+        {
+            if (bake == null || s_sliceJobs.Count == 0) return;
+            for (int i = 0; i < s_sliceJobs.Count; i++)
+            {
+                var job = s_sliceJobs[i];
+                if (!ReferenceEquals(job.Bake, bake)) continue;
+                EasyBakeLog.Debug($"[Cache] zone ({job.Coord.x},{job.Coord.y}): its bake is being torn down while its sliced save is pending ({job.Steps} step(s) done): the rest runs now, so the file is written as before");
+                int guard = 0;
+                while (s_sliceJobs.Contains(job) && guard++ < 100000) RunSliceStep(job);
+                return;
+            }
+        }
+
+        // Delete / DeleteWorld: a pending save of a file being removed must never write it back.
+        internal static void DropPendingSave(Vector2s coord, string why)
+        {
+            for (int i = s_sliceJobs.Count - 1; i >= 0; i--)
+            {
+                var job = s_sliceJobs[i];
+                if (!job.Coord.Equals(coord)) continue;
+                s_sliceJobs.RemoveAt(i);
+                EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): pending sliced save dropped ({why})");
+            }
+        }
+
+        private static bool BakeMeshesAlive(MeshBaker.BakeResult bake)
+        {
+            if (bake.Batches != null) for (int i = 0; i < bake.Batches.Count; i++) if (bake.Batches[i].Mesh == null) return false;
+            if (bake.FarBatches != null) for (int i = 0; i < bake.FarBatches.Count; i++) if (bake.FarBatches[i].Mesh == null) return false;
+            return true;
+        }
+
+        // One step: 0 = start (preload copy to reuse arrays from), 1..near = one near batch, then one far batch per step, last = finish (Save's tail).
+        private static void RunSliceStep(SliceJob job)
+        {
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (job.LastFrame != Time.frameCount) { job.LastFrame = Time.frameCount; job.Frames++; }
+            s_saveUid = job.Uid; s_saveCoord = job.Coord; s_saveBake = job.Bake; s_diskCopy = job.DiskCopy; s_diskTried = job.DiskTried;   // E25 disk fallback state, per job
+            bool finished = false, ok = false; string why = null;
+            try
+            {
+                var bake = job.Bake;
+                int nNear = bake.Batches != null ? bake.Batches.Count : 0, nFar = bake.FarBatches != null ? bake.FarBatches.Count : 0;
+                if (!BakeMeshesAlive(bake)) { finished = true; why = "a mesh of its bake was destroyed before the save finished (no partial file is written)"; }
+                else if (job.Step == 0)
+                {
+                    if (!_preloadFinished) s_touched.TryAdd(job.Coord, 0);   // D4, as Save
+                    _preloaded.TryGetValue(job.Coord, out job.Prior);
+                    job.Near = new List<CachedBatchData>(nNear); job.Far = new List<CachedBatchData>(nFar);
+                }
+                else if (job.Step <= nNear) { using (EbmPatchMarkers.SaveStepBatch.Auto()) ExtractOneBatch(bake.Batches, job.Step - 1, job.Prior?.Batches, job.Near); }   // 1.2.362: markers only
+                else if (job.Step <= nNear + nFar) { using (EbmPatchMarkers.SaveStepBatch.Auto()) ExtractOneBatch(bake.FarBatches, job.Step - 1 - nNear, job.Prior?.FarBatches, job.Far); }
+                else { using (EbmPatchMarkers.SaveStepFinish.Auto()) FinishSlicedSave(job); finished = true; ok = true; }
+                job.Step++;
+            }
+            catch (ReleasedMeshUnreadable ex)
+            {
+                // as Save: the file may be older than the zone now, so it goes and the zone bakes fresh next visit (nothing on screen changes)
+                finished = true; why = "released mesh unreadable";
+                s_sliceJobs.Remove(job);
+                EasyBakeLog.Warn($"[Cache] zone ({job.Coord.x},{job.Coord.y}) not saved: {ex.Message}; its cache file is removed and it bakes fresh next visit");
+                EbmBakeMemRelease.NoteRereadFailed();
+                Delete(job.Uid, job.Coord);
+            }
+            catch (Exception ex)
+            {
+                finished = true; why = ex.GetType().Name + ": " + ex.Message;
+                EasyBakeLog.Warn($"[Cache] Save failed for zone ({job.Coord.x},{job.Coord.y}) (sliced): {why}");
+            }
+            finally { job.DiskCopy = s_diskCopy; job.DiskTried = s_diskTried; s_saveBake = null; s_diskCopy = null; }
+            double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            job.Steps++; job.TotalMs += ms; if (ms > job.WorstMs) job.WorstMs = ms;
+            if (!finished) return;
+            s_sliceJobs.Remove(job);
+            if (ok) EasyBakeLog.Debug($"[Cache] zone ({job.Coord.x},{job.Coord.y}) saved sliced: {job.Steps} step(s) over {job.Frames} frame(s) in {Time.unscaledTime - job.StartedAt:0.0} s, worst step {job.WorstMs:0.0} ms, main-thread total {job.TotalMs:0.0} ms");
+            else if (why != null) EasyBakeLog.Debug($"[Cache] zone ({job.Coord.x},{job.Coord.y}) sliced save ended without a file: {why}");
+            try { job.Done?.Invoke(ok); } catch (Exception e) { EasyBakeLog.Debug("[Cache] sliced save callback threw: " + e.Message); }
+        }
+
+        // Save's tail (the SaveOffThread + SaveSerializeOffThread branch), unchanged, from the arrays the steps read. Prints, contributors and instance groups
+        // are taken here, in one frame, so the file matches the bake as it is now.
+        private static void FinishSlicedSave(SliceJob job)
+        {
+            var bake = job.Bake; var coord = job.Coord;
+            int[] prints = ZonePrints(bake);
+            RegisterLiveMaterials(bake.Batches);
+            RegisterLiveMaterials(bake.FarBatches);
+            var refreshed = new CachedZoneData
+            {
+                Coord = coord,
+                BakeSettings = CurrentBakeSettingsKey(),
+                PrefabPrints = prints,
+                ContributorIdentities = new HashSet<MeshBaker.PieceIdentity>(bake.ContributorIdentities),
+                PieceTransforms = bake.PieceTransforms != null ? new Dictionary<MeshBaker.PieceIdentity, MeshBaker.PieceTransform>(bake.PieceTransforms) : null,
+                Batches = job.Near,
+                FarBatches = job.Far,
+                InstanceGroups = ExtractInstanceGroupDataFromLive(bake.InstanceGroups),
+            };
+            _preloaded[coord] = refreshed;
+            if (!s_saidOffThread) { s_saidOffThread = true; EasyBakeLog.Info("[Cache] SaveOffThread + SaveSerializeOffThread on: zone cache files are serialised and written on a background thread and replaced atomically"); }
+            long written = ZoneDataBytes(refreshed);
+            AsyncSaves.QueueData(job.Path, job.Uid, refreshed);
+            NoteDisk(coord, written);
+            s_savedAt[coord] = Time.realtimeSinceStartup;   // E25
+            EvictOverCap(job.Uid);
+        }
         internal static int AsyncSaveCount => AsyncSaves.Saves;
 
         // Null until an off-thread save has happened.
@@ -1612,13 +2210,19 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (batches == null) return new List<CachedBatchData>();
             var list = new List<CachedBatchData>(batches.Count);
-            for (int i = 0; i < batches.Count; i++)
+            for (int i = 0; i < batches.Count; i++) ExtractOneBatch(batches, i, reuse, list);   // 1.2.361: the loop body moved to ExtractOneBatch, unchanged, so the sliced save reads the same bytes one batch per step
+            return list;
+        }
+
+        // 1.2.361: one batch of ExtractBatchDataFromLive (the old loop body, unchanged). Appends to `list`; a destroyed mesh is skipped as before.
+        private static void ExtractOneBatch(List<MeshBaker.BatchInstance> batches, int i, List<CachedBatchData> reuse, List<CachedBatchData> list)
+        {
             {
                 var batch = batches[i];
                 var mr = batch.Combined != null ? batch.Combined.GetComponent<MeshRenderer>() : null;
                 var matName = mr != null ? MaterialKey(mr.sharedMaterial) : "";
                 var mesh = batch.Mesh;
-                if (mesh == null) continue;
+                if (mesh == null) return;
 
                 // 1.2.253: renderer values below are always read fresh; only the geometry is reused
                 int meshId = mesh.GetInstanceID();
@@ -1655,7 +2259,6 @@ namespace FiresEasyBakeMeshes.EasyBake
                     MotionVectorMode     = mr != null ? (byte)mr.motionVectorGenerationMode : (byte)0,
                 });
             }
-            return list;
         }
 
         // --- Binary format -----------------------------------------------------
@@ -1878,11 +2481,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (fileLength < 12 || Far.FarCache.Crc32(file, fileLength - 4) != BitConverter.ToUInt32(file, fileLength - 4))
                 throw new InvalidDataException($"{BadSavedData}checksum does not match");
             int bakeSettings = br.ReadInt32();
+            if (bakeSettings != CurrentBakeSettingsKey()) SayFingerprint(expectedCoord, $"rebuilt (file was baked under fingerprint {bakeSettings})");
             if (bakeSettings != CurrentBakeSettingsKey() && KeepOtherSettingsOn)
             {
                 // D6 [Cache] KeepOtherSettings: an A/B on one setting no longer throws away the world's cache; the file stays until this zone bakes again.
                 if (!s_saidKeepOther) { s_saidKeepOther = true; EasyBakeLog.Info("[Cache] KeepOtherSettings: saved zones baked under other settings are kept on disk and not used; a zone that bakes again replaces its file"); }
-                EasyBakeLog.Debug($"[Cache] Zone ({expectedCoord.x},{expectedCoord.y}): baked under other settings ({bakeSettings}); file kept, not used.");
+                s_missSettingsKept++; EasyBakeLog.Debug($"[Cache] Zone ({expectedCoord.x},{expectedCoord.y}): baked under other settings ({bakeSettings}); file kept, not used.");
                 return null;
             }
             if (bakeSettings != CurrentBakeSettingsKey())

@@ -27,6 +27,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // the cells were judged afresh: what was empty may not be any more
         private static void CascadeVerdictChanged()
         {
+            s_emptyStamp++;   // 1.2.388: the cascade scan must look again (IndirectCascadeScanReuse)
             if (!s_emptyAny) return;
             System.Array.Clear(s_emptyStreak, 0, s_emptyStreak.Length);
             s_emptyAny = false;
@@ -50,6 +51,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 s_emptyPending = false;
                 if (r.hasError || epoch != Epoch || cap != s_batchCap) return;
+                s_emptyStamp++;   // 1.2.388: a sample can start or end a batch's empty streak, so the cascade scan runs again after it (IndirectCascadeScanReuse)
                 CascadeSample(r.GetData<uint>(), cap, cascades, Mathf.Min(batches, s_batches.Count));
             });
         }
@@ -82,6 +84,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             int cap = s_batchCap, size = cap * ArgWords * sizeof(uint);
             if (size > s_argsBuf.count * s_argsBuf.stride) return;
             s_camEmptyPending = true;
+            DepthCullOcclRead(cap);   // E2: the occlusion flags of the same cull, requested first (its callback runs before the args one)
             int epoch = Epoch, gen = s_camVerdictGen, batches = s_batches.Count;
             AsyncGPUReadback.Request(s_argsBuf, size, 0, r =>
             {
@@ -100,7 +103,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             bool any = false;
             for (int i = 0; i < batches; i++)
             {
-                if (args[i * ArgWords + 1] > 0) s_camEmpty[i] = 0;
+                if (args[i * ArgWords + 1] > 0 || DepthCullHid(i)) s_camEmpty[i] = 0;   // E2: 0 drawn only because it was hidden behind something is not "empty" (it must come back the frame it is in view)
                 else if (s_camEmpty[i] < 255) s_camEmpty[i]++;
                 if (s_camEmpty[i] >= EmptySamples) any = true;
             }

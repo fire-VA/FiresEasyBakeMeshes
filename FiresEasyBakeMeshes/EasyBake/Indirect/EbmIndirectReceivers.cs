@@ -94,6 +94,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             bool can = separate && sun != null && s_prepLight == sun;
             if (!can && SameFrameWanted && CascadesOn && EbmIndirectAssets.Receivers == null && !s_rxSaidOld)
             { s_rxSaidOld = true; EasyBakeLog.Info("[Indirect] same-frame cascade cull: this bundle has no EbmShadowReceivers v5 / EbmCullCascades kernels; cascades culled the 1.2.208 way"); }
+            if (!can && CasterRxWanted) CasterRxSay("off (the same-frame cascade cull is not running here: IndirectShadowSameFrame / IndirectCascadeShadows off, no sun shadow, or a bundle without its kernels)");   // [seasons] 11-11: says why it is not acting
             s_prepThisFrame = can; s_prepFrame = Time.frameCount; s_prepShadowPlanes = shadowPlanes;
             s_mainRendering = false;   // the Update runs between renders; a lost onPostRender can never pin the flag
             return separate ? 0 : 1;   // 1.2.225: with the separate buffer the Update cull never writes views 2..5 (a frame the prep cannot run has no EBM casters, never mixed buffers)
@@ -147,7 +148,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             Vector4 right = lt.right, up = lt.up, light = lt.forward;
             bool stableFit = QualitySettings.shadowProjection == ShadowProjection.StableFit;
 
-            bool receivers = ReceiverCullWanted;
+            // [seasons] 11-11 caster receiver cull (EbmCasterReceiverCull.cs): the receiver test on EBM's own grown spheres (no capture since 1.2.224)
+            bool casterRx = CasterRxWanted && n >= 2;
+            bool casterRxVerify = casterRx && CasterRxVerifyOn;
+            if (casterRx) { CasterRxSpheres(cam, n); w_rxFrames++; }
+            CasterRxSay(!CasterRxWanted ? "off (IndirectCasterReceiverCull and its Verify are off)" : n < 2 ? "off (one shadow cascade: nothing to choose between)"
+                : casterRxVerify ? "VERIFY (tested, nothing dropped; each would-be drop re-tested on a x1.5 sphere map)" : CasterRxOnText());
+            bool receivers = ReceiverCullWanted || casterRx;
             if (receivers)
             {
                 var gpuProj = GL.GetGPUProjectionMatrix(cam.projectionMatrix, false);
@@ -161,13 +168,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 cb.DispatchCompute(rx, EbmIndirectAssets.KernelRxTiles, s_rxTilesX, s_rxTilesY, 1);
                 cb.SetComputeMatrixParam(rx, IdRxInvViewProj, (gpuProj * cam.worldToCameraMatrix).inverse);
                 cb.SetComputeVectorParam(rx, IdRxRight, right); cb.SetComputeVectorParam(rx, IdRxUp, up); cb.SetComputeVectorParam(rx, IdRxLight, light);
-                cb.SetComputeVectorArrayParam(rx, IdRxSpheresCpu, s_rxSphereScratch);
+                cb.SetComputeVectorArrayParam(rx, IdRxSpheresCpu, casterRx ? s_rxGrown : s_rxSphereScratch);   // the cull reads the map with the same spheres
                 cb.SetComputeBufferParam(rx, EbmIndirectAssets.KernelRxScatter, IdRxTileBuf, s_rxTiles);
                 cb.SetComputeBufferParam(rx, EbmIndirectAssets.KernelRxScatter, IdRxMap, s_rxMap);
                 cb.SetComputeBufferParam(rx, EbmIndirectAssets.KernelRxScatter, IdCascadeCapture, capture);
                 cb.DispatchCompute(rx, EbmIndirectAssets.KernelRxScatter, Mathf.CeilToInt(s_rxTilesX / 8f), Mathf.CeilToInt(s_rxTilesY / 8f), 1);
                 cb.SetComputeBufferParam(rx, EbmIndirectAssets.KernelRxMips, IdRxMap, s_rxMap);
                 cb.DispatchCompute(rx, EbmIndirectAssets.KernelRxMips, n, 1, 1);
+                if (casterRxVerify) RecordCasterRxWideMap(cb, rx, n);
                 s_prepMaps++;
             }
 
@@ -197,9 +205,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             cb.SetComputeFloatParam(cull, IdRxSizeFactor, factor);
             cb.SetComputeFloatParam(cull, IdRxMapRes, factor > 0f ? CascadeMapSize(sun) : 0f);
             cb.SetComputeFloatParam(cull, IdRxBias, RxBias);
+            bool rxCensus = CasterRxBind(cb, cull, k3, receivers ? s_rxMap : RxMapDummy(), casterRx, casterRxVerify);
             int groups = Mathf.CeilToInt(s_high / (float)Group);
             if (groups > 0) cb.DispatchCompute(cull, k3, Mathf.Min(groups, 65535), Mathf.Max(1, Mathf.CeilToInt(groups / 65535f)), 1);
+            CasterRxAfterDispatch(cb, rxCensus && groups > 0);
             cb.CopyBuffer(s_cascScratch, s_cascVisible);   // 1.2.225: a copy, not a UAV bind, into the buffer the caster draws read
+            RecordArmedReadback(cb);   // 1.2.338: the 30 s args readback, after this dispatch, so the cascade rows are the shadow pass's counts
             if (!s_prepSaidOn) { s_prepSaidOn = true; EasyBakeLog.Info("[Indirect] same-frame cascade cull on: the shadow-pass cull writes its own scratch buffer and copies it to the casters-only buffer (the camera buffer is never written mid-frame)"); }
             s_prepRecords++;
 
@@ -248,12 +259,37 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         }
 
         // ---------------------------------------------------------------- §E placeholders, from the end of Draw
+        private static Batch s_phAny; private static Bounds s_phUnion; private static bool s_phHas; private static float s_phNext; private static int s_phNb = -1; internal static int s_phRebuilds; internal static int s_phEpoch; private static int s_phEpochSeen = -1;
+        private static bool PlaceholderCached => FiresEasyBakeMeshesPlugin.IndirectPlaceholderCachedBounds != null && FiresEasyBakeMeshesPlugin.IndirectPlaceholderCachedBounds.Value;
         internal static void SubmitShadowPlaceholders(Camera cam)
         {
             if (!PlaceholdersWanted || !CascadesOn || cam == null) return;
             if (s_placeholderArgs == null) { s_placeholderArgs = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 1, GraphicsBuffer.IndirectDrawIndexedArgs.size); s_placeholderArgs.SetData(new GraphicsBuffer.IndirectDrawIndexedArgs[1]); }
             int nb = s_batches.Count;
             Batch any = null; Bounds union = default; bool has = false;
+            // 1.2.265 [Optimize] IndirectPlaceholderCachedBounds (lead 11-10, the "draw ticks" phase): the empty shadow draw only needs one live casting batch
+            // and a box around EBM's casters, cut to this frame's shadowed region below. That box is kept and rebuilt every 0.5 s or when the batch count
+            // changes, instead of walking every batch (~1,500) with this frame's sun-volume row every frame. The box is the casters' whole extent (not only
+            // this frame's visible rows), so a placeholder may keep a shadow pass in a frame the old test would have let Unity skip; it never skips one more.
+            if (PlaceholderCached)
+            {
+                float pnow = Time.unscaledTime;
+                // [ghost]'s review: also rebuilt when any batch's caster area grew (s_phEpoch, bumped where batch.World is set / grown: a batch going from
+                // empty to drawn included), and every frame while no caster has been seen yet (arrival), so a new caster is never missed for half a second
+                if (pnow >= s_phNext || nb != s_phNb || s_phEpoch != s_phEpochSeen || !s_phHas || s_phAny == null || !HasMesh(s_phAny) || !HasMaterial(s_phAny))
+                {
+                    s_phNext = pnow + 0.5f; s_phNb = nb; s_phEpochSeen = s_phEpoch; s_phAny = null; s_phHas = false; s_phRebuilds++;
+                    for (int i = 0; i < nb; i++)
+                    {
+                        var b = s_batches[i];
+                        if (b.Count <= 0 || b.Shadows == ShadowCastingMode.Off || !HasMesh(b) || !HasMaterial(b)) continue;
+                        if (s_phAny == null) s_phAny = b;
+                        if (!s_phHas) { s_phUnion = b.World; s_phHas = true; } else s_phUnion.Encapsulate(b.World);
+                    }
+                }
+                any = s_phAny; union = s_phUnion; has = s_phHas;
+            }
+            else
             for (int i = 0; i < nb; i++)
             {
                 var b = s_batches[i];
@@ -270,7 +306,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 if (lo.x > hi.x || lo.y > hi.y || lo.z > hi.z) return;   // nothing of ours can shadow the view
                 union.SetMinMax(lo, hi);
             }
-            var rp = new RenderParams(any.Material) { worldBounds = union, layer = any.Layer, shadowCastingMode = ShadowCastingMode.ShadowsOnly, receiveShadows = false, camera = cam, matProps = any.ShadowProps };
+            var rp = new RenderParams(any.Material) { motionVectorMode = MotionVectorGenerationMode.Camera,  worldBounds = union, layer = any.Layer, shadowCastingMode = ShadowCastingMode.ShadowsOnly, receiveShadows = false, camera = cam, matProps = any.ShadowProps };
             Graphics.RenderMeshIndirect(in rp, any.Mesh, s_placeholderArgs);
             // each shadowed local light: a small box at the light, past its near plane on every side (inside that light's map only)
             for (int k = 0; k < s_localCount; k++)
@@ -312,6 +348,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (s_rxMapDummy != null) { s_rxMapDummy.Release(); s_rxMapDummy = null; }
             if (s_captureDummy != null) { s_captureDummy.Release(); s_captureDummy = null; }
             if (s_placeholderArgs != null) { s_placeholderArgs.Release(); s_placeholderArgs = null; }
+            ReleaseCasterRx();
         }
     }
 }

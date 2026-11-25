@@ -48,6 +48,7 @@ namespace FiresEasyBakeMeshes.Patches
 
         private static FieldInfo s_forceRebuildField;
         private static bool s_forceRebuildChecked;
+        private static AccessTools.FieldRef<ClutterSystem, bool> s_forceRebuildRef;   // 1.2.271: no reflection call / box per frame
 
         // Diagnostic tally — buckets every call by why it skipped or passed
         // through. Emitted as a one-line summary every 5s when ClutterLodVerbose
@@ -68,12 +69,6 @@ namespace FiresEasyBakeMeshes.Patches
             if (player == null) { _ctPassNoPlayer++; MaybeReport(); return true; }
             if (GameCamera.InFreeFly()) { _ctPassFreefly++; MaybeReport(); return true; }
 
-            // A pending rebuild must run now — don't swallow ClearAll / ResetGrass.
-            // This is the single biggest reason the throttle would no-op: terrain
-            // edits / biome paint queue heightmap rebuilds, which keeps
-            // m_forceRebuild stuck true until Heightmap.HaveQueuedRebuild clears.
-            if (GetForceRebuild(__instance)) { _ctPassForceRebuild++; MaybeReport(); return true; }
-
             Vector3 pos = player.transform.position;
             float now = Time.unscaledTime;
             float threshold = FiresEasyBakeMeshesPlugin.ClutterLodMoveThreshold.Value;
@@ -84,6 +79,12 @@ namespace FiresEasyBakeMeshes.Patches
             float dz = pos.z - _lastRunPos.z;
             bool moved = (dx * dx + dy * dy + dz * dz) >= threshold * threshold;
             bool ttlExpired = (now - _lastRunTime) >= maxSeconds;
+
+            // 1.2.271 (lead 11-10 10 PM, FDT 1181: this prefix 0.30 ms/s): the pending-rebuild read moved here, after the cheap distance / TTL test,
+            // so it runs only on a frame that would skip (a frame that passes runs vanilla anyway), and through a FieldRef (was FieldInfo.GetValue:
+            // reflection + a boxed bool every frame). A pending rebuild still always runs: don't swallow ClearAll / ResetGrass (terrain edits /
+            // biome paint keep m_forceRebuild true until Heightmap.HaveQueuedRebuild clears).
+            if (!moved && !ttlExpired && GetForceRebuild(__instance)) { _ctPassForceRebuild++; MaybeReport(); return true; }
 
             if (!moved && !ttlExpired)
             {
@@ -131,11 +132,12 @@ namespace FiresEasyBakeMeshes.Patches
                 if (s_forceRebuildField == null)
                     EasyBakeLog.Warn("[ClutterLod] ClutterSystem.m_forceRebuild not found via reflection — " +
                         "throttle disabled (fail-open: never skips).");
+                else s_forceRebuildRef = AccessTools.FieldRefAccess<ClutterSystem, bool>(s_forceRebuildField);
             }
             // Field missing → behave as if a rebuild is always pending so the
             // prefix never skips. Lose the optimization, keep correctness.
-            if (s_forceRebuildField == null) return true;
-            return (bool) s_forceRebuildField.GetValue(cs);
+            if (s_forceRebuildRef == null) return true;
+            return s_forceRebuildRef(cs);
         }
 
         public static void ResetState()

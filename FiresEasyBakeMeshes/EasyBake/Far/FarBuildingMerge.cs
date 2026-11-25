@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -24,18 +24,26 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
     internal sealed class FarJob
     {
         public long TargetKey; public int Generation; public bool Simplify;
+        public float Cluster = 1f;   // 1.2.353: the simplify grid (m): 1 for cells, [Far buildings] Coarse cluster for the coarse tier
         public Material[] Mats;
         public List<Bucket> Buckets = new List<Bucket>();
         public List<FarChunk> Result; public long Ticks;
         public bool TrackRuns; public List<long> RunKeys; public List<Vector2s> RunZones;   // [Optimize] FarIndexRanges: one run per piece (key + zone), set on the main thread at prep
         public bool Pooled;   // [Optimize] FarMergePooled, set at prep: the worker reuses its lists and rents chunk arrays
+        public int SplitCount = -1;   // 1.2.429: a loaded zone's copy holds only the pieces whose real LOD is culled: how many (-1 = a full copy)
+        public int[] MatRefs; public string CacheKey;   // 1.2.425 FarMergedCache: per material (prefab, part, sub); the merged-cache key to save the result under (null = not saved)
 
         internal sealed class Bucket
         {
             public int MatIdx; public byte Snow;
             public List<Item> Items = new List<Item>();
         }
-        internal struct Item { public FarPart Part; public int Sub; public Matrix4x4 M; public bool Mirror; public int Run; }   // Mirror: determinant < 0, set on the main thread; Run: the piece's run (-1 = not tracked)
+        internal struct Item { public FarPart Part; public int Sub; public Matrix4x4 M; public bool Mirror; public int Run; public int Piece; }   // Piece 1.2.431: index into Boxes (-1 = no box)
+
+        // 1.2.431 interior cut: one oriented box per piece (target-local centre, rotation, half extents of its far look), filled on the main thread at prep
+        internal struct PieceBox { public Vector3 C; public Quaternion R; public Vector3 H; }
+        public List<PieceBox> Boxes;              // null = no interior cut for this job
+        public int InteriorPieces, InteriorTris;  // results: pieces left out as enclosed, triangles saved (written by the worker)   // Mirror: determinant < 0, set on the main thread; Run: the piece's run (-1 = not tracked)
     }
 
     /// <summary>
@@ -83,6 +91,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static bool TryTake(out FarJob job) { lock (s_lock) { if (s_out.Count > 0) { job = s_out.Dequeue(); return true; } } job = null; return false; }
 
         internal static int Waiting { get { lock (s_lock) return s_in.Count; } }
+        internal static void Deliver(FarJob job) { lock (s_lock) s_out.Enqueue(job); }   // 1.2.425: a merged-cache hit goes straight to the upload queue
 
         private static void Run(object token)
         {
@@ -94,6 +103,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 long t0 = Stopwatch.GetTimestamp();
                 try { job.Result = Merge(job); }
                 catch (Exception e) { job.Result = new List<FarChunk>(); EasyBakeLog.Debug($"{FarBuildings.Log} merge failed for target {job.TargetKey}: {e.Message}"); }
+                // 1.2.425 FarMergedCache: saved from the worker, before the pooled arrays go back after upload
+                if (job.CacheKey != null && job.Result != null && job.Result.Count > 0) { try { var bytes = FarMergedCache.Serialize(job); if (bytes != null) { FarCache.Write(FarCacheScope.World, FarMergedCache.Bucket, job.CacheKey, bytes); System.Threading.Interlocked.Increment(ref FarMergedCache.Writes); } } catch (Exception e) { EasyBakeLog.Debug($"{FarBuildings.Log} merged cache save failed: {e.Message}"); } }
                 job.Ticks = Stopwatch.GetTimestamp() - t0;
                 lock (s_lock)
                 {
@@ -112,9 +123,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             var idx = pooled ? s_wIdx : new List<ushort>(16384);
             var remap = pooled ? s_wRemap : new Dictionary<int, int>();
             var cluster = job.Simplify ? (pooled ? s_wCluster : new Dictionary<long, int>()) : null;
+            t_cluster = job.Cluster > 0f ? job.Cluster : ClusterSize;   // 1.2.353: this job's grid (worker thread)
             if (pooled) { verts.Clear(); idx.Clear(); remap.Clear(); cluster?.Clear(); }
-            var runs = job.TrackRuns ? new RunRecorder() : null;   // [Optimize] FarIndexRanges; null = exactly the old output
+            var runs = job.TrackRuns ? (t_runs ?? (t_runs = new RunRecorder())).Reset() : null;   // [Optimize] FarIndexRanges; null = exactly the old output. 1.2.287: one per worker thread, reused
 
+            bool[] interior = job.Boxes != null && job.Boxes.Count >= MinPiecesForInterior ? Interior(job.Boxes) : null;   // 1.2.431
+            if (interior != null) { int n = 0; foreach (bool x in interior) if (x) n++; job.InteriorPieces = n; }
             foreach (var b in job.Buckets)
             {
                 verts.Clear(); idx.Clear(); cluster?.Clear();
@@ -124,6 +138,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (it.Sub >= part.Sub.Length) continue;
                     var tri = part.Sub[it.Sub];
                     if (tri.Length == 0) continue;
+                    if (interior != null && it.Piece >= 0 && it.Piece < interior.Length && interior[it.Piece]) { job.InteriorTris += tri.Length / 3; continue; }   // 1.2.431: enclosed, nobody can see it
                     var m = it.M;
                     remap.Clear();
                     runs?.Begin(it.Run, idx);
@@ -144,12 +159,98 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             return chunks;
         }
 
+        // ── 1.2.431 ([visual], lead approved; Fire: "some of the far pieces would be naturally covered and not shown"): a piece is ENCLOSED when a ray from its centre in
+        // each of 10 directions (+-x, +-y, +-z and the four horizontal diagonals) enters ANOTHER piece's oriented box (its far look's bounds, at its own rotation, so a
+        // rotated wall never covers open air the way a world box would) in front of it. Boxes that contain the start point do not count (overlapping pieces never hide
+        // each other), and a ray that leaves the copy's bounds is open. A piece visible from outside has at least its outward direction free, so the outer shell always
+        // stays; only pieces boxed in on every side go (inner walls, floors under a roof, stacked foundations). Uniform 4 m grid of box ids; plain arrays, worker thread.
+        internal const int MinPiecesForInterior = 20;
+        private const float GridCell = 4f, RayStep = 1f, MinEnter = 0.1f;
+        private static readonly Vector3[] s_dirs =
+        {
+            new Vector3(1, 0, 0), new Vector3(-1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, -1, 0), new Vector3(0, 0, 1), new Vector3(0, 0, -1),
+            new Vector3(0.70710678f, 0, 0.70710678f), new Vector3(-0.70710678f, 0, 0.70710678f), new Vector3(0.70710678f, 0, -0.70710678f), new Vector3(-0.70710678f, 0, -0.70710678f),
+        };
+        private static bool[] Interior(List<FarJob.PieceBox> boxes)
+        {
+            int n = boxes.Count;
+            var inv = new Quaternion[n]; var wmin = new Vector3[n]; var wmax = new Vector3[n];
+            Vector3 lo = Vector3.positiveInfinity, hi = Vector3.negativeInfinity;
+            for (int i = 0; i < n; i++)
+            {
+                var b = boxes[i]; inv[i] = Quaternion.Inverse(b.R);
+                // world AABB of the oriented box (for the grid only)
+                Vector3 ax = b.R * new Vector3(b.H.x, 0, 0), ay = b.R * new Vector3(0, b.H.y, 0), az = b.R * new Vector3(0, 0, b.H.z);
+                var ext = new Vector3(Mathf.Abs(ax.x) + Mathf.Abs(ay.x) + Mathf.Abs(az.x), Mathf.Abs(ax.y) + Mathf.Abs(ay.y) + Mathf.Abs(az.y), Mathf.Abs(ax.z) + Mathf.Abs(ay.z) + Mathf.Abs(az.z));
+                wmin[i] = b.C - ext; wmax[i] = b.C + ext;
+                lo = Vector3.Min(lo, wmin[i]); hi = Vector3.Max(hi, wmax[i]);
+            }
+            lo -= Vector3.one; hi += Vector3.one;
+            int gx = Mathf.Max(1, Mathf.CeilToInt((hi.x - lo.x) / GridCell)), gy = Mathf.Max(1, Mathf.CeilToInt((hi.y - lo.y) / GridCell)), gz = Mathf.Max(1, Mathf.CeilToInt((hi.z - lo.z) / GridCell));
+            if ((long)gx * gy * gz > 4000000) return null;   // absurd extent: no cut (never guess)
+            var cells = new Dictionary<int, List<int>>();
+            for (int i = 0; i < n; i++)
+            {
+                int x0 = (int)((wmin[i].x - lo.x) / GridCell), x1 = (int)((wmax[i].x - lo.x) / GridCell), y0 = (int)((wmin[i].y - lo.y) / GridCell), y1 = (int)((wmax[i].y - lo.y) / GridCell), z0 = (int)((wmin[i].z - lo.z) / GridCell), z1 = (int)((wmax[i].z - lo.z) / GridCell);
+                for (int x = x0; x <= x1; x++) for (int y = y0; y <= y1; y++) for (int z = z0; z <= z1; z++)
+                {
+                    int key = (x * gy + y) * gz + z;
+                    if (!cells.TryGetValue(key, out var l)) cells[key] = l = new List<int>(4);
+                    l.Add(i);
+                }
+            }
+            var result = new bool[n];
+            var tested = new int[n]; int stamp = 0;
+            for (int i = 0; i < n; i++)
+            {
+                bool allBlocked = true;
+                foreach (var d in s_dirs)
+                {
+                    stamp++;
+                    if (!Blocked(i, boxes[i].C, d, boxes, inv, cells, lo, hi, gy, gz, tested, stamp)) { allBlocked = false; break; }
+                }
+                result[i] = allBlocked;
+            }
+            return result;
+        }
+
+        private static bool Blocked(int self, Vector3 o, Vector3 d, List<FarJob.PieceBox> boxes, Quaternion[] inv, Dictionary<int, List<int>> cells, Vector3 lo, Vector3 hi, int gy, int gz, int[] tested, int stamp)
+        {
+            float maxT = (hi - lo).magnitude;
+            for (float t = 0f; t <= maxT; t += RayStep)
+            {
+                Vector3 p = o + d * t;
+                if (p.x < lo.x || p.y < lo.y || p.z < lo.z || p.x > hi.x || p.y > hi.y || p.z > hi.z) return false;   // left the copy: open
+                int key = ((int)((p.x - lo.x) / GridCell) * gy + (int)((p.y - lo.y) / GridCell)) * gz + (int)((p.z - lo.z) / GridCell);
+                if (!cells.TryGetValue(key, out var l)) continue;
+                foreach (int j in l)
+                {
+                    if (j == self || tested[j] == stamp) continue;
+                    tested[j] = stamp;
+                    var b = boxes[j];
+                    Vector3 lo2 = inv[j] * (o - b.C), ld = inv[j] * d;
+                    float tmin = float.NegativeInfinity, tmax = float.PositiveInfinity; bool miss = false;
+                    for (int a = 0; a < 3 && !miss; a++)
+                    {
+                        float oa = lo2[a], da = ld[a], h = b.H[a];
+                        if (Mathf.Abs(da) < 1e-6f) { if (oa < -h || oa > h) miss = true; continue; }
+                        float t1 = (-h - oa) / da, t2 = (h - oa) / da; if (t1 > t2) { float s = t1; t1 = t2; t2 = s; }
+                        if (t1 > tmin) tmin = t1; if (t2 < tmax) tmax = t2; if (tmin > tmax) miss = true;
+                    }
+                    if (!miss && tmin > MinEnter && tmin <= maxT) return true;   // a box ahead (not one around the start point)
+                }
+            }
+            return false;
+        }
+
         // [Optimize] FarMergePooled: the worker's own lists (Run is the only caller, on the one worker thread)
         // 1258 review: per THREAD, so an old worker still finishing after a stop never writes into the new worker's lists
         [ThreadStatic] private static List<FarVert> t_wVerts;
         [ThreadStatic] private static List<ushort> t_wIdx;
         [ThreadStatic] private static Dictionary<int, int> t_wRemap;
         [ThreadStatic] private static Dictionary<long, int> t_wCluster;
+        [ThreadStatic] private static float t_cluster;   // 1.2.353: the running job's simplify grid (m); 0 = ClusterSize
+        [ThreadStatic] private static RunRecorder t_runs;   // 1.2.287
         private static List<FarVert> s_wVerts => t_wVerts ?? (t_wVerts = new List<FarVert>(MaxChunkVerts));
         private static List<ushort> s_wIdx => t_wIdx ?? (t_wIdx = new List<ushort>(MaxChunkVerts * 2));
         private static Dictionary<int, int> s_wRemap => t_wRemap ?? (t_wRemap = new Dictionary<int, int>());
@@ -180,6 +281,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             }
 
             public void Reopen() { m_start = 0; }   // a new chunk: the same run goes on from index 0
+            public RunRecorder Reset() { m_run = -1; m_start = 0; Run.Clear(); Start.Clear(); Count.Clear(); return this; }   // 1.2.287: reused per worker thread
             public void End() { m_run = -1; }
 
             private static void Pad(List<ushort> idx) { idx.Add(0); idx.Add(0); idx.Add(0); }
@@ -193,7 +295,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             int at;
             if (cluster != null)
             {
-                long key = EbmMeshSimplify.ClusterKey(p, n, ClusterSize);   // 0.2.1212: the one simplifier key (EBM port: EBM's own EbmMeshSimplify, also the rock LOD1)
+                long key = EbmMeshSimplify.ClusterKey(p, n, t_cluster > 0f ? t_cluster : ClusterSize);   // 0.2.1212: the one simplifier key (EBM port: EBM's own EbmMeshSimplify, also the rock LOD1); 1.2.353: the job's grid
                 if (cluster.TryGetValue(key, out at)) { remap[i] = at; return at; }
                 at = Add(part, i, m, mirror, p, n, verts);
                 cluster[key] = at;
@@ -215,9 +317,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // Plain C# float -> half (the worker never calls into Unity's native code). Round-to-nearest, clamps to +-65504, no NaN.
+        // 1.2.287 (lead 11-11 allocation capture: "FarBuildingMerge.Run -> BitConverter.GetBytes 425 MB, 12.4M allocations"): the float's bits through an
+        // overlapping struct (no byte[] per value); same bits as before
+        [StructLayout(LayoutKind.Explicit)] private struct FloatBits { [FieldOffset(0)] public float F; [FieldOffset(0)] public uint U; }
         private static uint Half(float f)
         {
-            uint x = (uint)BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
+            uint x = new FloatBits { F = f }.U;
             uint sign = (x >> 16) & 0x8000u;
             int exp = (int)((x >> 23) & 0xFF) - 127 + 15;
             uint mant = x & 0x7FFFFFu;

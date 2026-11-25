@@ -106,6 +106,30 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_watched.Add(w);
         }
 
+        // 1.2.381 ([visual], [lead] hot-swap audit 4c): Consider runs when ZNetScene creates an object and returned at once with the key off, so a live OFF -> ON never
+        // watched the items created meanwhile. Turned on, every loaded item not watched yet goes through Consider once.
+        internal static void ConsiderLoaded()
+        {
+            var instances = ZoneTracker.SceneInstances();
+            if (instances == null) return;
+            var have = new HashSet<ZSyncTransform>();
+            for (int i = 0; i < s_watched.Count; i++) if (s_watched[i].Sync != null) have.Add(s_watched[i].Sync);
+            int before = s_watched.Count;
+            int walked = 0, seen = 0, already = 0;   // 1.2.383 ([lead]): the walk reports itself (objects visited, loose items with a ZSyncTransform, already watched)
+            foreach (var kv in instances)
+            {
+                if (kv.Value == null) continue;
+                walked++;
+                var sync = kv.Value.GetComponent<ZSyncTransform>();
+                if (sync != null && kv.Value.GetComponent<ItemDrop>() != null) seen++;
+                if (sync != null && have.Contains(sync)) already++;
+                if (sync == null || have.Contains(sync)) continue;
+                Consider(kv.Value.gameObject);
+            }
+            int acted = s_watched.Count - before;
+            EasyBakeLog.Info($"[ZSync-items] turned on: walked {walked} loaded object(s), {seen} item(s) with a ZSyncTransform ({already} watched already), acted on {acted} (watched now); {s_watched.Count} watched in all{(acted == 0 && already == 0 ? "; no targets in this scene" : "")}");
+        }
+
         internal static void Tick()
         {
             if (!FiresEasyBakeMeshesPlugin.RemoteItemZSyncSkipEnabled.Value)

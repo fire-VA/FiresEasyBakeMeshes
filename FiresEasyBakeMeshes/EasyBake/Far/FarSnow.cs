@@ -24,6 +24,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static void Register(Func<bool> active, Func<Vector3, float> coverAt, Func<Vector3, float> exposureAt, Func<int> revision, Func<float> worldSnow01)
         {
             s_active = active; s_cover = coverAt; s_exposure = exposureAt; s_revision = revision; s_world = worldSnow01;
+            FarBuildingDraw.MarkSnowDirty();   // 1.2.266 ([ghost] review): registering (or withdrawing) far snow changes SnowNeedsSnowMod's answer: far caps rebuild
             EasyBakeLog.Info(Bound
                 ? $"[Far] season snow registered (cover + exposure{(revision != null ? " + revision" : "")}{(worldSnow01 != null ? " + world amount" : "")}): far buildings and impostors follow it"
                 : (worldSnow01 != null ? "[Far] season snow registered for impostors only (world amount)" : "[Far] season snow withdrawn: far buildings plain, impostors use altitude snow"));

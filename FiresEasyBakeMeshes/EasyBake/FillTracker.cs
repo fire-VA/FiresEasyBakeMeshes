@@ -64,7 +64,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (t995 < 0 && s_counts[i] >= final * 0.995f) { t995 = i; break; }
             }
             string At(int s) => s < n ? s_counts[s].ToString("N0") : "-";
-            EasyBakeLog.Info($"[Fill] {s_why}: {(settled ? "settled" : "NOT settled after 600 s")} at {final:N0} instances; 95 % at T+{t95} s, 99.5 % at T+{t995} s; " +
+            EasyBakeLog.InfoFirst("Fill settled", $"[Fill] {s_why}: {(settled ? "settled" : "NOT settled after 600 s")} at {final:N0} instances; 95 % at T+{t95} s, 99.5 % at T+{t995} s; " +
                              $"count at T+0 {At(0)}, +30 {At(30)}, +60 {At(60)}, +120 {At(120)}, +180 {At(180)} s; far buildings first drawn at " +
                              (s_farAt >= 0f ? "T+" + s_farAt.ToString("0.0") + " s" : s_farFirstEver >= 0f && s_farFirstEver <= s_start ? "before the spawn (T-" + (s_start - s_farFirstEver).ToString("0.0") + " s, under the loading screen)" : "- (none this fill)") + " (EBM's measure; reads only the instance count, so it compares across stacks)");
         }

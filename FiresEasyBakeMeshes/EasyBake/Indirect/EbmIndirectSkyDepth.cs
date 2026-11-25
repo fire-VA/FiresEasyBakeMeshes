@@ -118,11 +118,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     if (bi == 0 || bi > s_batches.Count) continue;
                     var b = s_batches[(int)bi - 1];
                     if ((cam.cullingMask & (1 << b.Layer)) == 0) continue;
-                    Vector3 top = s_instPos[s] + Vector3.up * Mathf.Max(0f, b.LocalBounds.max.y);
-                    AddSample(cam, w2c, top, true);
+                    AddSampleAt(cam, w2c, s_instPos[s].x, s_instPos[s].z, true);
                 }
             }
-            // combined zone meshes: up to 32 batch tops
+            // combined zone meshes: up to 32 points inside their batches
+            // 1.2.276 ([seasons], E31): the census sampled a zone mesh at its bounds' CENTRE TOP, where usually nothing stands at the tallest piece's height,
+            // so every combined sample read "missing" (rig log 11-10 11:31 PM: 0 of 6 present, though vanilla's replacement render draws them). Every
+            // sample now takes the real top surface under the point (AddSampleAt: a ray down onto a PIECE collider; EBM hides the piece's renderers
+            // and keeps its collider, so the mask holds that top only if EBM's own drawing reached the mask). Indirect samples use the same rule.
             int c = 0;
             ZoneTracker.ForEachBakedZone((coord, bake, stale) =>
             {
@@ -133,7 +136,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     var mr = list[i].Combined != null ? list[i].Combined.GetComponent<MeshRenderer>() : null;
                     if (mr == null || !mr.enabled || !list[i].Combined.activeInHierarchy) continue;
                     var bb = mr.bounds;
-                    if (AddSample(cam, w2c, new Vector3(bb.center.x, bb.max.y, bb.center.z), false)) c++;
+                    // three points across the batch (its centre and two quarter points): a batch is many pieces, one of them is usually under one
+                    for (int k = 0; k < 3 && c < 32; k++)
+                    {
+                        float fx = k == 0 ? 0.5f : k == 1 ? 0.25f : 0.75f;
+                        if (AddSampleAt(cam, w2c, Mathf.Lerp(bb.min.x, bb.max.x, fx), Mathf.Lerp(bb.min.z, bb.max.z, fx), false)) c++;
+                    }
                 }
             });
             if (s_samples.Count == 0) return;
@@ -156,6 +164,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             });
         }
 
+        // 1.2.276: the topmost surface under (x, z) from the depth camera's height; counted only when it is a build piece (WearNTear), whose
+        // renderers EBM hides, so the mask can hold it only through EBM's drawing. A ray that lands on terrain or a non-piece says nothing: skipped.
+        private static int s_pieceRayMask = -1, w_skyNoPiece;
+        private static bool AddSampleAt(Camera cam, Matrix4x4 w2c, float x, float z, bool indirect)
+        {
+            if (s_pieceRayMask == -1) s_pieceRayMask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain", "vehicle");
+            var from = new Vector3(x, cam.transform.position.y, z);
+            // Physics.Raycast returns the CLOSEST hit (the topmost surface); no allocation
+            if (!Physics.Raycast(from, Vector3.down, out RaycastHit hit, 400f, s_pieceRayMask & cam.cullingMask, QueryTriggerInteraction.Ignore)) return false;
+            if (hit.collider == null || hit.collider.GetComponentInParent<WearNTear>() == null) { w_skyNoPiece++; return false; }
+            return AddSample(cam, w2c, hit.point, indirect);
+        }
+
         private static bool AddSample(Camera cam, Matrix4x4 w2c, Vector3 top, bool indirect)
         {
             Vector3 vp = cam.WorldToViewportPoint(top);
@@ -168,10 +189,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static void SaySky(float now)
         {
             if (s_nextSkySay > 0f && EasyBakeLog.DebugOn() && (w_indSampled + w_cmbSampled + w_skyRecords + w_skyThrottled) > 0)
-                EasyBakeLog.Debug($"[SkyDepth] 30 s: rain mask samples: EBM indirect {w_indSampled} ({w_indPresent} present, {w_indMissing} MISSING), combined zone meshes {w_cmbSampled} ({w_cmbPresent} present, {w_cmbMissing} missing); " +
+                EasyBakeLog.Debug($"[SkyDepth] 30 s: rain mask samples at real piece tops (1.2.276): near EBM indirect instances {w_indSampled} ({w_indPresent} present, {w_indMissing} MISSING), on combined zone meshes {w_cmbSampled} ({w_cmbPresent} present, {w_cmbMissing} missing), {w_skyNoPiece} point(s) over no piece skipped; " +
                     $"pass {(SkyDepthOn != null && SkyDepthOn.Value ? "on" : "off")}: {w_skyRecords} mask render(s) extended, {w_skyDraws} draw(s), {w_skyNoView} without a view; throttle {(SkyDepthThrottleOn != null && SkyDepthThrottleOn.Value ? "on" : "off")}: {w_skyThrottled} render(s) skipped");
             s_nextSkySay = now + 30f;
-            w_indSampled = w_indPresent = w_indMissing = w_cmbSampled = w_cmbPresent = w_cmbMissing = 0;
+            w_indSampled = w_indPresent = w_indMissing = w_cmbSampled = w_cmbPresent = w_cmbMissing = 0; w_skyNoPiece = 0;
             w_skyRecords = w_skyDraws = w_skyNoView = w_skyThrottled = 0;
         }
 

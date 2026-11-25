@@ -50,7 +50,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             public int Version, N, Entries, Cursor, ScheduledFrame, Adds;
             public bool LodParts, JobDone;
             public Batch[] Batches;
-            public string Context;
+            public Vector3 CtxPos;   // 1.2.356: was a string built per staged group; the [Integrity] text is built only when it prints
             public NativeArray<Matrix4x4> M;
             public NativeArray<StageLane> Lanes;
             public NativeArray<StageOut> Out;
@@ -148,6 +148,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // AddInstance's slot pick, shared with the commit. A staged slot looks free to the free heap (its batch id is 0), so a stale heap entry for it is dropped here.
         private static int AllocSlot()
         {
+            s_slotMutations++;   // 1.2.392 IndirectSlotCompact: the slot range changed (settle clock)
             while (s_free.Count > 0)
             {
                 int s = s_free.PopBelow(s_high, s_instBatch);
@@ -271,7 +272,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 {
                     var rp = lp.RenderParams;
                     float start = lp.Size > 0f ? lp.Start : float.MaxValue, end = lp.Size > 0f ? lp.End : 0f;
-                    var batch = BatchOf(lp.Mesh, lp.SubMesh, EbmIndirectAssets.VariantFor(rp.material), rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, start, end);
+                    var batch = BatchOf(lp.Mesh, lp.SubMesh, EbmIndirectAssets.VariantFor(rp.material), rp.shadowCastingMode, rp.receiveShadows, rp.layer, rp.renderingLayerMask, start, end, lp.Last);
                     s_stBatchScratch.Add(batch);
                     s_stLaneScratch.Add(new StageLane { Kind = 0, LodFromFirst = lp.FromFirst, RefFirst = lp.RefFirst, Size = lp.Size, Lod = Vector4.zero, LodStart = start, LodEnd = end,
                         BatchStart = batch.StartHeight, BatchEnd = batch.EndHeight, LocalBounds = batch.LocalBounds, PerInst = batch.LodPerInstance ? 1 : 0, PartFromFirst = Matrix4x4.identity });
@@ -302,7 +303,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 Group = group, Version = group.Version, N = n, Entries = lanes * n, Adds = adds, LodParts = lodParts != null, ScheduledFrame = s_frame,
                 Batches = s_stBatchScratch.ToArray(),
-                Context = "baked group of " + n + " at " + ((Vector3)group.Matrices[0].GetColumn(3)).ToString("F0"),   // Sync's s_addContext, for BadInstance's lines
+                CtxPos = (Vector3)group.Matrices[0].GetColumn(3),   // Sync's context, for BadInstance's lines (1.2.356: no string here)
                 M = new NativeArray<Matrix4x4>(n, Allocator.Persistent, NativeArrayOptions.UninitializedMemory),
                 Lanes = new NativeArray<StageLane>(lanes, Allocator.Persistent, NativeArrayOptions.UninitializedMemory),
                 Out = new NativeArray<StageOut>(lanes * n, Allocator.Persistent, NativeArrayOptions.UninitializedMemory),
@@ -335,7 +336,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             SetStaged(slot, true);
             if ((o.Flags & SfBad) != 0)
             {
-                s_addContext = st.Context;
+                SetGroupContext(st.N, st.CtxPos);
                 if (!BadInstance(batch, StageMatrix(st, lane, o))) s_stBadDisagree++;   // AddInstance's call: logs the same lines
                 s_inst[slot] = default; s_instPos[slot] = Vector3.zero; s_instLod[slot] = Vector4.zero;
             }
@@ -343,7 +344,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 if ((o.Flags & (SfScaleNote | SfMatrixNote)) != 0)
                 {
-                    s_addContext = st.Context;
+                    SetGroupContext(st.N, st.CtxPos);
                     var m = StageMatrix(st, lane, o);
                     if ((o.Flags & SfScaleNote) != 0 && BadInstance(batch, m)) s_stBadDisagree++;   // the Debug "unusual scale, still drawn" line
                     if ((o.Flags & SfMatrixNote) != 0) NoteMatrix(m, m.inverse);
@@ -393,6 +394,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     if ((o.Flags & SfBad) == 0)
                     {
                         if (!batch.WorldSet) { batch.World = o.Wb; batch.WorldSet = true; } else batch.World.Encapsulate(o.Wb);
+                        s_phEpoch++;   // 1.2.265 ([ghost] review)
                         s_cells.Add(batch.Index, o.Pos, o.Wb.min, o.Wb.max, o.CellEnd, o.CellStart);
                     }
                     ln.Mats.Add(o.Src); ln.Slots.Add(slot);

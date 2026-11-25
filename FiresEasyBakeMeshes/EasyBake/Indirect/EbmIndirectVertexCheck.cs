@@ -68,17 +68,18 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         private static void VertexSweepTick()
         {
+            if (CompactInFlight) return;   // 1.2.392: instances are moving between slots; a read taken now would compare against rows that have moved since
             if (!s_vertexDebugSet || s_sweepPending || s_instBuf == null || s_visibleBuf == null || s_argsBuf == null || Time.unscaledTime < s_sweepNext) return;
             s_sweepNext = Time.unscaledTime + 2f;
             s_sweepPending = true;
-            int epoch = Epoch, cap = s_batchCap, stride = s_visibleStride, cellsVersion = s_cells.Version;
+            int epoch = Epoch, cap = s_batchCap, stride = s_visibleStride, cellsVersion = s_cells.Version, moveStamp = s_compactMoveStamp;   // 1.2.392: + the compaction's move stamp ([2ic])
             uint[] args = null, visible = null; GpuInstance[] gpu = null; bool failed = false; int left = 3;
             void Landed()
             {
                 if (--left > 0) return;
                 s_sweepPending = false;
                 // 1.2.244 ([generator]): anything added, removed or moved since the read would look like bad data
-                if (failed || epoch != Epoch || cap != s_batchCap || stride != s_visibleStride || cellsVersion != s_cells.Version) return;
+                if (failed || epoch != Epoch || cap != s_batchCap || stride != s_visibleStride || cellsVersion != s_cells.Version || moveStamp != s_compactMoveStamp) return;   // 1.2.392: an instance moved to another slot since the read
                 int batches = s_batches.Count;
                 for (int i = 0; i < batches && i < cap; i++)
                 {

@@ -80,6 +80,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         [HarmonyPatch(typeof(ZNetScene), "CreateDestroyObjects"), HarmonyPostfix, HarmonyPriority(Priority.Last)]
         private static void AfterFullPass(ZNetScene __instance, bool __runOriginal)
         {
+            using (EbmPatchMarkers.ObjectArea.Auto()) AfterFullPassBody(__instance, __runOriginal);   // 1.2.360: profiler marker only
+        }
+        private static void AfterFullPassBody(ZNetScene __instance, bool __runOriginal)
+        {
             if (!__runOriginal || !EventOn || ZNet.instance == null || ZNet.instance.IsDedicated()) return;
             try
             {

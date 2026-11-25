@@ -36,10 +36,13 @@ namespace FiresEasyBakeMeshes.Patches
             public bool HasTier;
         }
 
+        internal static bool Ran;   // 1.2.301: the prefix is attached and has run with the key on
+
         [HarmonyPrefix]
         public static bool Prefix(LightFlicker __instance, ref float deltaTime)
         {
             if (!FiresEasyBakeMeshesPlugin.LightFlickerLodEnabled.Value) return true;
+            Ran = true;   // 1.2.301: EbmApi.LightFlickerLodActive (FiresFixes' off-screen skip stands down while this runs)
             if (__instance == null) return true;
             if (Player.m_localPlayer == null) return true;
 

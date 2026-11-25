@@ -1,3 +1,4 @@
+using System.Reflection.Emit;
 using HarmonyLib;
 using UnityEngine;
 
@@ -12,7 +13,7 @@ namespace FiresEasyBakeMeshes.Patches
         {
             if (!__runOriginal) return false;
             bool skip;
-            try { skip = EasyBake.ZoneTracker.TrySkipCreation(zdo); }
+            try { using (EasyBake.EbmPatchMarkers.SkipCreation.Auto()) skip = EasyBake.ZoneTracker.TrySkipCreation(zdo); }   // 1.2.360: profiler marker only
             catch (System.Exception ex)
             {
                 EasyBake.ZoneTracker.LogSkipFailureOnce(ex);
@@ -104,6 +105,10 @@ namespace FiresEasyBakeMeshes.Patches
     // ONE-SHOT, NOT A MEMBERSHIP TEST. ConsumeJustSkipped matches only the ZDO handed over by the skip that
     // just ran, and clears itself. A broader "is this skipped?" test would refuse REAL deletions whenever the
     // tracker disagreed, and a piece that cannot be destroyed is a far worse defect than one drawn twice.
+    // 1.2.318 ([lead] 11-11 BLOCKER, Tools\WORLD_LOSS_CHECK_20261111.md: 30,045 host-skipped pieces went down vanilla's "Destroyed invalid prefab"
+    // branch and lived ONLY because this one-shot matched): the guard is now the SECOND net. The first is ZNetScene_CreateLoop_HostSkipGate below,
+    // which keeps vanilla's loop from ever reaching that branch for a skip. If this guard still fires, something else destroyed a skipped piece
+    // (another mod's create loop, or the gate not installed): a Warning, the first time and every 1000th.
     [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.DestroyZDO))]
     public static class ZDOMan_DestroyZDO_SkipGuard_Patch
     {
@@ -113,6 +118,9 @@ namespace FiresEasyBakeMeshes.Patches
             if (zdo == null) return true;
             if (!EasyBake.ZoneTracker.ConsumeJustSkipped(zdo)) return true;
             s_blocked++;
+            if (s_blocked == 1 || s_blocked % 1000 == 0)
+                EasyBakeLog.Warn($"[SkipGuard] blocked a world deletion of a piece EBM skipped (uid {zdo.m_uid}, {s_blocked} so far): a create loop other than vanilla's own "
+                    + "(gate " + (ZNetScene_CreateLoop_HostSkipGate.Installed == 2 ? "installed" : "NOT installed: " + ZNetScene_CreateLoop_HostSkipGate.Installed + "/2 loops") + ") treated EBM's skip as an invalid prefab. The piece is kept.");
             return false;
         }
 
@@ -120,5 +128,78 @@ namespace FiresEasyBakeMeshes.Patches
 
         /// <summary>For the status box: how many world-deletions the skip signal would otherwise have caused.</summary>
         internal static int BlockedDeletions => s_blocked;
+    }
+
+    // ═══ 1.2.318: THE SOURCE FIX: VANILLA'S LOOP NEVER SEES A SKIP AS AN INVALID PREFAB ═══════════════════════════════════════════════════
+    // ZNetScene.CreateObjectsSorted / CreateDistantObjects:  if (CreateObject(zdo) != null) {...} else if (ZNet.instance.IsServer()) { ... DestroyZDO(zdo); }
+    // In both loops the CreateObject call is swapped for LoopCreate (which calls the real CreateObject, so every mod's patch on it still runs) and
+    // the IsServer() right after it for DestroyAllowed. LoopCreate notes, for THIS call, whether the null was a skip: vanilla sets zdo.Created only
+    // in AddInstance (ZNetScene.cs:74, from ZNetView.Awake), so null + Created == true can only be a skip (EBM's, which sets Created itself); a real
+    // invalid prefab (hash 0 / missing prefab) returns null with Created still false and is destroyed exactly as vanilla does. The note is written
+    // on every call and read by the very next IsServer, so no state outlives one loop iteration: nothing for another mod's DestroyZDO prefix, load
+    // order, or two skips in a row to break. The one-shot armed by the skip is cleared here too (no destroy follows, so it must not stay armed).
+    // Each loop must swap exactly one of each, or that loop is left untouched (Warning) and the guard above stays the net.
+    [HarmonyPatch]
+    public static class ZNetScene_CreateLoop_HostSkipGate
+    {
+        internal static int Installed;   // loops patched (2 = both)
+        private static bool s_lastWasSkip;
+        private static System.Func<ZNetScene, ZDO, GameObject> s_create;
+
+        [HarmonyTargetMethods]
+        public static System.Collections.Generic.IEnumerable<System.Reflection.MethodBase> TargetMethods()
+        {
+            yield return AccessTools.Method(typeof(ZNetScene), "CreateObjectsSorted");
+            yield return AccessTools.Method(typeof(ZNetScene), "CreateDistantObjects");
+        }
+
+        [HarmonyTranspiler]
+        public static System.Collections.Generic.IEnumerable<CodeInstruction> GateLoop(System.Collections.Generic.IEnumerable<CodeInstruction> instructions, System.Reflection.MethodBase original)
+        {
+            var create = AccessTools.Method(typeof(ZNetScene), "CreateObject", new[] { typeof(ZDO) });
+            var isServer = AccessTools.Method(typeof(ZNet), nameof(ZNet.IsServer));
+            var loopCreate = AccessTools.Method(typeof(ZNetScene_CreateLoop_HostSkipGate), nameof(LoopCreate));
+            var allowed = AccessTools.Method(typeof(ZNetScene_CreateLoop_HostSkipGate), nameof(DestroyAllowed));
+            var list = new System.Collections.Generic.List<CodeInstruction>(instructions);
+            int creates = 0, servers = 0;
+            foreach (var ci in list) { if (ci.Calls(create)) creates++; else if (creates == 1 && ci.Calls(isServer)) servers++; }
+            if (creates != 1 || servers != 1)
+            {
+                EasyBakeLog.Warn($"[SkipGuard] {original?.Name}: expected one CreateObject and one IsServer after it, found {creates} / {servers}; this loop is left as the game has it "
+                    + "(the DestroyZDO guard still keeps skipped pieces). Re-read the game's create loop.");
+                return list;
+            }
+            bool afterCreate = false, swappedServer = false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var ci = list[i];
+                if (ci.Calls(create)) { list[i] = new CodeInstruction(OpCodes.Call, loopCreate).MoveLabelsFrom(ci).MoveBlocksFrom(ci); afterCreate = true; continue; }
+                if (afterCreate && !swappedServer && ci.Calls(isServer)) { list[i] = new CodeInstruction(OpCodes.Call, allowed).MoveLabelsFrom(ci).MoveBlocksFrom(ci); swappedServer = true; }
+            }
+            Installed++;
+            EasyBakeLog.Debug($"[SkipGuard] {original?.Name}: a skipped piece can no longer reach the game's invalid-prefab delete");
+            return list;
+        }
+
+        // Same stack as the call it replaces (instance, zdo -> GameObject).
+        public static GameObject LoopCreate(ZNetScene scene, ZDO zdo)
+        {
+            if (s_create == null) s_create = AccessTools.MethodDelegate<System.Func<ZNetScene, ZDO, GameObject>>(AccessTools.Method(typeof(ZNetScene), "CreateObject", new[] { typeof(ZDO) }));
+            GameObject go = s_create(scene, zdo);
+            s_lastWasSkip = go == null && zdo != null && zdo.Created;
+            if (s_lastWasSkip) { EasyBake.ZoneTracker.ConsumeJustSkipped(zdo); s_gated++; }
+            return go;
+        }
+
+        // Replaces ZNet.instance.IsServer() on the null branch: a skip is never destroyed; anything else is exactly vanilla's answer.
+        public static bool DestroyAllowed(ZNet net)
+        {
+            if (s_lastWasSkip) { s_lastWasSkip = false; return false; }
+            return net.IsServer();
+        }
+
+        private static int s_gated;
+        /// <summary>Host skips the gate kept away from vanilla's invalid-prefab delete (the [Cache] summary).</summary>
+        internal static int Gated => s_gated;
     }
 }

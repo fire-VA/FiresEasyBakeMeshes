@@ -28,6 +28,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static GraphicsBuffer Buffer;
         private static ImpostorInstance[] s_mirror = new ImpostorInstance[0];   // what the GPU buffer holds, slot for slot
         internal static int Capacity, HighWater;
+        internal static int Generation;   // 1.2.352: +1 on every Clear (the engine dropped every cell); owners that skip unchanged cells resend after a change
         private static readonly Dictionary<(string, long), Cell> s_cells = new Dictionary<(string, long), Cell>();
         private static readonly List<Range> s_free = new List<Range>();
         private static readonly List<Cell> s_uploads = new List<Cell>();
@@ -205,6 +206,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             s_cells.Clear(); s_free.Clear(); s_uploads.Clear(); s_dead.Clear();
             Buffer?.Release(); Buffer = null; Capacity = 0; HighWater = 0; KindCounts = new int[0]; CountsChanged = true; s_mirror = new ImpostorInstance[0];
+            Generation++;   // 1.2.352
         }
 
         internal static string StatusText() => $"instances {LiveInstances} in {s_cells.Count} cell(s), pool {Capacity} (high water {HighWater}), uploads pending {s_uploads.Count}";

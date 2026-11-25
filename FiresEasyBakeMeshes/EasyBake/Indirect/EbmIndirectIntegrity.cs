@@ -29,6 +29,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         // frame: the stored index count / start / base vertex vs the mesh's submesh NOW. A mismatch logs an Error (mesh, old vs new) and the
         // batch's rows are rewritten from the mesh at once (self-healing).
         private static int s_msCursor, s_msHealed; private static bool s_msSaid;
+        private static float s_driftNext;
+        private static bool DriftSlow => FiresEasyBakeMeshesPlugin.IndirectMeshDriftSlow != null && FiresEasyBakeMeshesPlugin.IndirectMeshDriftSlow.Value;
         private static void MeshDriftTick(int nb)
         {
             if (nb == 0 || s_argsBuf == null) return;
@@ -61,7 +63,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static void IntegrityTick(int nb)
         {
             if (!Active || s_argsBuf == null || s_instBuf == null) return;
-            MeshDriftTick(nb);   // 1.2.234: always on (64 cheap compares a frame), not only with the integrity key
+            // 1.2.265 [Optimize] IndirectMeshDriftSlow (lead 11-10: "draw ticks" phase 0.14 ms EVERY frame in the proof leg): the drift safety check keeps its
+            // 64 batches a step but steps 10 times a second instead of every frame (a full lap of ~1,500 batches in ~2.3 s instead of ~0.4 s). Still always on.
+            if (!DriftSlow || Time.unscaledTime >= s_driftNext) { s_driftNext = Time.unscaledTime + 0.1f; MeshDriftTick(nb); }   // 1.2.234: always on, not only with the integrity key
             MeshContentTick(nb);   // 1.2.235: its own Diagnostics key
             MeshFullTick();   // 1.2.238
             if (!IntegrityOn) return;
@@ -80,7 +84,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     AsyncGPUReadback.Request(buf, words * sizeof(uint), 0, r => OnArgs(r, buf));
                 }
             }
-            if (now >= s_icNextLooks) { s_icNextLooks = now + 1f; IndirectLooks.IntegrityTick(s_high); }   // 1.2.232
+            if (now >= s_icNextLooks && !CompactInFlight) { s_icNextLooks = now + 1f; IndirectLooks.IntegrityTick(s_high); }   // 1.2.232; 1.2.392: not during a compaction pass (a vacated slot's Plain look is uploaded when the pass ends)
             if (!s_icInstPending && now >= s_icNextInst && s_high > 0 && s_high <= s_inst.Length && s_high <= s_instBuf.count)
             {
                 // [generator]: a rolling window of InstWindow slots a second (no multi-ms full copy / readback every 10 s)

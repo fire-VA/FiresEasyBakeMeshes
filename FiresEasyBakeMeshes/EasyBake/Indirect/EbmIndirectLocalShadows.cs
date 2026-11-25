@@ -118,6 +118,70 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             public CommandBuffer Cb; public Light Light; public ShadowMapPass Pass; public int LightIndex, Face = -1;
             public bool[] Rec = new bool[0]; public int RecCount; public bool Bias;
             public int Parked;   // 1.2.213 IndirectLocalSteady: frames this slot has been past the wanted list, still attached
+            // 1.2.330 IndirectLocalDirtyScan: the inputs of this slot's last full scan (see SlotUnchanged)
+            public bool SigOk; public Vector4 SigSphere, SigCone, SigSin; public int SigEpoch, SigNb; public bool SigMerge; public int[] SigLeader;
+        }
+
+        // ── 1.2.330 [Optimize] IndirectLocalDirtyScan ([lead] B1; the per-slot loop over ALL batches was "record lights" 0.171 ms at the settled town) ──
+        // A slot's wanted rows are a pure function of: the CPU cell rows (VisRow / FaceVis), the light's sphere / cone / near plane (its slot index and face),
+        // each batch's caster state (CastsShadows, caster-group leaders E9), the batch set / order, moved batches and the bindings epoch. When ALL of
+        // them equal the last full scan's, the scan would find exactly what it found then, so it is skipped and the slot keeps its recorded list.
+        // Inputs: s_cellVerdictSame (Cull reused last frame's verdict with no dirty cells), s_localMoved empty, the slot's light vectors, faces, nb,
+        // s_bindEpoch, the merge state and the leader array object. Anything else (redo / force) runs exactly as before. Debug proof: every 256th skip
+        // runs the full scan anyway and Warns if it would have changed the slot (it must never fire).
+        private static bool DirtyScanOn => FiresEasyBakeMeshesPlugin.IndirectLocalDirtyScan != null && FiresEasyBakeMeshesPlugin.IndirectLocalDirtyScan.Value;
+        internal static bool s_cellVerdictSame;
+        private static long s_dirtySkips, s_dirtyProofs, s_dirtyProofFails;
+
+        // 1.2.331 ([lead]: 1.2.330 skipped 0 at the settled town): every refusal is counted by its reason, in the order checked
+        internal const int DsNotStamped = 0, DsCells = 1, DsMoved = 2, DsEpoch = 3, DsNb = 4, DsGroups = 5, DsLightPos = 6, DsLightRange = 7, DsCone = 8, DsSin = 9, DsN = 10;
+        internal static readonly string[] DsName = { "never stamped", "cell verdict not reused (or dirty cells)", "batches moved", "bindings epoch", "batch count", "caster groups", "light position", "light range", "spot cone", "spot angle" };
+        internal static readonly long[] s_dsRefused = new long[DsN];
+        // [Optimize] IndirectLocalDirtyScanRelaxed: the light's sphere / cone are NOT compared exactly. Same function because the skip already requires
+        // s_cellVerdictSame, i.e. the CPU rows SlotWants reads (VisRow 7..10 and the face rows FaceVis) ARE last frame's arrays, and CellReuseValid
+        // (EbmIndirect.cs) only reuses them while each light stayed within LightReuseSlack (1 m) of the verdict's, inside the 4 m CPU sphere margin. Vanilla
+        // LightFlicker jitters torch positions every frame, which the exact compare can never pass. The Debug proof still runs (every 256th skip).
+        private static bool DirtyScanRelaxed => FiresEasyBakeMeshesPlugin.IndirectLocalDirtyScanRelaxed != null && FiresEasyBakeMeshesPlugin.IndirectLocalDirtyScanRelaxed.Value;
+
+        private static bool SlotUnchanged(CasterSlot s, int nb)
+        {
+            int k = s.LightIndex, why = -1;
+            if (!s.SigOk) why = DsNotStamped;
+            else if (!s_cellVerdictSame) why = DsCells;
+            else if (s_localMoved.Count != 0) why = DsMoved;
+            else if (s.SigEpoch != s_bindEpoch) why = DsEpoch;
+            else if (s.SigNb != nb) why = DsNb;
+            else if (s.SigMerge != s_mergeActive || !ReferenceEquals(s.SigLeader, s_casterLeader)) why = DsGroups;
+            else if (!DirtyScanRelaxed)
+            {
+                Vector4 a = s.SigSphere, b = s_localSpheres[k];
+                if (a.x != b.x || a.y != b.y || a.z != b.z) why = DsLightPos;
+                else if (a.w != b.w) why = DsLightRange;
+                else if (s.SigCone != s_localCones[k]) why = DsCone;
+                else if (s.SigSin != s_localSinV[k]) why = DsSin;
+            }
+            if (why >= 0) { s_dsRefused[why]++; return false; }
+            return true;
+        }
+
+        // the original per-slot check (1.2.210 / E9), unchanged: a wanted row not recorded = re-record; over a quarter stale = re-record
+        private static bool ScanWouldRedo(CasterSlot s, int nb)
+        {
+            int stale = 0;
+            for (int i = 0; i < nb; i++)
+            {
+                bool w = CasterRowCasts(i) && CasterRowWantsSlot(s, i);   // E9: a merged group is one row, its leader's
+                if (w && !s.Rec[i]) return true;
+                if (!w && s.Rec[i]) stale++;
+            }
+            return stale > 8 && stale * 4 > s.RecCount;
+        }
+
+        private static void StampSlot(CasterSlot s, int nb)
+        {
+            int k = s.LightIndex;
+            s.SigOk = true; s.SigEpoch = s_bindEpoch; s.SigNb = nb; s.SigMerge = s_mergeActive; s.SigLeader = s_casterLeader;
+            s.SigSphere = s_localSpheres[k]; s.SigCone = s_localCones[k]; s.SigSin = s_localSinV[k];
         }
         private static int s_slotAttached;   // 1.2.213: slots 0..s_slotAttached-1 may hold an attached buffer (>= s_slotCount while some are parked)
         private const int MaxSlots = MaxLocal * 6;
@@ -232,17 +296,21 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 if (s.Rec.Length < nb) { System.Array.Resize(ref s.Rec, Mathf.NextPowerOfTwo(nb)); s.RecCount = -1; }
                 bool redo = force || s.RecCount < 0 || s.Bias != faces;
                 if (!redo && s_localMoved.Count > 0 && SlotHoldsMoved(s)) { redo = true; s_localMovedRedos++; }   // 1.2.213: one of ITS batches moved
-                if (!redo)
+                bool skipScan = !redo && DirtyScanOn && SlotUnchanged(s, nb);   // a slot / face / light change already forced redo (RecCount = -1)
+                if (skipScan)
                 {
-                    int stale = 0;
-                    for (int i = 0; i < nb && !redo; i++)
+                    s_dirtySkips++;
+                    // Debug proof: every 256th skip runs the full scan anyway; it must never find a change
+                    if ((s_dirtySkips & 255) == 0 && EasyBakeLog.DebugOn())
                     {
-                        bool w = CastsShadows(s_batches[i]) && SlotWants(s, i);
-                        if (w && !s.Rec[i]) redo = true; else if (!w && s.Rec[i]) stale++;
+                        s_dirtyProofs++;
+                        bool would = ScanWouldRedo(s, nb);
+                        if (would) { s_dirtyProofFails++; EasyBakeLog.Warn($"[Indirect] IndirectLocalDirtyScan proof FAILED: slot {s.LightIndex}/{s.Face} would have re-recorded although every input was unchanged ({s_dirtyProofFails} of {s_dirtyProofs} proofs); turn [Optimize] IndirectLocalDirtyScan off"); }
                     }
-                    if (!redo && stale > 8 && stale * 4 > s.RecCount) redo = true;
                 }
+                else if (!redo) redo = ScanWouldRedo(s, nb);
                 if (redo) { RecordSlot(s, nb, faces); records++; }
+                if (!skipScan) StampSlot(s, nb);
                 draws += s.RecCount;
             }
             s_localMoved.Clear();   // 1.2.213: every current slot has seen this frame's moves
@@ -266,7 +334,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 int i = s_order[j];
                 var b = s_batches[i];
-                if (!CastsShadows(b) || !SlotWants(s, i)) continue;
+                if (!CasterRowCasts(i) || !CasterRowWantsSlot(s, i)) continue;   // E9: members skipped; a leader when any member is wanted
+                var casterMat = CasterMaterialOf(b, out int casterPass);   // E9: EBM/SharedCaster for a group
+                if (casterPass < 0) continue;
                 if (!s_localCasterInfo.TryGetValue(b, out var props))
                 {
                     props = new MaterialPropertyBlock[MaxLocal];
@@ -275,7 +345,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 }
                 else if (b.LocalBound != s_bindEpoch) for (int q = 0; q < MaxLocal; q++) Bind(props[q], (LocalView0 + q) * s_visibleStride + b.VisibleOffset);
                 b.LocalBound = s_bindEpoch;
-                cb.DrawMeshInstancedIndirect(b.Mesh, b.SubMesh, b.Material, b.CasterPass, s_argsBuf, (view * s_batchCap + i) * ArgWords * sizeof(uint), props[k]);
+                cb.DrawMeshInstancedIndirect(b.Mesh, b.SubMesh, casterMat, casterPass, s_argsBuf, (view * s_batchCap + i) * ArgWords * sizeof(uint), props[k]);
                 s.Rec[i] = true; s.RecCount++;
             }
             if (bias) cb.SetGlobalDepthBias(0f, 0f);

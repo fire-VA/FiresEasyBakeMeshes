@@ -14,6 +14,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         // WearNTear.m_snow only above 0.25 build-up), 1-4 = quarters of vanilla's _SnowLevel = Remap(build-up, 0.25, 1, 0, 1). Set by a ZDO scan; a
         // piece from the cache or the server has 0 until its zone is scanned, so an unknown cap is never shown.
         public byte Cap;
+        // 1.2.432 ([visual], Fire: "maybe locations eat the budget over actual builds?"): who placed it, from ZDOVars.s_creator at scan (0 = world-generated, a location).
+        // Saved in cache format v2 (a flag byte per piece); a v1 cache entry reads as unknown until its zone is scanned again. Never in the print.
+        public bool CreatorKnown, World;
     }
 
     /// <summary>The far-relevant pieces of one 64 m zone, plus an order-independent fingerprint of them.</summary>
@@ -34,6 +37,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal const int ZoneLimit = 160; // |zone x/y| beyond this is outside any Valheim world (10.5 km / 64 m)
 
         internal static readonly Dictionary<Vector2s, FarZone> Zones = new Dictionary<Vector2s, FarZone>();
+        internal static int s_cacheDropped; internal static bool s_saidCacheDrop;   // 1.2.430: cached pieces no longer admitted (natural prefabs), for the census
         internal static event Action<Vector2s> Changed;
 
         private static readonly List<Vector2s> s_ring = new List<Vector2s>();
@@ -56,7 +60,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // ── Per-prefab classification (main thread, cached) ──
-        internal sealed class PrefabClass { public bool Draw; public string Name; public float Height; }
+        internal sealed class PrefabClass { public bool Draw; public string Name; public float Height; public float Extent; public float LodU = float.PositiveInfinity; }   // LodU 1.2.428: the real piece's LOD cull reach in units of 2 tan(fov/2) / lodBias (size / last transition); +inf = never culled   // Extent: 1.2.353, the longest side (coarse tier small-piece rule)
         private static readonly Dictionary<int, PrefabClass> s_class = new Dictionary<int, PrefabClass>();
 
         internal static PrefabClass Classify(int hash)
@@ -64,11 +68,18 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (s_class.TryGetValue(hash, out var c)) return c;
             c = new PrefabClass();
             s_class[hash] = c;
+            if (FarBakeSources.IsBake(hash)) { c.Name = FarBakeSources.BakeParentPrefab; c.Draw = true; c.Height = 0f; return c; }   // 1.2.341 (G2): a bake id draws; its mesh comes from FAP
             var prefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(hash) : null;
             if (prefab == null) return c;
             c.Name = prefab.name;
             // A building piece: Piece or WearNTear. Never: vanilla's own distant objects, anything that moves, plants.
-            if (prefab.GetComponent<Piece>() == null && prefab.GetComponent<WearNTear>() == null) return c;
+            // 1.2.430 ([visual]; Fire: "the imposter vegetation is eating up all our vert budget before the builds can draw"): was "Piece OR WearNTear", but FAP adds a
+            // bare Piece to vanilla's natural prefabs for its hammer (FAP VAVanillaPieceManager.cs:1615 prefab.AddComponent<Piece>(), no WearNTear), so trees, rocks and
+            // other world objects counted as far buildings and filled the vertex cap (7.93 M of 8 M in Fire's census). A building piece is one the game can damage and
+            // support: WearNTear (every vanilla build piece and furniture; FAP's own bake roots add one too, VABakeBundle.cs:860 / VABakeParentPrefab.cs:70). Natural
+            // objects are drawn far by their own systems (impostors, far rocks).
+            if (prefab.GetComponent<WearNTear>() == null) return c;
+            if (prefab.GetComponent<TreeBase>() != null || prefab.GetComponent<TreeLog>() != null || prefab.GetComponent<MineRock>() != null || prefab.GetComponent<MineRock5>() != null || prefab.GetComponent<Pickable>() != null) return c;   // defensive: natural kinds never, whatever else they carry
             var nview = prefab.GetComponent<ZNetView>();
             if (nview != null && nview.m_distant) return c;
             if (prefab.GetComponentInChildren<Rigidbody>(true) != null) return c;
@@ -80,6 +91,17 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             // Small furniture and decor do not read at 1-2.5 km and cost vertices.
             if (piece != null && (piece.m_category == Piece.PieceCategory.Furniture || piece.m_category == Piece.PieceCategory.Misc) && extent < 2.5f) return c;
             c.Height = b.max.y;
+            c.Extent = extent;   // 1.2.353
+            // 1.2.428: where the REAL piece stops drawing. Unity's LODGroup (and EBM's indirect draw, EbmIndirect.cs:364 InstancePart.LodFor) culls once
+            // size / (2 d tan(fov/2)) x lodBias falls under the last level's transition, i.e. at d = (size / transition) x lodBias / (2 tan(fov/2)). No LODGroup,
+            // or a last level that is never culled (transition 0) = drawn at any distance (+inf). FarBuildingDraw shows a far copy inside the loaded area only past it.
+            var lg = prefab.GetComponentInChildren<LODGroup>(true);
+            if (lg != null)
+            {
+                var lods = lg.GetLODs();
+                float h = lods.Length > 0 ? lods[lods.Length - 1].screenRelativeTransitionHeight : 0f;
+                if (h > 1e-5f && lg.size > 0f) c.LodU = lg.size / h;
+            }
             c.Draw = true;
             return c;
         }
@@ -120,6 +142,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     $"changed-zones-only {(ChangedOnly ? "on" : "off")}: {s_skippedUnchanged} unchanged zone(s) skipped, {s_safetyRescans} safety rescan(s), {s_safetyFoundChange} of them found a change");
                 s_heldScans = s_loadedScans = s_heldZonesGrown = s_heldPiecesAdded = 0;
                 s_skippedUnchanged = s_safetyRescans = s_safetyFoundChange = 0;
+                // 1.2.341 (G2) census row: the baked blueprints the far tier knows (Fire's proof for the island build)
+                if (FarBakeSources.Available && EasyBakeLog.DebugOn())
+                {
+                    int bakePieces = 0, bakeZones = 0;
+                    foreach (var fz in Zones.Values) { bool any = false; foreach (var fp in fz.Pieces) if (FarBakeSources.IsBake(fp.Prefab)) { bakePieces++; any = true; } if (any) bakeZones++; }
+                    EasyBakeLog.Debug($"{FarBuildings.Log} baked blueprints (VA_BakeParent): {bakePieces} placement(s) in {bakeZones} zone(s) of the ring, {FarBakeSources.Registered} bake name(s) known, {FarBakeSources.Waiting} waiting on FAP's bake");
+                }
             }
 
             // 1.2.255: never while the listed zones are still being read: the index is written from Zones, and a short one would drop the rest at the next launch. The dirty flag stays set.
@@ -241,9 +270,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 Vector3 p = zdo.GetPosition();
                 if (p.y > 3000f) continue;                 // dungeon and location interiors sit up high
                 if (ZoneSystem.GetZone(p) != zone) continue;
-                var c = Classify(zdo.GetPrefab());
+                int prefabHash = zdo.GetPrefab();
+                // 1.2.341 (G2): a baked blueprint (VA_BakeParent) enters as its BAKE ID (FarBakeSources: FAP's cache name), whose far mesh FAP hands over;
+                // without a registration, or a ZDO without a cache name, it stays the plain prefab (no far mesh of its own, as before)
+                if (prefabHash == FarBakeSources.BakeParentHash) { int bake = FarBakeSources.IdFor(zdo); if (bake != 0) prefabHash = bake; }
+                var c = Classify(prefabHash);
                 if (!c.Draw) continue;
-                s_pieces.Add(new FarPiece { Prefab = zdo.GetPrefab(), Pos = p, Rot = zdo.GetRotation(), Cap = CapLevel(zdo.GetFloat(ZDOVars.s_snow)) });
+                s_pieces.Add(new FarPiece { Prefab = prefabHash, Pos = p, Rot = zdo.GetRotation(), Cap = CapLevel(zdo.GetFloat(ZDOVars.s_snow)), CreatorKnown = true, World = zdo.GetLong(ZDOVars.s_creator, 0L) == 0L });   // 1.2.432: creator
             }
             s_buf.Clear();
             if (held)
@@ -279,6 +312,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 {
                     old.Pieces = pieces.ToArray(); s_capOnlyChanges++;
                     Changed?.Invoke(zone);
+                }
+                // 1.2.432: same pieces, but the cached copy did not know who placed them (a v1 entry): take the scan's and write the cache as v2 (no rebuild: the print is unchanged)
+                else if (old != null && pieces.Count > 0 && old.Pieces.Length > 0 && !old.Pieces[0].CreatorKnown && pieces[0].CreatorKnown)
+                {
+                    old.Pieces = pieces.ToArray();
+                    FarCache.Write(FarCacheScope.World, "far-buildings", ZoneKey(zone), Serialize(old.Pieces, old.Print));
                 }
                 return;
             }
@@ -401,6 +440,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 {
                     w.Write(p.Prefab); w.Write(p.Pos.x); w.Write(p.Pos.y); w.Write(p.Pos.z);
                     w.Write(Q(p.Rot.x)); w.Write(Q(p.Rot.y)); w.Write(Q(p.Rot.z)); w.Write(Q(p.Rot.w));
+                    w.Write((byte)((p.CreatorKnown ? 1 : 0) | (p.World ? 2 : 0)));   // 1.2.432 v2: the creator flags
                 }
                 return ms.ToArray();
             }
@@ -417,7 +457,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 {
                     print = r.ReadUInt64();
                     int n = r.ReadInt32();
-                    if (n < 0 || n > MaxPiecesPerZone || data.Length != 12 + n * 24) { LastReject = "size"; return null; }
+                    bool v2 = n >= 0 && data.Length == 12 + n * 25;   // 1.2.432: v2 adds a creator flag byte per piece; v1 (24 B) still reads, creator unknown
+                    if (n < 0 || n > MaxPiecesPerZone || (!v2 && data.Length != 12 + n * 24)) { LastReject = "size"; return null; }
                     var arr = new FarPiece[n];
                     for (int i = 0; i < n; i++)
                     {
@@ -425,11 +466,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                         var pos = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
                         // 0.2.1216: kept exactly as written (D of the int16s, not renormalised), so Q gives back the same int16s for the print
                         var rot = new Quaternion(D(r.ReadInt16()), D(r.ReadInt16()), D(r.ReadInt16()), D(r.ReadInt16()));
+                        byte cf = v2 ? r.ReadByte() : (byte)0;
                         if (!Finite(pos)) { LastReject = "position not finite"; return null; }
                         if (ZoneSystem.GetZone(pos) != expectZone) { LastReject = "a piece outside the zone"; return null; }
                         float m = Mathf.Sqrt(rot.x * rot.x + rot.y * rot.y + rot.z * rot.z + rot.w * rot.w);
                         if (m < 0.5f) { LastReject = "rotation"; return null; }
-                        arr[i] = new FarPiece { Prefab = prefab, Pos = pos, Rot = rot };
+                        arr[i] = new FarPiece { Prefab = prefab, Pos = pos, Rot = rot, CreatorKnown = (cf & 1) != 0, World = (cf & 2) != 0 };
                     }
                     if (Fingerprint(arr) != print) { LastReject = "fingerprint"; return null; }
                     // Not renormalised: |q| is within ~3e-5 of 1 (invisible), and keeping the written values makes this side's print equal the
@@ -469,11 +511,24 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                         IndexReadDone(gen);   // first, and on every answer: a miss and a rejected zone count too
                         if (gen != s_indexGen) return;
                         var pieces = Deserialize(bytes, zone, out _);
+                        // 1.2.430: a cached zone may hold pieces an older build admitted (FAP-pieced natural prefabs): re-judged now; a changed list is written back by Apply
+                        if (pieces != null)
+                        {
+                            int keep = 0; for (int k = 0; k < pieces.Length; k++) if (Classify(pieces[k].Prefab).Draw) keep++;
+                            if (keep != pieces.Length)
+                            {
+                                var kept = new FarPiece[keep]; int j = 0; foreach (var fp in pieces) if (Classify(fp.Prefab).Draw) kept[j++] = fp;
+                                s_cacheDropped += pieces.Length - keep;
+                                if (!Zones.ContainsKey(zone)) Apply(zone, kept, fromServer: false, fromCache: false);
+                                pieces = null;
+                            }
+                        }
                         if (pieces != null && !Zones.ContainsKey(zone)) Apply(zone, pieces, fromServer: false, fromCache: true);
                     });
                     loaded++;
                 }
                 IndexReadDone(gen);   // the index's own read, after its zones were counted
+                s_saidCacheDrop = false;
                 EasyBakeLog.Info($"{FarBuildings.Log} far cache: {loaded} zone(s) with far pieces listed for this world.");
             });
         }

@@ -48,13 +48,16 @@ namespace FiresEasyBakeMeshes.Patches
         [HarmonyPrefix]
         public static void Prefix(GameObject go)
         {
-            if (!FiresEasyBakeMeshesPlugin.SectorMirrorEnabled.Value) return;
+            // 1.2.272: EBM's one ZNetScene.Destroy prefix also takes a waiting object out of CoverageRegistry (no second patch on this method)
+            bool mirror = FiresEasyBakeMeshesPlugin.SectorMirrorEnabled.Value;
+            if (!mirror && EasyBake.Indirect.Coverage.CoverageRegistry.Waiting == 0) return;
             if (go == null) return;
             var nv = go.GetComponent<ZNetView>();
             if (nv == null) return;
             var zdo = nv.GetZDO();
             if (zdo == null) return;
-            EasyBake.SectorInstanceMirror.OnInstanceRemoved(zdo);
+            if (mirror) EasyBake.SectorInstanceMirror.OnInstanceRemoved(zdo);
+            EasyBake.Indirect.Coverage.CoverageRegistry.OnDestroy(zdo);
         }
     }
 
@@ -65,10 +68,14 @@ namespace FiresEasyBakeMeshes.Patches
         public static void Postfix()
         {
             EasyBake.SectorInstanceMirror.Reset();
+            EasyBake.Indirect.Coverage.CoverageRegistry.Clear();   // 1.2.272: cleared at unload
+            EasyBake.DungeonInteriorCull.Clear();   // 1.2.273: dungeons go with the scene
+            EasyBake.Indirect.Coverage.StaticClusters.Clear();   // 1.2.286
             // Zone state outlives the scene otherwise: after a relog a zone still "baked" would hide returning pieces
             // behind combined meshes the old scene took with it, and skipped ZDOs would belong to a finished session.
             try { EasyBake.ZoneTracker.Reset(); }
             catch { }
+            try { EasyBake.MeshCacheStore.ColdSessionWorldClosed(); } catch { }   // 1.2.384: ebm_coldcache never outlives the world it was typed in
         }
     }
 

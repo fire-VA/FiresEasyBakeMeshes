@@ -44,11 +44,17 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         {
             s_aliveValid = false;
             if (!CachedAliveOn) return;
+            // 1.2.277 (lead 11-10, swamp housekeeping: "group walk" 0.019 ms a frame; 875 batches, only 7,975 of 120,676 slots live): an EMPTY
+            // batch draws nothing, so it skips the two native Unity null checks and reads as "not ok" (never handed a possibly destroyed mesh).
+            // Every draw path tests Count first anyway; the few that do not just skip an empty batch.
             for (int i = 0; i < s_batches.Count; i++)
             {
                 var b = s_batches[i];
-                b.MeshOk = b.Mesh != null;
-                b.MatOk = b.Material != null;
+                if (b.Count <= 0) { b.MeshOk = false; b.MatOk = false; continue; }
+                bool meshOk = b.Mesh != null, matOk = b.Material != null;
+                if (meshOk != b.MeshOk || matOk != b.MatOk) s_emptyStamp++;   // 1.2.388 ([seasons] review): a mesh / material that died or came back changes what casts: the cascade scan looks again (IndirectCascadeScanReuse)
+                b.MeshOk = meshOk;
+                b.MatOk = matOk;
             }
             s_aliveValid = true;
         }
@@ -65,7 +71,31 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static int s_lastTaken, s_lastRefused;
         private static bool s_gSnow, s_gField, s_gWet, s_gRoof; private static int s_gInside;
 
-        internal static void RequestFullWalk() { s_walkAll = true; }
+        // 1.2.265 (TESTPLAN row 25, DESIGN_EBM_rows24-26: with IndirectSettledWalk on, only these full walks remain): counted by who asked, so a moving
+        // leg shows whether full walks happen often enough to be worth incremental zone events. The caller is filled in by the compiler (no cost).
+        private static readonly Dictionary<string, int> s_walkWhy = new Dictionary<string, int>();
+        private static int s_walkRequests; private static float s_walkNextSay;
+        internal static void RequestFullWalk([System.Runtime.CompilerServices.CallerMemberName] string caller = "", [System.Runtime.CompilerServices.CallerFilePath] string file = "")
+        {
+            if (!s_walkAll)
+            {
+                s_walkRequests++;
+                string key = System.IO.Path.GetFileNameWithoutExtension(file) + "." + caller;
+                s_walkWhy.TryGetValue(key, out int c); s_walkWhy[key] = c + 1;
+                float now = Time.unscaledTime;
+                if (now >= s_walkNextSay)
+                {
+                    if (s_walkNextSay > 0f && EasyBakeLog.DebugOn())
+                    {
+                        var sb = new System.Text.StringBuilder();
+                        foreach (var kv in s_walkWhy) sb.Append(sb.Length > 0 ? ", " : "").Append(kv.Key).Append(' ').Append(kv.Value);
+                        EasyBakeLog.Debug($"[Indirect] full group walks last 30 s: {s_walkRequests} ({sb})");
+                    }
+                    s_walkNextSay = now + 30f; s_walkRequests = 0; s_walkWhy.Clear();
+                }
+            }
+            s_walkAll = true;
+        }
 
         // a group of a hidden zone is not registered, and must not be: only the full walk knows which zones draw
         internal static void MarkGroupDirty(ZoneInstanceGroup group)
@@ -106,7 +136,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             return true;
         }
 
-        internal static void NoteFullWalkEnd() { s_lastTaken = TakenGroups; s_lastRefused = RefusedGroups; }
+        internal static void NoteFullWalkEnd() { s_lastTaken = TakenGroups; s_lastRefused = RefusedGroups; GateWalkEnd(); }   // 1.2.401 IndirectSelfGate: this walk's instance sum is the load's baked part
 
         internal static void WalkWork()
         {

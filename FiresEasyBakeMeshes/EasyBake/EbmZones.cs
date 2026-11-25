@@ -70,11 +70,57 @@ namespace FiresEasyBakeMeshes.EasyBake
         /// <summary>A key normalised onto the ring grid (wraps the around-the-ring index at the seam). Identity off the ring.</summary>
         internal static Vector2s Norm(Vector2s key) => Ring ? Of(Pos(key)) : key;
 
+        // 1.2.314: vanilla's private "zones still spawning location / dungeon objects" map, read through a compiled field ref (never a publicized reference)
+        private static readonly HarmonyLib.AccessTools.FieldRef<ZoneSystem, System.Collections.Generic.Dictionary<Vector2s, System.Collections.Generic.List<ZDO>>> s_loadingObjects = LoadingRef();
+        private static HarmonyLib.AccessTools.FieldRef<ZoneSystem, System.Collections.Generic.Dictionary<Vector2s, System.Collections.Generic.List<ZDO>>> LoadingRef()
+        {
+            try { return HarmonyLib.AccessTools.FieldRefAccess<ZoneSystem, System.Collections.Generic.Dictionary<Vector2s, System.Collections.Generic.List<ZDO>>>("m_loadingObjectsInZones"); }
+            catch (Exception e) { EasyBakeLog.Info("[ZoneFlip] vanilla's m_loadingObjectsInZones not found (" + e.Message + "): zones count as unloaded while they spawn locations, as before"); return null; }
+        }
+        private static int s_keptLoaded; private static float s_keptSayNext;
+        internal static bool ZoneLoadedIgnoresObjectLoading => FiresEasyBakeMeshesPlugin.ZoneLoadedIgnoresObjectLoading == null || FiresEasyBakeMeshesPlugin.ZoneLoadedIgnoresObjectLoading.Value;
+        /// <summary>For the [ZoneFlip] proof line: vanilla is spawning location / dungeon objects in this zone right now.</summary>
+        internal static bool VanillaLoadingObjects(ZoneSystem zs, Vector2s key)
+        {
+            if (zs == null || s_loadingObjects == null) return false;
+            var lo = s_loadingObjects(zs); return lo != null && lo.ContainsKey(key);
+        }
+
         /// <summary>Is this EBM zone's content loaded: terrain IsZoneLoaded off the ring; within the near area of the player's
         /// object sector on the ring (the same area FAT's ring CreateDestroyObjects instantiates).</summary>
-        internal static bool Loaded(ZoneSystem zs, Vector2s key)
+        internal static bool Loaded(ZoneSystem zs, Vector2s key) => Loaded(zs, key, stillActive: false);
+
+        /// <summary>1.2.314: the same test for a zone EBM already has ACTIVE (ZoneTracker's unload decision only): a zone the game is still
+        /// spawning a location / dungeon in counts as loaded. New zones keep the strict test (never baked before their objects exist).</summary>
+        internal static bool StillLoaded(ZoneSystem zs, Vector2s key) => Loaded(zs, key, stillActive: true);
+
+        private static bool Loaded(ZoneSystem zs, Vector2s key, bool stillActive)
         {
-            if (!Ring) return zs != null && zs.IsZoneLoaded(key);
+            if (!Ring)
+            {
+                if (zs == null) return false;
+                if (zs.IsZoneLoaded(key)) return true;
+                if (!stillActive) return false;
+                // 1.2.314 (Fire's load-in pop; [ZoneFlip] on 1.2.312: near zones "UNLOAD" then "RELOAD" 1-4 frames later with vanilla's own
+                // HaveInstanceInSector TRUE, so UpdateTTL never removed them). Vanilla IsZoneLoaded (ZoneSystem.cs 1339-1346) is
+                // `m_zones.ContainsKey(id) && !m_loadingObjectsInZones.ContainsKey(id)`: it reads FALSE while a LocationProxy in that zone waits to spawn
+                // its location (LocationProxy.cs 57-64 SetLoadingInZone while ShouldDelayProxyLocationSpawning; 73-77 / OnDestroy Unset) or a dungeon
+                // generates (DungeonGenerator.cs 286 / 163), which is exactly what load-in does. The zone, its terrain and its pieces are all still there,
+                // so for EBM a zone that is only "loading objects" stays loaded (the entry is removed when that proxy / dungeon is destroyed with its zone).
+                if (ZoneLoadedIgnoresObjectLoading && s_loadingObjects != null)
+                {
+                    var lo = s_loadingObjects(zs);
+                    if (lo != null && lo.ContainsKey(key))
+                    {
+                        // the proof (a working fix means NO [ZoneFlip] lines): the first time, then at most once per 30 s, at Info
+                        s_keptLoaded++;
+                        float t = Time.unscaledTime;
+                        if (s_keptLoaded == 1 || t >= s_keptSayNext) { s_keptSayNext = t + 30f; EasyBakeLog.InfoFirst("ZoneLoad kept", $"[ZoneLoad] kept {s_keptLoaded} zone check(s) loaded while the game was still spawning a location / dungeon in the zone (last zone {key})"); }
+                        return true;
+                    }
+                }
+                return false;
+            }
             var net = ZNet.instance;
             if (net == null) return false;
             var d = Delta(Of(net.GetReferencePosition()), key);

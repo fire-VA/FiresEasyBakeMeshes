@@ -29,10 +29,28 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static Material s_pack;
         private static RenderTexture s_camRT, s_tA, s_tB, s_atlasA, s_atlasB;
         private static byte[][] s_readA, s_readB; private static int s_readsLeft; private static bool s_readFailed;
+        // 1.2.356 ([2ic], lead 11-13 profiler shore move: "<RenderView>b__0 / b__1" 24.0 + 24.0 MB/min, 16 allocations of 1.5 MB): every readback copied its
+        // mip into a NEW array (GetData().ToArray()). The bake is strictly one kind at a time (Idle -> Render -> Readback -> Work -> Finish -> Idle),
+        // so one buffer per atlas per mip is reused: written by the readback, read by the worker, free again before the next kind's readback.
+        // s_readSerial: a callback from a bake that ended (Done / Abort / Release) is ignored, so it can never write into the next kind's buffers.
+        private static byte[][] s_poolA, s_poolB; private static int s_readSerial;
+        private static byte[] PoolBuf(ref byte[][] pool, int mip, int len)
+        {
+            if (pool == null || pool.Length <= mip) { var n = new byte[Math.Max(mip + 1, 12)][]; if (pool != null) Array.Copy(pool, n, pool.Length); pool = n; }
+            var b = pool[mip];
+            if (b == null || b.Length != len) pool[mip] = b = new byte[len];   // a new atlas size: once
+            return b;
+        }
         private static Task<Result> s_task;
         private static int s_layer = -1;
         private static readonly Vector3 StageOrigin = new Vector3(0f, 40f, 0f);   // meadow height: no altitude snow in the bake
         private static readonly Stopwatch s_sw = new Stopwatch();
+        private const float BakeFovDeg = 1f;
+        private const float LoadingBudgetMs = 40f;   // 1.2.345: under the loading screen (a longer load beats post-load hitches)
+        private static string s_pathUsed;             // Camera.actualRenderingPath of the kind's first view
+        private static double s_lastViewMs;           // cost of the last view (the next one is assumed to cost the same)
+        private static int s_skipFrames;              // after load: frames to wait after an over-budget view
+        internal static int OverBudgetViews, DeferredFrames;   // census: views that cost more than BakeBudgetMs after load; frames skipped for it
         internal static double SpentMs, WorstViewMs; internal static int KindsBaked, FromCache;
         private static readonly int GB0 = Shader.PropertyToID("_ImpGB0"), GB1 = Shader.PropertyToID("_ImpGB1"), GB2 = Shader.PropertyToID("_ImpGB2"), Depth = Shader.PropertyToID("_ImpDepth");
 
@@ -59,7 +77,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (ImpostorAtlas.TrySwap()) ImpostorDraw.KindsChanged();
             var k = ImpostorKinds.NextToBake();
             if (k == null) return;
-            if (Loading()) return;
+            // 1.2.345: baking now runs under the loading screen too (it used to wait for it to close and bake while playing)
             s_kind = k; s_pair = ImpostorAtlas.Target;
             s_size = s_pair.Size; s_px = s_size / ImpostorKinds.Views; s_mips = s_pair.Mips;
             k.State = ImpostorKinds.State.Baking;
@@ -72,7 +90,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 return;
             }
             if (!Setup(k)) { k.State = ImpostorKinds.State.Refused; k.Why = "bake setup failed"; s_kind = null; return; }
-            s_view = 0; s_phase = Phase.Render;
+            s_view = 0; s_phase = Phase.Render; s_pathUsed = null;
         }
 
         private static bool Loading() => Hud.instance != null && Hud.instance.m_loadingScreen != null && Hud.instance.m_loadingScreen.gameObject.activeInHierarchy && Hud.instance.m_loadingScreen.alpha > 0f;
@@ -111,7 +129,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 s_camGo = new GameObject("FiresEBM_ImpostorBakeCamera") { hideFlags = HideFlags.HideAndDontSave };
                 UnityEngine.Object.DontDestroyOnLoad(s_camGo);
                 s_cam = s_camGo.AddComponent<Camera>();
-                s_cam.enabled = false; s_cam.orthographic = true; s_cam.aspect = 1f;
+                // 1.2.345 ([ghost], Fire's run_7: all 30 kinds refused "nothing reached the G-buffer", 0 baked): Unity's built-in pipeline does not
+                // run deferred on an ORTHOGRAPHIC camera (it falls back to forward), so the AfterGBuffer pack below never ran. A perspective camera
+                // with a 1 degree field of view, placed r / tan(0.5 deg) away, is deferred and its rays are parallel within half a degree, so the
+                // 64 views keep the hemi-octahedral layout the draw shader expects. Each kind's line names the path Unity actually used.
+                s_cam.enabled = false; s_cam.orthographic = false; s_cam.fieldOfView = BakeFovDeg; s_cam.aspect = 1f;
                 s_cam.renderingPath = RenderingPath.DeferredShading; s_cam.allowHDR = false; s_cam.allowMSAA = false;
                 s_cam.clearFlags = CameraClearFlags.SolidColor; s_cam.backgroundColor = Color.clear;
                 s_cam.useOcclusionCulling = false;
@@ -132,7 +154,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             s_cb.SetGlobalTexture(GB0, BuiltinRenderTextureType.GBuffer0);
             s_cb.SetGlobalTexture(GB1, BuiltinRenderTextureType.GBuffer1);
             s_cb.SetGlobalTexture(GB2, BuiltinRenderTextureType.GBuffer2);
-            s_cb.SetGlobalTexture(Depth, BuiltinRenderTextureType.ResolvedDepth);
+            // 1.2.346: no ResolvedDepth (run_8 :17647 "built-in render texture type 5 not found": a non-MSAA deferred camera has none). The pack
+            // shader (FiresCoreImpostorPack, firescoreimpostor bundle 1.2.346+) takes coverage from the G-buffer normals instead.
             s_cb.Blit(BuiltinRenderTextureType.GBuffer0, s_tA, s_pack, 0);
             s_cb.Blit(BuiltinRenderTextureType.GBuffer0, s_tB, s_pack, 1);
             // clear the atlases (views outside the kind stay empty)
@@ -152,10 +175,27 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             rt.Create();
         }
 
-        // one view a frame
+        // 1.2.345: views per frame inside a budget: LoadingBudgetMs under the loading screen, [Far Impostors] Bake budget ms after it. After
+        // load a view whose last cost was over the budget still runs (one view is the smallest step), but the next frame is skipped so the
+        // average stays near the budget; every such view is counted (census OverBudgetViews).
         private static void RenderOne()
         {
             if (s_kind.State != ImpostorKinds.State.Baking) { Abort("the kind went away"); return; }
+            if (s_skipFrames > 0) { s_skipFrames--; DeferredFrames++; return; }
+            bool loading = Loading();
+            double budget = loading ? LoadingBudgetMs : ImpostorEngine.BakeBudgetMs;
+            var frame = Stopwatch.StartNew();
+            do
+            {
+                if (!RenderView()) return;
+                if (!loading && s_lastViewMs > budget) { OverBudgetViews++; s_skipFrames = 1; return; }
+            }
+            while (s_phase == Phase.Render && frame.Elapsed.TotalMilliseconds + s_lastViewMs <= budget);
+        }
+
+        // one view; false when the kind is done with views (or stopped)
+        private static bool RenderView()
+        {
             s_sw.Restart();
             int i = s_view % ImpostorKinds.Views, j = s_view / ImpostorKinds.Views;
             Vector3 d = HemiOctDecode(new Vector2((i + 0.5f) / ImpostorKinds.Views, (j + 0.5f) / ImpostorKinds.Views));
@@ -163,25 +203,30 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             Vector3 centre = StageOrigin + s_kind.Bounds.center;
             Vector3 f = -d;
             Vector3 up = Vector3.Cross(Vector3.up, f).sqrMagnitude < 1e-8f ? Vector3.forward : Vector3.up;
-            s_cam.transform.SetPositionAndRotation(centre + d * (r * 3f), Quaternion.LookRotation(f, up));
-            s_cam.orthographicSize = r; s_cam.nearClipPlane = r * 0.5f; s_cam.farClipPlane = r * 6f;
+            float dist = r / Mathf.Tan(BakeFovDeg * 0.5f * Mathf.Deg2Rad);   // the sphere of radius r just fills the 1 degree view
+            s_cam.transform.SetPositionAndRotation(centre + d * dist, Quaternion.LookRotation(f, up));
+            s_cam.nearClipPlane = Mathf.Max(0.1f, dist - r * 1.5f); s_cam.farClipPlane = dist + r * 1.5f;
             s_cam.Render();
+            if (s_pathUsed == null) s_pathUsed = s_cam.actualRenderingPath.ToString();
             Graphics.CopyTexture(s_tA, 0, 0, 0, 0, s_px, s_px, s_atlasA, 0, 0, i * s_px, j * s_px);
             Graphics.CopyTexture(s_tB, 0, 0, 0, 0, s_px, s_px, s_atlasB, 0, 0, i * s_px, j * s_px);
-            double ms = s_sw.Elapsed.TotalMilliseconds; SpentMs += ms; if (ms > WorstViewMs) WorstViewMs = ms;
-            if (++s_view < ImpostorKinds.Views * ImpostorKinds.Views) return;
+            double ms = s_sw.Elapsed.TotalMilliseconds; SpentMs += ms; if (ms > WorstViewMs) WorstViewMs = ms; s_lastViewMs = ms;
+            if (++s_view < ImpostorKinds.Views * ImpostorKinds.Views) return true;
 
             // all views: mips on the GPU, then read every mip back without a stall
             s_stage.SetActive(false); UnityEngine.Object.Destroy(s_stage); s_stage = null;
             s_atlasA.GenerateMips(); s_atlasB.GenerateMips();
             s_readA = new byte[s_mips][]; s_readB = new byte[s_mips][]; s_readsLeft = s_mips * 2; s_readFailed = false;
+            int serial = ++s_readSerial;   // 1.2.356
             for (int m = 0; m < s_mips; m++)
             {
                 int mip = m;
-                AsyncGPUReadback.Request(s_atlasA, mip, TextureFormat.RGBA32, req => { if (req.hasError) s_readFailed = true; else s_readA[mip] = req.GetData<byte>().ToArray(); s_readsLeft--; });
-                AsyncGPUReadback.Request(s_atlasB, mip, TextureFormat.RGBA32, req => { if (req.hasError) s_readFailed = true; else s_readB[mip] = req.GetData<byte>().ToArray(); s_readsLeft--; });
+                // 1.2.356: copied into the pooled buffer for this atlas + mip (was a new array per readback)
+                AsyncGPUReadback.Request(s_atlasA, mip, TextureFormat.RGBA32, req => { if (serial != s_readSerial) return; if (req.hasError) s_readFailed = true; else { var d = req.GetData<byte>(); var buf = PoolBuf(ref s_poolA, mip, d.Length); d.CopyTo(buf); s_readA[mip] = buf; } s_readsLeft--; });
+                AsyncGPUReadback.Request(s_atlasB, mip, TextureFormat.RGBA32, req => { if (serial != s_readSerial) return; if (req.hasError) s_readFailed = true; else { var d = req.GetData<byte>(); var buf = PoolBuf(ref s_poolB, mip, d.Length); d.CopyTo(buf); s_readB[mip] = buf; } s_readsLeft--; });
             }
             s_phase = Phase.Readback;
+            return false;
         }
 
         private static void StartWork()
@@ -233,9 +278,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static void Finish()
         {
             var task = s_task; s_task = null;
-            if (task.IsFaulted || task.Result == null) { Abort("the bake work failed: " + task.Exception?.GetBaseException().Message); return; }
+            if (task.IsFaulted || task.Result == null) { var ex = task.Exception?.GetBaseException(); string at = ex?.StackTrace != null ? ex.StackTrace.Split('\n')[0].Trim() : "?"; Abort("the bake work failed: " + ex?.Message + " at " + at + $" (size {s_size}, px {s_px}, mips {s_mips}, views {ImpostorKinds.Views})"); return; }   // 1.2.346: run_8 cycled 240 times on "Index was outside the bounds of the array" with no frame named
             var r = task.Result;
-            if (r.Why != null) { s_kind.State = ImpostorKinds.State.Refused; s_kind.Why = r.Why; EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {s_kind.Name} refused: {r.Why}"); Done(); return; }
+            if (r.Why != null) { s_kind.State = ImpostorKinds.State.Refused; s_kind.Why = r.Why; EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {s_kind.Name} refused: {r.Why} (bake camera path {s_pathUsed ?? "?"})"); Done(); return; }
             Apply(r, false);
             if (ImpostorEngine.CacheOnDisk)
             {
@@ -245,6 +290,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         private static ImpostorKinds.Kind s_kindLast;
+        private const int MaxFails = 3;   // 1.2.346
+        private static readonly System.Collections.Generic.Dictionary<string, int> s_fails = new System.Collections.Generic.Dictionary<string, int>();
 
         private static void Apply(Result r, bool fromCache)
         {
@@ -256,7 +303,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             k.State = ImpostorKinds.State.Ready;
             if (s_pair == ImpostorAtlas.Current) { bool was = k.HasSlice; k.HasSlice = true; if (was) ImpostorKinds.LookRevision++; }
             KindsBaked++; if (fromCache) FromCache++;
-            EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {k.Name} {(fromCache ? "read from the disk cache" : "baked")}: {s_size} px, coverage {r.Coverage:P0}, upload {ms:0.0} ms, cutoffs {string.Join("/", Array.ConvertAll(r.Cutoffs, c => c.ToString("0.00")))}");
+            EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {k.Name} {(fromCache ? "read from the disk cache" : "baked (bake camera path " + (s_pathUsed ?? "?") + ")")}: {s_size} px, coverage {r.Coverage:P0}, upload {ms:0.0} ms, cutoffs {string.Join("/", Array.ConvertAll(r.Cutoffs, c => c.ToString("0.00")))}");
             if (ImpostorAtlas.TrySwap()) foreach (var kk in ImpostorKinds.All) if (kk.State == ImpostorKinds.State.Ready) kk.HasSlice = true;
             ImpostorDraw.KindsChanged();
             Done();
@@ -264,7 +311,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
         private static void Abort(string why)
         {
-            if (s_kind != null) { EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {s_kind.Name} bake stopped: {why}"); if (s_kind.State == ImpostorKinds.State.Baking) s_kind.State = ImpostorKinds.State.Queued; s_kind.NeedDistance += 1e6f; }
+            if (s_kind != null)
+            {
+                // 1.2.346 ([lead], run_8: 240 throws in 2 minutes, kinds re-queued forever): a kind that fails MaxFails times is refused with the
+                // reason (Info, once per kind) instead of going back to the queue; "the kind went away" is not a failure of the bake.
+                int fails = 0;
+                if (why != "the kind went away") { s_fails.TryGetValue(s_kind.Name, out fails); s_fails[s_kind.Name] = ++fails; }
+                if (fails >= MaxFails)
+                {
+                    s_kind.State = ImpostorKinds.State.Refused; s_kind.Why = $"bake failed {fails} times: {why}";
+                    EasyBakeLog.Info(ImpostorEngine.Tag + $"kind {s_kind.Name} refused after {fails} failed bakes: {why}");
+                }
+                else
+                {
+                    EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {s_kind.Name} bake stopped ({fails} of {MaxFails}): {why}");
+                    if (s_kind.State == ImpostorKinds.State.Baking) s_kind.State = ImpostorKinds.State.Queued; s_kind.NeedDistance += 1e6f;
+                }
+            }
             Done();
         }
 
@@ -272,11 +335,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (s_stage != null) { UnityEngine.Object.Destroy(s_stage); s_stage = null; }
             s_kind = null; s_pair = null; s_phase = Phase.Idle;
+            s_readSerial++;   // 1.2.356: a readback still in flight for this bake writes nothing
         }
 
         internal static void Release()
         {
-            Done(); s_task = null; s_readA = s_readB = null;
+            Done(); s_task = null; s_readA = s_readB = null; s_poolA = s_poolB = null;   // 1.2.356: the pooled readback buffers go with the bake
             foreach (var rt in new[] { s_camRT, s_tA, s_tB, s_atlasA, s_atlasB }) if (rt != null) { rt.Release(); UnityEngine.Object.Destroy(rt); }
             s_camRT = s_tA = s_tB = s_atlasA = s_atlasB = null;
             if (s_cam != null && s_cb != null) s_cam.RemoveCommandBuffer(CameraEvent.AfterGBuffer, s_cb);
@@ -333,6 +397,6 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             catch { return false; }
         }
 
-        private static class Version { internal const int Build = 1; }   // bump when the bake output changes
+        private static class Version { internal const int Build = 3; }   // 3: 1.2.346 mip chain stops at the last multiple of 4 (ImpostorAtlas.MipsFor) + G-buffer coverage   // bump when the bake output changes (2: 1.2.345 perspective 1 degree bake camera)
     }
 }

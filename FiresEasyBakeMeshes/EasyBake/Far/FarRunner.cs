@@ -53,7 +53,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             // EBM port: EBM's own far job queue (replaces Core's FrameBudgetScheduler), drained here first, about 1 ms a frame, client and server.
             try { EbmFarJobs.Drain(); } catch (Exception e) { EasyBakeLog.Warn($"[Far] jobs failed this frame: {e.GetType().Name}: {e.Message}"); }
-            foreach (var p in s_parts) Run(p, p.Update);
+            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Update);   // 1.2.415: index loop, a part may Register another mid-pass (was foreach: "Collection was modified", leg 0446)
         }
         private void LateUpdate()
         {
@@ -63,7 +63,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
         private void LateUpdateInner()
         {
-            foreach (var p in s_parts) Run(p, p.Late);
+            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Late);   // 1.2.415: index loop (see UpdateInner)
             if (Time.unscaledTime >= s_nextLog) { s_nextLog = Time.unscaledTime + 30f; Report(); }
         }
 

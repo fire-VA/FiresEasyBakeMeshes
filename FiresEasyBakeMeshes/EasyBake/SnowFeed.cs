@@ -26,6 +26,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             public Func<bool> Active; public Func<Vector3, float> Cover, Exposure; public Func<bool> Field; public Func<GameObject, string, int> Apply;
         }
         private static readonly List<Source> s_sources = new List<Source>(3);   // highest priority first
+        internal static bool AnySource => s_sources.Count > 0;   // 1.2.266: a piece snow source (a snow mod) is registered
         // the winner per role, recomputed on every (un)registration (read hot: no list walk per call)
         private static Func<bool>[] s_active = new Func<bool>[0];
         private static Source s_cover, s_exposure, s_field, s_apply;
@@ -53,6 +54,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 ? $"[Snow] snow source {owner} (priority {priority}) registered; baked piece snow: cover from {s_cover?.Owner ?? "nobody"}, exposure from {s_exposure?.Owner ?? "vanilla Cover"}, field from {s_field?.Owner ?? "nobody"}, swap by {s_apply?.Owner ?? "nobody"}"
                 : $"[Snow] snow source {owner} withdrawn");
             ZoneTracker.MarkAllSnowDirty();
+            Far.FarBuildingDraw.MarkSnowDirty();   // 1.2.266 ([ghost] review): far caps follow whether a snow source is registered (SnowNeedsSnowMod), so a late registration rebuilds them too
         }
 
         /// <summary>True while any registered snow source is live; EBM then writes snow into its instanced draws.</summary>
@@ -131,7 +133,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 var p = Player.m_localPlayer;
                 string cover = p != null ? CoverageAt(p.transform.position).ToString("0.00") : "?";
-                EasyBakeLog.Debug($"[Snow] 30 s: cover at the player {cover}; far chunks built with snow {Far.FarBuildingDraw.TakeSnowChunks()}; far snow caps: {Far.FarBuildingDraw.TakeCapCounts()} (cap-only zone changes {Far.FarBuildingDigest.s_capOnlyChanges}); re-reads {w_refreshes}, last {(s_lastAt < 0f ? "never" : $"{now - s_lastAt:0} s ago")} ({s_lastWhy}); poll {(RefreshPoll == null || RefreshPoll.Value ? "on" : "off")}");
+                EasyBakeLog.Debug($"[Snow] 30 s: cover at the player {cover}; far chunks built with snow {Far.FarBuildingDraw.TakeSnowChunks()}; area events ignored (snow off) {s_areaIgnored}; far snow caps: {Far.FarBuildingDraw.TakeCapCounts()} (cap-only zone changes {Far.FarBuildingDigest.s_capOnlyChanges}); re-reads {w_refreshes}, last {(s_lastAt < 0f ? "never" : $"{now - s_lastAt:0} s ago")} ({s_lastWhy}); poll {(RefreshPoll == null || RefreshPoll.Value ? "on" : "off")}");
             }
             s_nextSay = now + 30f;
             w_refreshes = 0;
@@ -139,9 +141,14 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void RaiseChanged() => Refresh("the snow source announced a change", false);
 
+        private static int s_areaIgnored;   // 1.2.316: snow-area events dropped while the snow field is off (the [Snow] 30 s line)
         internal static void RaiseAreaChanged(Vector2s zone, Rect area, bool wholeZone)
         {
             AreaEventBound = true;
+            // 1.2.316 ([lead] / Core-FAP read 11-11: Core raises a piece-snow area change for every WearNTear.Awake / OnDestroy even with snow OFF, once
+            // a second, so a town streaming in re-split its instance groups' snow values over and over for nothing). While the snow source says its
+            // field is off there is no snow to re-split: the event is counted and dropped. Snow coming back on re-splits everything once (Refresh).
+            if (!FieldActive) { s_areaIgnored++; return; }
             ZoneTracker.MarkSnowDirtyArea(zone, area, wholeZone);
         }
 
@@ -185,6 +192,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         internal static float ExposureAt(Vector3 top) => ExposureAt(top, Vector3.up);
+
+        /// <summary>1.2.356: who answers ExposureAt (the [SnowBake] roof-test line names it, so a slow cast is pinned on its owner).</summary>
+        internal static string ExposureOwner { get { var s = s_exposure; return s != null ? s.Owner : "EBM's own roof ray (vanilla Cover)"; } }
 
         internal static float ExposureAt(Vector3 top, Vector3 up)
         {

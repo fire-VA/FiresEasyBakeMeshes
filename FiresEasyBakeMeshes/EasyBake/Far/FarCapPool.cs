@@ -122,7 +122,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             long used = 0;
             foreach (var t in order)
             {
-                int est = t.Verts > 0 ? t.Verts : Estimate(t);
+                int est = t.Verts > 0 ? t.Verts : ScaledEst(t);   // 1.2.435: raw x measured ratio
                 if (!t.Evicted)
                 {
                     if (used + est <= budget) used += est;

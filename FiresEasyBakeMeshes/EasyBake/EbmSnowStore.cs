@@ -44,6 +44,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_zones.TryGetValue(coord, out var old))
             {
                 foreach (var id in old.Stored) if (s_snow.TryGetValue(id, out var v)) s_keep[id] = v;
+                s_keepShape.Clear();   // 1.2.437: shape values ride a re-announce the same way
+                foreach (var id in old.Ids) if (s_shape.TryGetValue(id, out var sv)) s_keepShape[id] = sv;
                 Unload(coord, false);
             }
             var zone = new Zone { AnnouncedAt = Time.unscaledTime };
@@ -66,6 +68,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                     o.group.ExtCount++; o.group.ExternalLooksChanged();
                 }
             s_keep.Clear();
+            foreach (var kv in s_keepShape)
+                if (s_owner.TryGetValue(kv.Key, out var o) && o.zone.Equals(coord) && o.group != null && !s_shape.ContainsKey(kv.Key))
+                { s_shape[kv.Key] = kv.Value; o.group.ShapeCount++; o.group.ShapeLooksChanged(); }
+            s_keepShape.Clear();
             s_announced++;
             if (zone.Ids.Count == 0 || liveZdos == null) return Array.Empty<ZDOID>();
             var list = new List<ZDOID>(zone.Ids.Count);
@@ -85,6 +91,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             foreach (var id in zone.Ids)
             {
+                // 1.2.437: shape values go with the zone (no ShapeGen bump: the group is leaving or being re-announced)
+                if (s_shape.Remove(id) && s_owner.TryGetValue(id, out var so) && so.group != null && so.group.ShapeCount > 0) so.group.ShapeCount--;
                 if (s_owner.TryGetValue(id, out var o) && o.zone.Equals(coord)) s_owner.Remove(id);
                 s_caps.Remove(id);
             }
@@ -97,7 +105,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Clear()
         {
-            s_owner.Clear(); s_snow.Clear(); s_caps.Clear(); s_zones.Clear(); s_groupZone.Clear(); s_pending.Clear(); s_holdEnd.Clear();
+            s_owner.Clear(); s_snow.Clear(); s_shape.Clear(); s_keepShape.Clear(); s_caps.Clear(); s_zones.Clear(); s_groupZone.Clear(); s_pending.Clear(); s_holdEnd.Clear();
         }
 
         // ── re-announce after a piece is built / removed in an announced group ([visual] 11-08): at most once per zone per second ──
@@ -139,7 +147,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (s_zones.TryGetValue(owner.zone, out var zone)) zone.Stored.Add(key);
             }
             owner.group.ExternalLooksChanged();
-            s_set++;
+            s_set++; s_amountPushes++;   // 1.2.437: [Snow] shape mode line
             Summary();
             return true;
         }
@@ -187,6 +195,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         /// <summary>ZoneTracker, once a frame: zones whose hold ended re-split, so pieces still unanswered take the computed cover.</summary>
         internal static void PumpHolds(float now)
         {
+            ShapeSummary(now);   // 1.2.437
             if (s_holdEnd.Count == 0) return;
             s_holdScratch.Clear();
             foreach (var kv in s_holdEnd) if (now >= kv.Value) s_holdScratch.Add(kv.Key);
@@ -215,8 +224,73 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (s_owner.TryGetValue(id, out var o) && o.group != null && o.group.ExtCount > 0) { o.group.ExtCount--; o.group.ExternalLooksChanged(); }
                 }
                 zone.Stored.Clear();
+                foreach (var id in zone.Ids)   // 1.2.437: shape values are answered afresh too (owner push, or the shape source at the next look write)
+                    if (s_shape.Remove(id) && s_owner.TryGetValue(id, out var so) && so.group != null) { if (so.group.ShapeCount > 0) so.group.ShapeCount--; so.group.ShapeLooksChanged(); }
                 s_pending[kv.Key] = now;   // ZoneTracker's TakeDue re-announces it this frame (EbmApi.ZoneBaked again)
             }
+        }
+
+        // ── 1.2.437 (Vedr snow redesign step 4, contract with [seasons]): per-piece snow SHAPE, EbmApi.SetPieceSnowShape / RegisterPieceSnowShapeSource ──
+        // encoded: 0 = no snow; 0..1 = winter ground, value = shelter; 2..3 = snow base, value - 2 = shelter. The amount is NOT stored: EBM/Piece
+        // multiplies by Vedr's _VedrSnowA global per pixel. Stored as encoded; the look's .z carries encoded + 1 (0 = unset) - ShapeLookZ.
+        // A shape change touches only the look writes of the piece's group (ZoneInstanceGroup.ShapeLooksChanged -> ShapeGen -> IndirectLooks.WriteGroup,
+        // which re-uploads only slots whose value moved). It never goes through SetPiece / ExternalLooksChanged / the re-split / RaisePieceSnowChanged.
+        // Bounded like s_snow: only pieces of announced zones; dropped on unload, InvalidateSnow and Clear. Main thread only.
+        private static readonly Dictionary<MeshBaker.PieceIdentity, float> s_shape = new Dictionary<MeshBaker.PieceIdentity, float>();
+        private static readonly Dictionary<MeshBaker.PieceIdentity, float> s_keepShape = new Dictionary<MeshBaker.PieceIdentity, float>();
+        private static Func<Vector3, float> s_shapeSource;
+        private static int s_shapeUpdates, s_amountPushes;
+        private static float s_nextShapeLog;
+
+        /// <summary>True while a shape source is registered (shape mode on): baked pieces with no pushed shape ask it at their first look write.</summary>
+        internal static bool ShapeSourceOn => s_shapeSource != null;
+        internal static void RegisterShapeSource(Func<Vector3, float> shapeAt)
+        {
+            if (s_shapeSource == shapeAt) return;
+            s_shapeSource = shapeAt;
+            // every announced group re-writes its looks once (LooksActive may have flipped; source values are asked at that write)
+            foreach (var kv in s_zones) foreach (var g in kv.Value.Groups) g?.ShapeLooksChanged();
+        }
+        internal static void NoteAmountPush() => s_amountPushes++;   // EbmApi.RaisePieceSnowChanged / RaisePieceSnowAreaChanged / InvalidateSnow
+
+        private static float EncodeClamp(float encoded) => float.IsNaN(encoded) || encoded <= 0f ? 0f : Mathf.Min(encoded, 3f);
+
+        /// <summary>EbmApi.SetPieceSnowShape. False = EBM draws no instance of that piece. A no-op when the value did not change.</summary>
+        internal static bool SetShape(ZDOID id, float encoded)
+        {
+            if (!TryOwner(id, out var key, out var owner)) return false;
+            float v = EncodeClamp(encoded);
+            bool had = s_shape.TryGetValue(key, out var old);
+            if (had && old == v) return true;
+            s_shape[key] = v;
+            if (!had) owner.group.ShapeCount++;
+            owner.group.ShapeLooksChanged();
+            s_shapeUpdates++;
+            return true;
+        }
+
+        /// <summary>The look's .z for a piece: stored shape + 1, else (shape source on) the source's value at pos, stored once (bake time); 0 = unset.
+        /// Called from ZoneInstanceGroup.LookOf while the group's looks are written; a source fill bumps nothing (that write is already running).</summary>
+        internal static float ShapeLookZ(ZoneInstanceGroup group, MeshBaker.PieceIdentity id, Vector3 pos)
+        {
+            if (s_shape.TryGetValue(id, out var v)) return v + 1f;
+            var src = s_shapeSource;
+            if (src == null || !s_owner.TryGetValue(id, out var o) || o.group != group) return 0f;
+            float got;
+            try { got = src(pos); } catch (Exception e) { EasyBakeLog.Warn("[Snow] the snow shape source threw, shape mode off until it registers again: " + e.Message); s_shapeSource = null; return 0f; }
+            if (float.IsNaN(got) || float.IsInfinity(got) || got < 0f) return 0f;   // negative = the source has no answer here
+            v = EncodeClamp(got);
+            s_shape[id] = v; group.ShapeCount++;
+            return v + 1f;
+        }
+
+        private static void ShapeSummary(float now)
+        {
+            if (now < s_nextShapeLog) return;
+            s_nextShapeLog = now + 30f;
+            if (s_shape.Count == 0 && s_shapeUpdates == 0 && s_shapeSource == null) { s_amountPushes = 0; return; }   // shape mode not in use: silent
+            EasyBakeLog.Debug($"[Snow] shape mode: {s_shape.Count} pieces with a shape value, {s_shapeUpdates} shape updates, {s_amountPushes} amount pushes last 30 s");
+            s_shapeUpdates = 0; s_amountPushes = 0;
         }
 
         private static bool TryOwner(ZDOID id, out MeshBaker.PieceIdentity key, out (ZoneInstanceGroup group, Vector2s zone) owner)

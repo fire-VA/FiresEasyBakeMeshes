@@ -19,6 +19,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             InvulnerableClassifier.AllImmuneWear = config.Bind("Batching", "VanillaWearOnInvulnerablePieces", false,
                 "Run vanilla wear and support on invulnerable pieces: all-Immune pieces can then collapse, and pieces leaning on a floating negative-health piece can too. Off keeps what stands today standing. Applies to pieces loaded after the change.");
             EasyBakeLog.Debug($"[IdleGates] {(On ? "on" : "off")}");
+            Enabled.SettingChanged += (_, __) => ApplyToTracked();   // 1.2.380: the particle half follows a live flip (the three Update gates read On every call)
         }
 
         // A portal or fade is written once at its end value, then left alone. The first Update always runs, since Awake does not write the start value.
@@ -30,21 +31,48 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly HashSet<string> s_noParticles = new HashSet<string>();
         private static int s_paused;
         private static bool s_said;
+        // 1.2.380 ([lead], Fire: off/on tests toggle keys live in one run; Tools\HOTSWAP_EBM_KEYS_20261114.md section 4): the culling mode written below stayed on the
+        // particle system after the key went off (nothing restored it), and a piece created while the key was off was never looked at again, so an off / on pair in one
+        // run compared the same state twice. The systems this class may pause are remembered whatever the key says; a flip sets every live one to the key's side
+        // (Automatic = what the game had: only a system found on Automatic is ever taken).
+        private static readonly List<ParticleSystem> s_tracked = new List<ParticleSystem>();
+        private static int s_trackedPruneAt = 256;
+
+        private static void ApplyToTracked()
+        {
+            bool on = On;
+            int live = 0, write = 0;
+            for (int i = 0; i < s_tracked.Count; i++)
+            {
+                var system = s_tracked[i];
+                if (system == null) continue;
+                s_tracked[write++] = system; live++;
+                var main = system.main;
+                main.cullingMode = on ? ParticleSystemCullingMode.PauseAndCatchup : ParticleSystemCullingMode.Automatic;
+            }
+            s_tracked.RemoveRange(write, s_tracked.Count - write);
+            s_trackedPruneAt = Mathf.Max(256, s_tracked.Count * 2);
+            EasyBakeLog.Info($"[IdleGates] turned {(on ? "on" : "off")}: {live} looping particle system(s) on placed pieces set to {(on ? "pause off screen" : "the game's own culling")}");
+        }
 
         // Instances, not prefabs: FAP's lazy bundles realize prefabs late, and other mods own theirs. A prefab with no particle system costs one set lookup after its first copy.
         internal static void PauseOffScreen(GameObject go)
         {
-            if (!On || go.GetComponent<Piece>() == null || s_noParticles.Contains(go.name)) return;
+            if (go.GetComponent<Piece>() == null || s_noParticles.Contains(go.name)) return;   // 1.2.380: looked at whatever the key says, so a later flip to on reaches this piece
             go.GetComponentsInChildren(true, s_systems);
             if (s_systems.Count == 0) { s_noParticles.Add(go.name); return; }
+            bool on = On;
             foreach (var system in s_systems)
             {
                 var main = system.main;
                 if (!main.loop || main.cullingMode != ParticleSystemCullingMode.Automatic) continue;
-                main.cullingMode = ParticleSystemCullingMode.PauseAndCatchup;
+                s_tracked.Add(system);   // 1.2.380
+                if (!on) continue;
+                main.cullingMode = ParticleSystemCullingMode.PauseAndCatchup;   // 1.2.378 ([lead]): the 1.2.366 test key [Batching] IdleGatesCullingMode is gone (T6 captures 11-14: PauseAndCatchup / Pause / Off made no measurable difference); this mode stays
                 s_paused++;
             }
             s_systems.Clear();
+            if (s_tracked.Count >= s_trackedPruneAt) { s_tracked.RemoveAll(s => s == null); s_trackedPruneAt = Mathf.Max(256, s_tracked.Count * 2); }   // 1.2.380: destroyed pieces leave the list
             if (!s_said && s_paused > 0) { s_said = true; EasyBakeLog.Debug($"[IdleGates] looping particles on placed pieces pause off screen; first: {go.name}"); }
         }
     }

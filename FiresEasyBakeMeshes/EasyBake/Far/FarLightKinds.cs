@@ -17,6 +17,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             public string Name; public int Hash; public bool Fire, Infinite;
             public float SecPerFuel, Range, Size; public Color Color;
+            public Vector3 LightLocal;   // 1.2.427: the Light's position in the prefab root's space (the glow's anchor; was root + 0.3 / 0.6 m up)
         }
 
         private static readonly Dictionary<int, Kind> s_kinds = new Dictionary<int, Kind>();
@@ -57,6 +58,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     k.Range = light != null ? Mathf.Max(2f, light.range) : 8f;
                     k.Color = light != null ? light.color : new Color(1f, 0.62f, 0.3f);
                     k.Size = Mathf.Clamp(k.Range * 0.18f, 0.6f, 5f);   // glow core in metres: torch ~1.5 m, bonfire ~4 m
+                    k.LightLocal = light != null ? go.transform.InverseTransformPoint(light.transform.position) : new Vector3(0f, k.Fire ? 0.6f : 0.3f, 0f);   // 1.2.427 (Fire: "baked into the wrong spot"): rest pose of the light point
                     s_kinds[k.Hash] = k;
                 }
                 catch (Exception e) { EasyBakeLog.Debug($"[FarLights] prefab {go.name} skipped: {e.GetType().Name}: {e.Message}"); }

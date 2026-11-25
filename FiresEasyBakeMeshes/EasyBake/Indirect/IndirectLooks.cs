@@ -27,7 +27,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static GraphicsBuffer s_buf;
         private static int s_dirtyMin = int.MaxValue, s_dirtyMax = -1;
 
-        private sealed class Seen { public int Version = -1, SnowGen = -1, ExtGen = -1, Slots = -1; public bool Active; }
+        private sealed class Seen { public int Version = -1, SnowGen = -1, ExtGen = -1, ShapeGen = -1, Slots = -1; public bool Active; }   // 1.2.437: + ShapeGen
         private static readonly Dictionary<ZoneInstanceGroup, Seen> s_seen = new Dictionary<ZoneInstanceGroup, Seen>();
         private static int s_mismatchLogs;
 
@@ -40,6 +40,41 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             int old = s_looks.Length;
             Array.Resize(ref s_looks, n);
             for (int i = old; i < n; i++) s_looks[i] = Plain;
+        }
+
+        /// <summary>1.2.389 EbmIndirect.SlotTrimTick (same new length): the CPU array shrinks; every slot at or past it is free. The GPU buffer keeps its size
+        /// (Upload only re-makes a buffer that is too small), so no property block needs a new bind and a pending integrity read stays valid.</summary>
+        internal static void TrimCapacity(int slots)
+        {
+            if (slots >= s_looks.Length) return;
+            Array.Resize(ref s_looks, slots);
+            if (s_dirtyMax >= slots) s_dirtyMax = slots - 1;
+        }
+
+        /// <summary>1.2.392 EbmIndirect.CompactSlots: an instance moved to a lower slot; its look goes with it and the old slot goes back to Plain.</summary>
+        /// The buffer has ONE dirty span ([seasons] review): marking a low and a high slot dirty every frame of a pass would re-send everything between them.
+        /// So the vacated slot is set to Plain on the CPU here and its upload is held back as one tail range, sent once by FlushMovedTail when the pass ends.
+        /// Until then no instance is drawn from that slot (its batch id is 0), and nothing can be handed the slot: any slot hand-out ends the pass first.
+        internal static void MoveSlot(int from, int to)
+        {
+            if (from < 0 || to < 0 || from >= s_looks.Length) return;
+            Set(to, s_looks[from]);
+            if (s_looks[from] == Plain) return;
+            s_looks[from] = Plain;
+            if (from < s_tailMin) s_tailMin = from;
+            if (from > s_tailMax) s_tailMax = from;
+        }
+        private static int s_tailMin = int.MaxValue, s_tailMax = -1;
+
+        /// <summary>1.2.392 EbmIndirect.CompactEnd: the Plain looks of the slots a pass vacated join the dirty span (one upload).</summary>
+        internal static void FlushMovedTail()
+        {
+            if (s_tailMax >= s_tailMin)
+            {
+                int max = Mathf.Min(s_tailMax, s_looks.Length - 1);
+                if (max >= s_tailMin) { if (s_tailMin < s_dirtyMin) s_dirtyMin = s_tailMin; if (max > s_dirtyMax) s_dirtyMax = max; }
+            }
+            s_tailMin = int.MaxValue; s_tailMax = -1;
         }
 
         /// <summary>One slot's look; a no-op when unchanged (so a rewrite of an unchanged group uploads nothing).</summary>
@@ -100,8 +135,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             bool active = group.LooksActive;
             int gen = group.SnowGeneration;
             int ext = group.ExtGen;   // 1.2.206: a pushed EbmApi.SetPieceSnow value changed
-            if (seen.Version == group.Version && seen.SnowGen == gen && seen.ExtGen == ext && seen.Active == active && seen.Slots == slots.Count) return;
-            seen.Version = group.Version; seen.SnowGen = gen; seen.ExtGen = ext; seen.Active = active; seen.Slots = slots.Count;
+            int shape = group.ShapeGen;   // 1.2.437: a snow shape value changed (EbmApi.SetPieceSnowShape): only .z moves; Set uploads changed slots only
+            if (seen.Version == group.Version && seen.SnowGen == gen && seen.ExtGen == ext && seen.ShapeGen == shape && seen.Active == active && seen.Slots == slots.Count) return;
+            seen.Version = group.Version; seen.SnowGen = gen; seen.ExtGen = ext; seen.ShapeGen = shape; seen.Active = active; seen.Slots = slots.Count;
             int n = Mathf.Min(slots.Count, slotInstance.Count);
             for (int k = 0; k < n; k++) Set(slots[k], active ? group.LookOf(slotInstance[k]) : Plain);
         }
@@ -144,6 +180,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_seen.Clear();
             for (int i = 0; i < s_looks.Length; i++) s_looks[i] = Plain;
             s_dirtyMin = int.MaxValue; s_dirtyMax = -1;
+            s_tailMin = int.MaxValue; s_tailMax = -1;   // 1.2.392
         }
     }
 }

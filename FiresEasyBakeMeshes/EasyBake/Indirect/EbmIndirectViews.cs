@@ -29,6 +29,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static void OtherCameraPreCull(Camera cam)
         {
             if (!Active || cam == null || cam == s_drawCamera || s_argsBuf == null || s_batches.Count == 0 || s_otherScratch == null) return;
+            if (s_live == 0 || s_high == 0) return;   // 1.2.404 ([visual], [2ic]'s DN read): nothing live = nothing to draw for this camera; the pass below would dispatch "Mathf.CeilToInt(s_high / 64f)" = 0 groups = Unity's "Thread group size must be above zero" error line, once per probe face (246 in the 1.2.403 DN log, from the self-gate's stand-down on)
             if (cam.cameraType != CameraType.Game && cam.cameraType != CameraType.Reflection) return;
             if (EbmIndirectAssets.Cull == null) return;
             long tO = PhT();   // 1.2.212 phase timer (the own pass below; a pre-culled view returns early and costs ~nothing)
@@ -51,6 +52,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 cs.SetBuffer(k, EbmIndirectAssets.IdInstLod, s_instLodBuf);
                 cs.SetBuffer(k, EbmIndirectAssets.IdBatches, s_batchBuf);
                 cs.SetBuffer(k, EbmIndirectAssets.IdVisible, s_otherScratch);   // 1.2.225 ([generator]): this runs mid-frame too: never UAV-bind the camera-read buffer
+                s_cullForeign++;   // 1.2.388 IndirectCullBindCache: the main cull must bind its own visible buffer again
                 cs.SetBuffer(k, EbmIndirectAssets.IdArgs, s_argsBuf);
                 cs.SetVectorArray(EbmIndirectAssets.IdCamPlanes, s_otherPlanes4);
                 float halfTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
@@ -94,7 +96,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     sent++;
                     if (b.OtherProps == null) { b.OtherProps = new MaterialPropertyBlock(); BindOther(b.OtherProps, OtherView * s_visibleStride + b.VisibleOffset); }
                     var rp = new RenderParams(b.Material)
-                    {
+                    { motionVectorMode = MotionVectorGenerationMode.Camera, 
                         worldBounds = b.World, layer = b.Layer, renderingLayerMask = b.RenderingLayerMask, receiveShadows = b.ReceiveShadows,
                         shadowCastingMode = ShadowCastingMode.Off, matProps = b.OtherProps, camera = cam,
                     };

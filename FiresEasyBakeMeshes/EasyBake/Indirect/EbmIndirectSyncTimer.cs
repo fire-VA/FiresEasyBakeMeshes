@@ -42,7 +42,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         private static void SyncTimed(ZoneInstanceGroup group, GroupSlots reg)
         {
-            if (!s_phOn) { Sync(group, reg); return; }
+            if (!s_phOn || !EasyBakeLog.DebugOn()) { Sync(group, reg); return; }   // 1.2.328: the per-group sync table stays Debug (phase timers are always on now)
             bool first = reg.Version == -1;
             int adds0 = s_addsWindow, removes0 = s_removesWindow, gc0 = System.GC.CollectionCount(0);
             long t0 = Stopwatch.GetTimestamp();

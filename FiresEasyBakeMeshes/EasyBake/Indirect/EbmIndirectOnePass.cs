@@ -108,7 +108,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     for (int q = 0; q < PreSlots; q++) { b.SlotProps[q] = new MaterialPropertyBlock(); Bind(b.SlotProps[q], (PreView0 + q) * s_visibleStride + b.VisibleOffset); }
                 }
                 var rp = new RenderParams(b.Material)
-                {
+                { motionVectorMode = MotionVectorGenerationMode.Camera, 
                     worldBounds = b.World, layer = b.Layer, renderingLayerMask = b.RenderingLayerMask, receiveShadows = b.ReceiveShadows,
                     shadowCastingMode = ShadowCastingMode.Off, matProps = b.SlotProps[slot], camera = cam,
                 };

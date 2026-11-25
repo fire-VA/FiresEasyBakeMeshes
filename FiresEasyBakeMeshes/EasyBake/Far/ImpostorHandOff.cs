@@ -62,6 +62,17 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     int tx = z.x - Origin.x, ty = z.y - Origin.y;
                     s_data[ty * Size + tx] = v;
                 }
+            // 1.2.416 [Far] FarNeedsGround (FarGroundCover): a mask zone that would draw far trees (0) but has NO ground drawn under it yet (vanilla's TerrainLod
+            // not built there: arrival, or its 256 m re-centre still waiting for every region) is masked 255, the same "hide" the cull already honours, so no
+            // impostor floats in the sky. Not added to s_standing (no hand-off event). Re-checked 4 times a second, so they appear the moment the ground does.
+            if (FarGroundCover.On)
+                for (int ty = 0; ty < Size; ty++)
+                    for (int tx = 0; tx < Size; tx++)
+                    {
+                        int i = ty * Size + tx;
+                        if (s_data[i] != 0) continue;
+                        if (!FarGroundCover.Covered(new Vector2s(Origin.x + tx, Origin.y + ty))) s_data[i] = 255;
+                    }
             s_tex.SetPixelData(s_data, 0); s_tex.Apply(false, false);
         }
 

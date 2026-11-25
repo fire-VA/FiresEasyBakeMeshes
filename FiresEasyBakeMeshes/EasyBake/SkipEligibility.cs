@@ -208,7 +208,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 detail = zdo.GetFloat(ZDOVars.s_snow, 0f) > 0f
                     ? $"snow buildup {zdo.GetFloat(ZDOVars.s_snow, 0f):F2} on its ZDO"
                     : "spawned with a location, so Deep North weather will snow it";
-                return "snow can change what it shows, which only a real piece tracks";
+                // 1.2.333 ([lead], the snow-cap design gain question): is snow the ONLY reason, and could this piece take snow damage? Split rows in ebm_census.
+                bool onlySnow = !VedrWinterSnowHere(zdo, info, out _, wantWhy: false)
+                    && (info.AllImmune || StoredHealth(zdo, info) < 0f || DamageableSkipAllowed)
+                    && WearLooks.Resolve(info.Prefab, zdo) == cached.Look && info.BlockerFor(cached.Look) == null
+                    && Quaternion.Angle(zdo.GetRotation(), cached.Rotation) <= 0.5f && (ExpectedScale(zdo, info) - cached.Scale).sqrMagnitude < 0.0001f;
+                bool canTakeSnowDamage = !info.AllImmune && !(StoredHealth(zdo, info) < 0f);
+                return "snow can change what it shows, which only a real piece tracks" + (onlySnow ? (canTakeSnowDamage ? " [snow ONLY; damageable]" : " [snow ONLY; invulnerable]") : " [snow + another reason]");
             }
 
             if (VedrWinterSnowHere(zdo, info, out string winterWhy))

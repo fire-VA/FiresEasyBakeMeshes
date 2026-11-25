@@ -74,23 +74,64 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static void Begin()
         {
             ImpostorAtlas.CheckSize(ImpostorKinds.Count);
+            if (ImpostorAtlas.Target == null) return;   // 1.2.450: the first atlas pair is still being created (over two frames)
             if (ImpostorAtlas.TrySwap()) ImpostorDraw.KindsChanged();
             var k = ImpostorKinds.NextToBake();
-            if (k == null) return;
-            // 1.2.345: baking now runs under the loading screen too (it used to wait for it to close and bake while playing)
-            s_kind = k; s_pair = ImpostorAtlas.Target;
+            if (k == null) { SayQueueEmpty(); FreeWhenIdle(); return; }
+            s_idleSince = -1f;
+            s_pair = ImpostorAtlas.Target;   // 1.2.478: size first, the disk key holds it (Begin runs only while idle, so nothing reads these mid-bake)
             s_size = s_pair.Size; s_px = s_size / ImpostorKinds.Views; s_mips = s_pair.Mips;
+            // 1.2.478: the disk key first, BEFORE the kind is taken: a runtime-made texture's content hash may still be on its way (GPU readback, a few
+            // frames); the kind waits for it up to KeyWaitFrames, then bakes without the disk cache this time.
+            string key = null; bool keyPending = false;
+            if (ImpostorEngine.CacheOnDisk) key = CacheKey(k, out keyPending);   // disk cache off: no key, no content readbacks
+            if (keyPending)
+            {
+                if (s_keyWaitFrames == 0) ImpostorKinds.RequestQueuedRuntimeHashes();   // [2ic] SHOULD: the first frame of a wait asks for every queued kind's hashes at once
+                if (++s_keyWaitFrames < KeyWaitFrames) return;
+                s_keyWaits++; key = null;
+            }
+            s_keyWaitFrames = 0;
+            // 1.2.345: baking now runs under the loading screen too (it used to wait for it to close and bake while playing)
+            s_kind = k;
             k.State = ImpostorKinds.State.Baking;
 
             // the disk cache first
-            string key = CacheKey(k);
-            if (ImpostorEngine.CacheOnDisk && ImpostorDiskCache.TryRead("impostor-atlas", key, out var bytes) && Decode(bytes, out var cached))
+            s_bakeKey = key;   // 1.2.478 ([2ic] S1): Finish saves under THIS key (was re-derived from the live materials at Finish)
+            if (key == null && ImpostorEngine.CacheOnDisk) s_noDiskKinds++;
+            if (ImpostorEngine.CacheOnDisk && key != null && ImpostorDiskCache.TryRead("impostor-atlas", key, out var bytes) && Decode(bytes, out var cached))
             {
                 Apply(cached, true);
                 return;
             }
+            if (ImpostorEngine.CacheOnDisk) EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {k.Name}: " + (key == null ? "a runtime-made texture without a content hash (readback failed or timed out), not disk-cached (1.2.478): baking" : $"not in the disk cache (1.2.478, key {key}): baking"));   // [2ic] S2
             if (!Setup(k)) { k.State = ImpostorKinds.State.Refused; k.Why = "bake setup failed"; s_kind = null; return; }
             s_view = 0; s_phase = Phase.Render; s_pathUsed = null;
+        }
+
+        // 1.2.464 ([visual], lead 11-19 RAM census G8 (rig path) "FiresEBM_ImpostorBake 12.0 MB (1536x1536
+        // ARGB32 ... mips)" x2 for the whole session): the bake targets (two atlas-size render textures, the view textures) and the pooled readback buffers
+        // (one per atlas per mip, RGBA32: ~12.6 MB each at 1536 px, ~25 MB of managed heap) were kept until the world unloaded, though every kind is baked
+        // (or read from the disk cache) within the first minute and new kinds are rare. After IdleFreeSeconds with nothing to bake they are freed; the next
+        // bake makes them again in Setup (Alloc handles null; the pack command buffer is cleared and re-recorded there; the disabled camera never renders
+        // without RenderOne). The atlases themselves (what draws) are untouched.
+        private const float IdleFreeSeconds = 10f;
+        private static float s_idleSince = -1f;
+        private static void FreeWhenIdle()
+        {
+            if (s_atlasA == null && s_poolA == null && s_poolB == null) return;
+            float now = Time.unscaledTime;
+            if (s_idleSince < 0f) { s_idleSince = now; return; }
+            if (now - s_idleSince < IdleFreeSeconds) return;
+            long rtBytes = 0, poolBytes = 0;
+            foreach (var rt in new[] { s_camRT, s_tA, s_tB, s_atlasA, s_atlasB }) if (rt != null) rtBytes += (long)rt.width * rt.height * 4 * (rt.useMipMap ? 4 : 3) / 3;
+            foreach (var pool in new[] { s_poolA, s_poolB }) if (pool != null) foreach (var b in pool) if (b != null) poolBytes += b.Length;
+            if (s_cam != null) s_cam.targetTexture = null;
+            foreach (var rt in new[] { s_camRT, s_tA, s_tB, s_atlasA, s_atlasB }) if (rt != null) { rt.Release(); UnityEngine.Object.Destroy(rt); }
+            s_camRT = s_tA = s_tB = s_atlasA = s_atlasB = null;
+            s_poolA = s_poolB = null; s_readA = s_readB = null;
+            s_idleSince = -1f;
+            EasyBakeLog.Debug(ImpostorEngine.Tag + $"bake buffers freed after {IdleFreeSeconds:0} s with nothing to bake: render targets ~{rtBytes / (1024 * 1024)} MB, readback buffers {poolBytes / (1024 * 1024)} MB (made again by the next bake)");
         }
 
         private static bool Loading() => Hud.instance != null && Hud.instance.m_loadingScreen != null && Hud.instance.m_loadingScreen.gameObject.activeInHierarchy && Hud.instance.m_loadingScreen.alpha > 0f;
@@ -282,9 +323,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             var r = task.Result;
             if (r.Why != null) { s_kind.State = ImpostorKinds.State.Refused; s_kind.Why = r.Why; EasyBakeLog.Debug(ImpostorEngine.Tag + $"kind {s_kind.Name} refused: {r.Why} (bake camera path {s_pathUsed ?? "?"})"); Done(); return; }
             Apply(r, false);
-            if (ImpostorEngine.CacheOnDisk)
+            if (ImpostorEngine.CacheOnDisk && s_bakeKey != null)   // 1.2.478: null = a runtime-made texture, no disk copy
             {
-                string key = CacheKey(s_kindLast); var bytes = Encode(r, s_kindLast);
+                string key = s_bakeKey; var bytes = Encode(r, s_kindLast);
                 Task.Run(() => ImpostorDiskCache.Write("impostor-atlas", key, bytes));
             }
         }
@@ -359,7 +400,27 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         // ── disk cache ──
-        private static string CacheKey(ImpostorKinds.Kind k) => ImpostorDiskCache.Key("imp-v1", k.Signature, s_size, Application.version, Version.Build);
+        // 1.2.478: one Info each time the bake queue empties after new work: the proof that a warm launch reads every kind from the disk cache
+        private static int s_saidAtKinds = -1;
+        private static string s_bakeKey;      // the key read in Begin, written in Finish (null = not disk-cached)
+        private static int s_noDiskKinds;     // bakes of kinds with a runtime-made texture that has no content hash (no disk copy)
+        private const int KeyWaitFrames = 120;   // ~2 s at 60 fps: the longest a kind waits for its textures' content hashes
+        private static int s_keyWaitFrames, s_keyWaits;
+        private static void SayQueueEmpty()
+        {
+            if (KindsBaked == s_saidAtKinds) return;
+            s_saidAtKinds = KindsBaked;
+            EasyBakeLog.Info(ImpostorEngine.Tag + $"bake queue empty (1.2.478): {KindsBaked} kind(s) this session, {FromCache} read from the disk cache, {KindsBaked - FromCache} baked ({s_noDiskKinds} of them not disk-cached: a runtime-made texture without a content hash, {s_keyWaits} of those timed out waiting); disk key: {ImpostorKinds.DiskTextures} texture identity(ies), {ImpostorKinds.DiskCollisions} shared by two different textures; runtime-made textures: {ImpostorKinds.RtHashed} content-hashed, {ImpostorKinds.RtFailed} failed, {ImpostorKinds.RtStartMs:0.00} ms main thread in all, slowest readback {ImpostorKinds.RtWorstFrames:0} frame(s)");
+        }
+
+        // 1.2.478: launch-stable texture identity (was k.Signature with instance IDs: a new key, a re-bake and an orphan file on some launches), imp-v1 -> imp-v2;
+        // + the mod-set tag (game version + every plugin's GUID@version, FarBuildingSources.ModTag), so a mod update that changes a texture under the same name re-bakes.
+        // null = no disk copy (a runtime-made texture without a content hash; pending = its hash is still on its way).
+        private static string CacheKey(ImpostorKinds.Kind k, out bool pending)
+        {
+            string sig = ImpostorKinds.DiskSignatureOf(k, out pending);
+            return sig == null ? null : ImpostorDiskCache.Key("imp-v2", sig, s_size, Application.version, Version.Build, FarBuildingSources.ModTag);
+        }
 
         private static byte[] Encode(Result r, ImpostorKinds.Kind k)
         {

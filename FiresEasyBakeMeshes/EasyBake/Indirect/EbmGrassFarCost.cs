@@ -50,9 +50,21 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             EasyBakeLog.Info(far > 0f ? $"[Grass] far sway stop: EBM-drawn grass further than {far:0} m stands still (eases over 4 m)" : "[Grass] far sway stop off: grass sways at every distance");
         }
 
+        // 1.2.479 ([visual], lead 11-21, Fire: "Norger owns clutter"): Norger Grass sets the same two ClutterSystem fields (its [6 - Clutter] Patch Size /
+        // Amount Multiplier), so with it loaded EBM's GrassPatchSize stands down and never touches them, the same rule as IndirectGrass yielding to a
+        // mod that patches InstanceRenderer. Checked by plugin GUID once (the plugin set is fixed after the chainloader).
+        private static bool? s_norger;
+        private static bool NorgerGrassLoaded { get { if (s_norger == null) s_norger = BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("Norger.Grass"); return s_norger.Value; } }
+        private static bool s_saidNorger;
+
         private static void Apply(ClutterSystem cs)
         {
             if (cs == null || cs.m_menuHack || s_baseSize <= 0f) return;
+            if (NorgerGrassLoaded)
+            {
+                if (!s_saidNorger) { s_saidNorger = true; EasyBakeLog.Info("[Grass] GrassPatchSize stands down: Norger Grass is loaded and owns the grass patch size and density (EBM leaves them as they are)"); }
+                return;
+            }
             // another mod changed the amount since we set it: that is the new base
             if (s_setAmount >= 0f && !Mathf.Approximately(cs.m_amountScale, s_setAmount)) s_baseAmount = cs.m_amountScale / s_ratio;
             float key = SizeKey;

@@ -19,11 +19,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private sealed class Part
         {
             public string Name; public Action Update, Late; public bool ServerToo, Off;
-            public long Ticks, Worst; public int Frames;
+            public Unity.Profiling.ProfilerMarker MarkUpdate, MarkLate;   // 1.2.477: one marker per part, so a normal capture splits the FarRunner rows ("EBM Far: <name>" / "EBM Far late: <name>")
+            public long Ticks, Worst; public int Frames; public int LastFrame = -1;   // 1.2.478: Frames = frames the part ran in (was calls: Update + Late counted twice)
         }
 
         private static FarRunner s_instance;
         private static readonly List<Part> s_parts = new List<Part>();
+        private static readonly Part s_jobs = new Part { Name = "FarJobs" };   // 1.2.478: EbmFarJobs.Drain, timed for the 30 s line (it runs outside Run)
         private static float s_nextLog;
 
         /// <summary>True on a client with a graphics device (the far view draws nothing on a dedicated server).</summary>
@@ -34,7 +36,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (string.IsNullOrEmpty(name)) return;
             foreach (var p in s_parts) if (p.Name == name) { p.Update = update; p.Late = late; p.ServerToo = serverToo; p.Off = false; return; }
-            s_parts.Add(new Part { Name = name, Update = update, Late = late, ServerToo = serverToo });
+            s_parts.Add(new Part { Name = name, Update = update, Late = late, ServerToo = serverToo, MarkUpdate = new Unity.Profiling.ProfilerMarker("EBM Far: " + name), MarkLate = new Unity.Profiling.ProfilerMarker("EBM Far late: " + name) });
             if (s_instance == null)
             {
                 var go = new GameObject("FiresEBM_FarRunner") { hideFlags = HideFlags.HideAndDontSave };
@@ -52,8 +54,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private void UpdateInner()
         {
             // EBM port: EBM's own far job queue (replaces Core's FrameBudgetScheduler), drained here first, about 1 ms a frame, client and server.
-            try { EbmFarJobs.Drain(); } catch (Exception e) { EasyBakeLog.Warn($"[Far] jobs failed this frame: {e.GetType().Name}: {e.Message}"); }
-            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Update);   // 1.2.415: index loop, a part may Register another mid-pass (was foreach: "Collection was modified", leg 0446)
+            long tJobs = Stopwatch.GetTimestamp();   // 1.2.478: timed as "FarJobs"
+            try { using (s_markJobs.Auto()) EbmFarJobs.Drain(); } catch (Exception e) { EasyBakeLog.Warn($"[Far] jobs failed this frame: {e.GetType().Name}: {e.Message}"); }
+            Count(s_jobs, Stopwatch.GetTimestamp() - tJobs);
+            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Update, false);   // 1.2.415: index loop, a part may Register another mid-pass (was foreach: "Collection was modified", leg 0446)
         }
         private void LateUpdate()
         {
@@ -63,22 +67,37 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
         private void LateUpdateInner()
         {
-            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Late);   // 1.2.415: index loop (see UpdateInner)
-            if (Time.unscaledTime >= s_nextLog) { s_nextLog = Time.unscaledTime + 30f; Report(); }
+            for (int i = 0; i < s_parts.Count; i++) Run(s_parts[i], s_parts[i].Late, true);   // 1.2.415: index loop (see UpdateInner)
+            if (s_nextLog <= 0f) { s_nextLog = Time.unscaledTime + 30f; ResetAll(); }   // 1.2.478: the first line covers a full 30 s (was frame 1: load + JIT)
+            else if (Time.unscaledTime >= s_nextLog) { s_nextLog = Time.unscaledTime + 30f; Report(); }
         }
 
-        private static void Run(Part p, Action a)
+        private static readonly Unity.Profiling.ProfilerMarker s_markJobs = new Unity.Profiling.ProfilerMarker("EBM Far: jobs drain");   // 1.2.477
+        private static void Run(Part p, Action a, bool late)
         {
             if (a == null || p.Off || (!p.ServerToo && !Client)) return;
             long t0 = Stopwatch.GetTimestamp();
-            try { a(); }
+            try { using (late ? p.MarkLate.Auto() : p.MarkUpdate.Auto()) a(); }   // 1.2.477: markers need ENABLE_PROFILER (set in the csproj, both configurations)
             catch (Exception e)
             {
                 p.Off = true;
                 EasyBakeLog.Warn($"[Far] {p.Name} failed and is off until the game restarts: {e.GetType().Name}: {e.Message}");
                 EasyBakeLog.Debug($"[Far] {p.Name} failure: {e}");
             }
-            long d = Stopwatch.GetTimestamp() - t0; p.Ticks += d; if (d > p.Worst) p.Worst = d; p.Frames++;
+            Count(p, Stopwatch.GetTimestamp() - t0);
+        }
+
+        // 1.2.478: ticks summed per call; worst = the worst single call; Frames once per frame, so avg = cost per frame
+        private static void Count(Part p, long d)
+        {
+            p.Ticks += d; if (d > p.Worst) p.Worst = d;
+            int f = Time.frameCount; if (p.LastFrame != f) { p.LastFrame = f; p.Frames++; }
+        }
+
+        private static void ResetAll()
+        {
+            foreach (var p in s_parts) { p.Ticks = 0; p.Worst = 0; p.Frames = 0; }
+            s_jobs.Ticks = 0; s_jobs.Worst = 0; s_jobs.Frames = 0;
         }
 
         private static void Report()
@@ -86,10 +105,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (s_parts.Count == 0) return;
             double us = 1e6 / Stopwatch.Frequency;
             var parts = new List<string>();
+            if (s_jobs.Frames > 0) { parts.Add($"FarJobs avg {s_jobs.Ticks * us / s_jobs.Frames:0} us a frame, worst {s_jobs.Worst * us:0} us"); s_jobs.Ticks = 0; s_jobs.Worst = 0; s_jobs.Frames = 0; }   // 1.2.478
             foreach (var p in s_parts)
             {
                 if (p.Frames == 0) continue;
-                parts.Add($"{p.Name} avg {p.Ticks * us / p.Frames:0} us, worst {p.Worst * us:0} us{(p.Off ? " (off)" : "")}");
+                parts.Add($"{p.Name} avg {p.Ticks * us / p.Frames:0} us a frame, worst {p.Worst * us:0} us{(p.Off ? " (off)" : "")}");   // 1.2.478: per frame
                 p.Ticks = 0; p.Worst = 0; p.Frames = 0;
             }
             if (parts.Count > 0) EasyBakeLog.Debug("[Far] main thread, last 30 s: " + string.Join("; ", parts.ToArray()));

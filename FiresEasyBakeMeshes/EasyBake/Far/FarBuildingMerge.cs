@@ -31,6 +31,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         public bool TrackRuns; public List<long> RunKeys; public List<Vector2s> RunZones;   // [Optimize] FarIndexRanges: one run per piece (key + zone), set on the main thread at prep
         public bool Pooled;   // [Optimize] FarMergePooled, set at prep: the worker reuses its lists and rents chunk arrays
         public int SplitCount = -1;   // 1.2.429: a loaded zone's copy holds only the pieces whose real LOD is culled: how many (-1 = a full copy)
+        public ulong SplitSig;        // 1.2.463: the split copy's membership signature (FarBuildingDraw.SigOf), compared by Plan instead of the count alone
+        public List<int> RunPrefabs; public List<Vector3> RunPos;   // 1.2.463: per run (same index as RunKeys) the piece's prefab and position, for the per-piece hand-off
+        public bool HandRuns;         // 1.2.463 measure: runs tracked for the per-piece hand-off (its range table build is counted)
+        public HashSet<long> InKeys;  // 1.2.463: a split copy built WITHOUT runs: the pieces it holds (FarBuildingDraw.StandKey), for the whole-copy fallback
         public int[] MatRefs; public string CacheKey;   // 1.2.425 FarMergedCache: per material (prefab, part, sub); the merged-cache key to save the result under (null = not saved)
 
         internal sealed class Bucket

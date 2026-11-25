@@ -25,9 +25,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         internal static ConfigEntry<bool> WaterOcclOn, WaterOcclVerifyOn;
         internal static void BindWaterOccl(ConfigFile config)
         {
-            WaterOcclOn = config.Bind("Optimize", "WaterHideOccludedTiles", false /* OFF until gate: E2 breakdown 3+ streaks = 0 at town + spot4, then ABBA */,
+            WaterOcclOn = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterHideOccludedTiles", false /* OFF until gate: E2 breakdown 3+ streaks = 0 at town + spot4, then ABBA */,
                 "Water tiles that are completely hidden behind hills or buildings (from where you stand) are not drawn. They come back the moment they could be seen. Swimming, boats and everything else about the water are unchanged. Off = as before.");
-            WaterOcclVerifyOn = config.Bind("Optimize", "WaterHideOccludedTilesVerify", false,
+            WaterOcclVerifyOn = EbmConfigMove.Bind(config, "90 - Debugging", "WaterHideOccludedTilesVerify", false,
                 "Test twin of WaterHideOccludedTiles: nothing is hidden; the log counts the tiles it would hide and how many of those would have popped back within 3 reads (WOULD-POPS should be 0). Off = no test.");
         }
 

@@ -110,7 +110,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (s_roofs.Count == 0 || cam == null || s_noRoofCameras.Contains(cam)) return;
             if (cam != s_main && cam.cameraType != CameraType.Game && cam.cameraType != CameraType.Reflection) return;
-            try { foreach (var (group, far) in s_roofs) if (group != null && group.Count > 0) group.Draw(far, cam); }
+            try { foreach (var (group, far) in s_roofs) if (group != null && group.Count > 0) group.Draw(far, cam); PieceCaps.DrawRoofCapsFor(cam); }   // 1.2.505: + the roof prefabs' snow caps
             catch (System.Exception ex) { EasyBakeLog.Debug($"[Draw] drawing roof groups for camera '{cam.name}' threw: {ex.Message}"); }
         }
 

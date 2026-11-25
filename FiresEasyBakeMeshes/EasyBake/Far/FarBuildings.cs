@@ -22,7 +22,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
     internal static class FarBuildings
     {
         internal const string Log = "[FarBuildings]";
-        private const string Section = "Far buildings";
+        private const string Section = "04 - Far Buildings";   // 1.2.444: was "Far buildings" (EbmConfigMove carries saved values)
 
         // â”€â”€ Config (defaults are what readers see until EBM binds) â”€â”€
         private static ConfigEntry<bool> s_enabled;
@@ -34,8 +34,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static ConfigEntry<bool> s_clientAsks;
         private static ConfigEntry<bool> s_serverSends;
 
-        internal static bool Enabled => s_enabled != null && s_enabled.Value;
-        internal static float Reach => Mathf.Clamp(FarReach.Or(s_reach != null ? s_reach.Value : 2500f), 300f, 5000f);   // 1.2.344: [Far] Far reach wins when set
+        internal static bool Enabled => s_enabled != null && s_enabled.Value && FarRendering.On;   // 1.2.458: AND the Far Rendering master
+        internal static float Reach => FarReach.For(OwnReach);   // 1.2.483: Far Zone Sync = the one shared reach (FarReach.Effective), else OwnReach
+        internal static float OwnReach => Mathf.Clamp(FarReach.Or(s_reach != null ? s_reach.Value : 2500f), 300f, 5000f);   // 1.2.344: [Far] Far reach wins when set (1.2.483: the 1.2.482 reach, unchanged)
         internal static int MaxVertices => s_maxVertices != null ? Mathf.Clamp(s_maxVertices.Value, 100000, 8000000) : 2000000;
         private static ConfigEntry<float> s_arrivalMs;
         internal static double ArrivalBudgetMs => s_arrivalMs != null ? Mathf.Clamp(s_arrivalMs.Value, 0f, 12f) : 6.0;
@@ -53,6 +54,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static bool s_movingCapSaid; private static float s_nextBacklogSaid;   // 1.2.355
         private static bool s_edgeSaid; private const double EdgeBudgetMs = 1.5;   // 1.2.424 edge ring budget
         internal static bool ColdBudgetOn => s_coldBudget == null || s_coldBudget.Value;
+        private static ConfigEntry<bool> s_digestBaseAfterLap;   // 1.2.476
+        // 1.2.477 (lead 11-20: split the FarRunner row in a normal capture; ENABLE_PROFILER is defined in the csproj): the far-buildings steps
+        private static readonly Unity.Profiling.ProfilerMarker s_markDigest = new Unity.Profiling.ProfilerMarker("EBM Far buildings: digest scan"), s_markSources = new Unity.Profiling.ProfilerMarker("EBM Far buildings: sources"), s_markDraw = new Unity.Profiling.ProfilerMarker("EBM Far buildings: plan + prep + upload + hand-off");
+        internal static bool DigestBaseAfterLap => s_digestBaseAfterLap != null && s_digestBaseAfterLap.Value;
         internal static float CellFrom => s_cellFrom != null ? Mathf.Clamp(s_cellFrom.Value, 400f, 5000f) : 1000f;
         // 1.2.353 ([2ic], [lead] 11-13 overnight; Fire: "far drawing must ACTUALLY WORK: whole builds + rocks from far"; run_16 "evicted by the vertex cap 88
         // (nearest evicted 994 m) ... 7,999,767 vertices"): a COARSE tier past "Coarse tier from (m)": the same 512 m cells, clustered at "Coarse cluster (m)"
@@ -97,37 +102,40 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static void Initialize(ConfigFile config)
         {
             if (config == null || s_enabled != null) return;
-            s_enabled = config.Bind(Section, "Enabled", false /* 1.2.211 had it ON; 1.2.263 (Fire 11-10 4:15 AM: far rendering defaults off) OFF. Off = no scans, no worker, no GPU readbacks (Update returns first) */,
-                "Off by default; turn on to draw your visited buildings out to the far view distance (merged far meshes with the pieces' own materials).");
-            s_reach = config.Bind(Section, "Reach (m)", 2500f,
+            // 1.2.458 (Fire 11-18): [03 - Far Rendering] Far Buildings (was [04 - Far Buildings] Enabled; EbmConfigMove carries a saved value), under the master switch
+            s_enabled = EbmConfigMove.Bind(config, FarRendering.Section, "Far Buildings", false /* 1.2.211 had it ON; 1.2.263 (Fire 11-10 4:15 AM: far rendering defaults off) OFF. Off = no scans, no worker, no GPU readbacks (Update returns first) */,
+                "Draws your visited buildings out to the far view distance (merged far meshes with the pieces' own materials). Needs Far Rendering on (on a server too, for the far-base keys in [04 - Far Buildings]).");
+            s_reach = EbmConfigMove.Bind(config, Section, "Reach (m)", 2500f,
                 new ConfigDescription("How far far buildings are drawn.", new AcceptableValueRange<float>(300f, 5000f)));
-            s_maxVertices = config.Bind(Section, "Max vertices", 2000000,
+            s_maxVertices = EbmConfigMove.Bind(config, Section, "Max vertices", 2000000,
                 new ConfigDescription("Cap on far-building vertices (24 bytes each on the GPU). The farthest are dropped first.",
                     new AcceptableValueRange<int>(100000, 8000000)));
-            s_arrivalMs = config.Bind(Section, "Arrival budget (ms)", 6f, new ConfigDescription("1.2.219: main-thread ms a frame for far buildings while you arrive (loading screen, teleport, and until the area has filled in), so distant builds show from the first seconds. 0 = use the normal budget.", new AcceptableValueRange<float>(0f, 12f)));
-            s_coldBudget = config.Bind(Section, "Cold-set arrival budget", true /* 1.2.346 FIX: the far set never finished building at 0.5 ms a frame */,
+            s_arrivalMs = EbmConfigMove.Bind(config, Section, "Arrival budget (ms)", 6f, new ConfigDescription("1.2.219: main-thread ms a frame for far buildings while you arrive (loading screen, teleport, and until the area has filled in), so distant builds show from the first seconds. 0 = use the normal budget.", new AcceptableValueRange<float>(0f, 12f)));
+            s_digestBaseAfterLap = EbmConfigMove.Bind(config, Section, "FarDigestBaseBudgetAfterLap", false /* 1.2.476: OFF until the fire_bf1 A/B (new-key rule) */,
+                "Once every zone in far reach has been read once, keeping the far buildings' list fresh (pieces placed or removed) uses only the main-thread budget instead of the arrival / cold budget. Building far copies keeps the arrival / cold budget. Off = the list is re-read with the full far budget every frame while far copies are still waiting. Applies live.");
+            s_coldBudget = EbmConfigMove.Bind(config, Section, "Cold-set arrival budget", true /* 1.2.346 FIX: the far set never finished building at 0.5 ms a frame */,
                 "While far buildings in reach are still waiting to be built, the far tier uses the arrival budget each frame instead of the main-thread budget, so the whole far set is up within the first minutes after a load or a long move; back to the main-thread budget once everything in reach is built. Off = the steady 0.5 ms from the start (slow to fill).");
-            s_budgetMs = config.Bind(Section, "Main thread budget (ms)", 0.5f,
+            s_budgetMs = EbmConfigMove.Bind(config, Section, "Main thread budget (ms)", 0.5f,
                 new ConfigDescription("Main-thread time per frame for scanning, snow and uploads. Merging runs on a worker thread.",
                     new AcceptableValueRange<float>(0.1f, 4f)));
-            s_cellFrom = config.Bind(Section, "Cell merge from (m)", 1000f,
+            s_cellFrom = EbmConfigMove.Bind(config, Section, "Cell merge from (m)", 1000f,
                 new ConfigDescription("Past this distance zones merge into 512 m cells and are simplified to about 1 m.",
                     new AcceptableValueRange<float>(400f, 5000f)));
-            s_coarseOn = config.Bind(Section, "Coarse tier", false /* 1.2.353: OFF until its gate (dock ABBA + Fire's look); a look change */,
+            s_coarseOn = EbmConfigMove.Bind(config, Section, "Coarse tier", false /* 1.2.353: OFF until its gate (dock ABBA + Fire's look); a look change */,
                 "Past 'Coarse tier from (m)', far buildings are merged with a coarser simplification and small pieces are left out, so more whole builds fit under 'Max vertices' farther out. Outlines stay; fine detail goes.");
-            s_coarseFrom = config.Bind(Section, "Coarse tier from (m)", 1500f,
+            s_coarseFrom = EbmConfigMove.Bind(config, Section, "Coarse tier from (m)", 1500f,
                 new ConfigDescription("Where the coarse tier starts (never nearer than 'Cell merge from (m)').", new AcceptableValueRange<float>(600f, 5000f)));
-            s_coarseCluster = config.Bind(Section, "Coarse cluster (m)", 2f,
+            s_coarseCluster = EbmConfigMove.Bind(config, Section, "Coarse cluster (m)", 2f,
                 new ConfigDescription("Simplification grid of the coarse tier, in metres (the cell tier uses 1 m). Larger = fewer vertices, blockier.", new AcceptableValueRange<float>(1f, 4f)));
-            s_coarseSmall = config.Bind(Section, "Coarse small piece (m)", 1f,
+            s_coarseSmall = EbmConfigMove.Bind(config, Section, "Coarse small piece (m)", 1f,
                 new ConfigDescription("In the coarse tier, pieces whose longest side is under this are left out (0 = keep every piece).", new AcceptableValueRange<float>(0f, 3f)));
             // 1.2.431 ([visual], lead approved; Fire: "some of the far pieces would be naturally covered and not shown so they could be thinned out"): two cuts, each its own key
-            s_interior = config.Bind(Section, "Interior pieces left out", true,
+            s_interior = EbmConfigMove.Bind(config, Section, "Interior pieces left out", true,
                 "Far buildings leave out pieces that are boxed in on every side by other pieces of the same building (inner walls, floors under a roof, stacked foundations). The outer walls and roofs always stay. Frees room under 'Max vertices' for more buildings far away.");
-            s_sizeCut = config.Bind(Section, "Size cut grows with distance", true,
+            s_sizeCut = EbmConfigMove.Bind(config, Section, "Size cut grows with distance", true,
                 "Past 'Coarse tier from (m)', small pieces are left out, and the size left out grows with distance up to 'Size cut max (m)' at the far reach. Outlines stay; small detail that is under a pixel goes.");
-            s_sizeCutMax = config.Bind(Section, "Size cut max (m)", 3f, new ConfigDescription("With 'Size cut grows with distance': pieces whose longest side is under this are left out at the far reach (rising from 'Coarse small piece (m)' at 'Coarse tier from (m)').", new AcceptableValueRange<float>(0.5f, 8f)));
-            s_simplifyFrom = config.Bind(Section, "Simplify zones from (m)", 300f, new ConfigDescription("1.2.432: zone copies farther than this are simplified (vertex clustering, 0.5 m here rising to 1 m at 'Cell merge from'), as the 512 m cells already are. At these distances one cluster is under a pixel; many more buildings fit under 'Max vertices'.", new AcceptableValueRange<float>(100f, 5000f)));
+            s_sizeCutMax = EbmConfigMove.Bind(config, Section, "Size cut max (m)", 3f, new ConfigDescription("With 'Size cut grows with distance': pieces whose longest side is under this are left out at the far reach (rising from 'Coarse small piece (m)' at 'Coarse tier from (m)').", new AcceptableValueRange<float>(0.5f, 8f)));
+            s_simplifyFrom = EbmConfigMove.Bind(config, Section, "Simplify zones from (m)", 300f, new ConfigDescription("1.2.432: zone copies farther than this are simplified (vertex clustering, 0.5 m here rising to 1 m at 'Cell merge from'), as the 512 m cells already are. At these distances one cluster is under a pixel; many more buildings fit under 'Max vertices'.", new AcceptableValueRange<float>(100f, 5000f)));
             s_simplifyFrom.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
             s_interior.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
             s_sizeCut.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
@@ -136,13 +144,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             s_coarseFrom.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
             s_coarseCluster.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
             s_coarseSmall.SettingChanged += (_, __) => FarBuildingDraw.TiersChanged();
-            s_timingLog = config.Bind(Section, "Timing log", false,
+            s_timingLog = EbmConfigMove.Bind(config, Section, "Timing log", false,
                 "Every 10 s, a Debug line with main-thread and worker time, zones, pieces, vertices, draws and GPU memory.");
-            s_clientAsks = config.Bind(Section, "Ask the server for far bases", false,
+            s_clientAsks = EbmConfigMove.Bind(config, Section, "Ask the server for far bases", false,
                 "On a client: ask the server for the bases you have not visited (needs the server key below on the server).");
-            s_serverSends = config.Bind(Section, "Server sends far bases to clients", false,
+            s_serverSends = EbmConfigMove.Bind(config, Section, "Server sends far bases to clients", false,
                 "On a server or host: answer clients' far-base requests with compact zone lists (changed zones only, paced).");
             s_enabled.SettingChanged += (_, __) => { s_wantRestate = true; s_standDownDirty = true; };   // 1.2.269: a toggle re-judges the stand-down
+            FarRendering.Changed += () => { s_wantRestate = true; s_standDownDirty = true; };   // 1.2.458: the same on the master switch (Update stops / starts on Enabled)
             FarRunner.Register("FarBuildings", Update, Late, serverToo: true);
             FarRunner.Register("FarGroundProbe", null, FarGroundProbe.Late);   // [Optimize] FarGroundProbe (E20): counts only, client only, idle while the key is off
         }
@@ -204,19 +213,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             double ms = ((Arriving() || cold) && !moving) ? System.Math.Max(BudgetMs, ArrivalBudgetMs) : BudgetMs;
             if (edgeCold) ms = System.Math.Max(ms, EdgeBudgetMs);
             long budget = (long)(ms * Stopwatch.Frequency / 1000.0);
-            if (moving && Time.unscaledTime >= s_nextBacklogSaid) { s_nextBacklogSaid = Time.unscaledTime + 30f; EasyBakeLog.Info($"{Log} moving: {FarBuildingDraw.ColdBacklog()}"); }   // 1.2.355: the trade, visible every 30 s while moving
+            if (moving && Time.unscaledTime >= s_nextBacklogSaid) { s_nextBacklogSaid = Time.unscaledTime + 30f; if (EasyBakeLog.InfoFirstWouldWrite("far-moving-backlog")) EasyBakeLog.InfoFirst("far-moving-backlog", $"{Log} moving: {FarBuildingDraw.ColdBacklog()}"); }   // next EBM ([lead] GO 11-22): Info once, Debug after; not built when dropped   // 1.2.355: the trade, visible every 30 s while moving
 
             // Host / server: keep the zone digests fresh from the ZDOs it holds. A client scans what it holds too (its visited zones).
             long t0 = Stopwatch.GetTimestamp();
-            FarBuildingDigest.Step(frameStart + budget / 2);
+            // 1.2.476 [Optimize] FarDigestBaseBudgetAfterLap: after the ring's first full lap the digest gets half of the BASE budget, not half of the arrival / cold one
+            bool baseDigest = DigestBaseAfterLap && FarBuildingDigest.LapDone;
+            long digestBudget = baseDigest ? (long)(BudgetMs * Stopwatch.Frequency / 1000.0) : budget;
+            using (s_markDigest.Auto()) FarBuildingDigest.Step(frameStart + digestBudget / 2);   // 1.2.477 marker
+            FarBuildingDigest.NoteLapState(DigestBaseAfterLap);
             S.ScanTicks += Stopwatch.GetTimestamp() - t0;
 
             FarBuildingNet.Update();
 
             if (FarRunner.Client)
             {
-                FarBuildingSources.Step(frameStart + budget);
-                FarBuildingDraw.Update(frameStart + budget);
+                using (s_markSources.Auto()) FarBuildingSources.Step(frameStart + budget);   // 1.2.477 marker
+                using (s_markDraw.Auto()) FarBuildingDraw.Update(frameStart + budget);   // 1.2.477 marker
             }
             long d = Stopwatch.GetTimestamp() - frameStart; if (d > S.WorstTicks) S.WorstTicks = d; S.Frames++;
         }

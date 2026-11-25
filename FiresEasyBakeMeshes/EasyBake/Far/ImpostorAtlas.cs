@@ -18,6 +18,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         }
 
         internal static Pair Current, Next;
+        private static Pair s_building;   // 1.2.450: the first pair while it is being created over two frames
+        private static readonly System.Diagnostics.Stopwatch s_buildSw = new System.Diagnostics.Stopwatch();
+        private static double s_buildMs1;
 
         internal static int PxPerView(ImpostorEngine.Sharpness s) => s == ImpostorEngine.Sharpness.Low ? 64 : s == ImpostorEngine.Sharpness.High ? 192 : s == ImpostorEngine.Sharpness.Ultra ? 256 : 128;
         internal static int MipsFor(int size) { int m = 0; while (size >= 4 && (size & 3) == 0) { m++; size >>= 1; } return m; }   // 1.2.346 ([ghost], Fire run_8: 240 "Index was outside the bounds" bake failures): every mip must be a whole number of 4x4 DXT blocks. Sharpness High = 192 px x 8 views = 1536, whose 9th mip is 6x6: ImpostorDxt.Size(6,6) reserved one block while Encode wrote four, past the end of the chain. Stop at the last multiple of 4 (1536 -> 8 mips, down to 12x12).
@@ -29,7 +32,26 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static void CheckSize(int kinds)
         {
             int size = PxPerView(ImpostorEngine.SharpnessNow) * ImpostorKinds.Views;
-            if (Current == null) { Current = Make(size, kinds); return; }
+            // 1.2.450 ([visual], 449 leg: "created + uploaded in 59.3 / 60.0 ms on the main thread", DontInitializePixels did not help): the first pair is
+            // created over TWO frames (albedo array, then normal array), so no single frame pays both. Current stays null until both exist; the baker
+            // waits for Target (ImpostorBaker.Begin) and nothing draws without a baked slice.
+            if (Current == null)
+            {
+                if (s_building == null || s_building.Size != size)
+                {
+                    int cap = Math.Max(8, ((kinds + 7) / 8) * 8);
+                    s_buildSw.Restart();
+                    s_building = new Pair { Size = size, Mips = MipsFor(size), Capacity = cap, Has = new bool[cap] };
+                    s_building.Albedo = NewArray(size, s_building.Mips, cap, false, "FarImpostorAlbedo");
+                    s_buildMs1 = s_buildSw.Elapsed.TotalMilliseconds;
+                    return;
+                }
+                s_buildSw.Restart();
+                s_building.Normal = NewArray(size, s_building.Mips, s_building.Capacity, true, "FarImpostorNormal");
+                Current = s_building; s_building = null;
+                EasyBakeLog.Info(ImpostorEngine.Tag + $"atlas arrays {size} px, {Current.Mips} mips, {Current.Capacity} slices ({Current.Bytes / (1024 * 1024)} MB), created over 2 frames on the main thread: albedo {s_buildMs1:0.0} ms, normal {s_buildSw.Elapsed.TotalMilliseconds:0.0} ms");
+                return;
+            }
             if (Current.Size == size) { if (Next != null) { Next.Destroy(); Next = null; } return; }
             if (Next != null && Next.Size == size) return;
             Next?.Destroy();
@@ -41,17 +63,31 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             int cap = Math.Max(8, ((kinds + 7) / 8) * 8);
             var p = new Pair { Size = size, Mips = MipsFor(size), Capacity = cap, Has = new bool[cap] };
+            var sw = System.Diagnostics.Stopwatch.StartNew();   // 1.2.448 ([visual], lead: 447 "FarImpostors worst 121811 us" on first use): time the array creation + its zero upload
             p.Albedo = NewArray(size, p.Mips, cap, false, "FarImpostorAlbedo");
             p.Normal = NewArray(size, p.Mips, cap, true, "FarImpostorNormal");
-            EasyBakeLog.Debug(ImpostorEngine.Tag + $"atlas arrays {size} px, {p.Mips} mips, {cap} slices ({p.Bytes / (1024 * 1024)} MB)");
+            EasyBakeLog.Info(ImpostorEngine.Tag + $"atlas arrays {size} px, {p.Mips} mips, {cap} slices ({p.Bytes / (1024 * 1024)} MB), created + uploaded in {sw.Elapsed.TotalMilliseconds:0.0} ms on the main thread");
             return p;
         }
 
         private static Texture2DArray NewArray(int size, int mips, int cap, bool linear, string name)
         {
-            var t = new Texture2DArray(size, size, cap, TextureFormat.DXT5, mips, linear)
+            // 1.2.449 ([visual], 448 leg: "created + uploaded in 64.7 ms on the main thread"): DontInitializePixels skips filling the 63 MB CPU copy with zeros
+            // before the one upload (every slice is overwritten by a bake or a disk read before it is drawn: the draw is gated on Kind.HasSlice, ImpostorDraw.cs:141, set only after a bake / disk read fills the slice). The timer
+            // line in Make() proves the new cost.
+            var gf = linear ? UnityEngine.Experimental.Rendering.GraphicsFormat.RGBA_DXT5_UNorm : UnityEngine.Experimental.Rendering.GraphicsFormat.RGBA_DXT5_SRGB;
+            // 1.2.452 ([visual], 450 leg: albedo 33.1 ms / normal 21.1 ms): slices are only ever written on the GPU (Graphics.CopyTexture from the baker's per-view
+            // textures, ImpostorBaker.cs:212-213, and from the disk-read temp, below), so the CPU copy is never used. DontUploadUponCreate: the constructor no longer
+            // uploads the (uninitialised) CPU data; the single Apply(false, true) creates the GPU texture and frees the CPU copy. UNCONFIRMED that the constructor
+            // uploaded before; the split timer below (ctor vs Apply) proves where the cost is.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var t = new Texture2DArray(size, size, cap, gf,
+                                       UnityEngine.Experimental.Rendering.TextureCreationFlags.MipChain | UnityEngine.Experimental.Rendering.TextureCreationFlags.DontInitializePixels
+                                       | UnityEngine.Experimental.Rendering.TextureCreationFlags.DontUploadUponCreate, mips)
             { name = name, filterMode = FilterMode.Trilinear, wrapMode = TextureWrapMode.Clamp, anisoLevel = 1, hideFlags = HideFlags.HideAndDontSave };
+            double ctor = sw.Elapsed.TotalMilliseconds;
             t.Apply(false, true);   // GPU only
+            EasyBakeLog.Info(ImpostorEngine.Tag + $"atlas array '{name}' {size} px x {cap}: constructor {ctor:0.0} ms, upload (Apply) {sw.Elapsed.TotalMilliseconds - ctor:0.0} ms");
             return t;
         }
 

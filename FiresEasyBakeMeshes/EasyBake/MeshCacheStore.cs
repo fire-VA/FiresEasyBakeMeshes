@@ -1427,6 +1427,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             var mat = FindMaterial(b.MaterialName);
             if (mat == null) return false;
 
+            long tP = Probe.Start();   // 1.2.491 (B): the managed share, as "EasyBake:cacheMeshBuild" (0 = the timer is off, nothing recorded); the GPU upload lands at render
+            EbmTrace.Hf(EbmTrace.HfCacheBuild); EbmTrace.Hf(EbmTrace.HfCacheVerts, b.Vertices != null ? b.Vertices.Length : 0);   // 1.2.491 (A) [Hitch-EBM] counts
             string batchName = b.MaterialName.Split(MaterialKeySeparator)[0] + (farTier ? MeshBaker.FarTierNameSuffix : string.Empty);
             var mesh = new Mesh { name = $"EasyBakeCached_{coord.x}_{coord.y}_{batchName}" };
             if (b.IndexFormatUInt32 || (b.Vertices != null && b.Vertices.Length > 65535)) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;   // 1.2.234: never 16-bit over 65,535 vertices, whatever the cache file says
@@ -1456,6 +1458,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             b.SourceMeshId = mesh.GetInstanceID();   // 1.2.253: this mesh was built from these arrays
             into.Add(new MeshBaker.BatchInstance { Combined = go, Mesh = mesh });
+            Probe.Stop("EasyBake:cacheMeshBuild", tP);   // 1.2.491 (B)
             return true;
         }
 

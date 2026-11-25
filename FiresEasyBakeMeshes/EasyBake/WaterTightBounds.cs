@@ -24,9 +24,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile cfg)
         {
-            Enabled = cfg.Bind("Optimize", "WaterTightTileBounds", true /* 1.2.305 ON: KEEP -0.016 ms spot4 + verify 135 samples TOO TIGHT 0 (DefaultsMigrated1305) */,
+            Enabled = EbmConfigMove.Bind(cfg, "41 - Water Performance", "WaterTightTileBounds", true /* 1.2.305 ON: KEEP -0.016 ms spot4 + verify 135 samples TOO TIGHT 0 (DefaultsMigrated1305) */,
                 "Each water tile's culling box is made as tall as its waves can really reach instead of 20 m, so torches and lamps above the water that cannot light it no longer make the game draw that tile again for them. Same water look. (Tiles split by WaterSplitLitTiles keep their pieces' own boxes, so it does nothing on those.) Off = as before.");
-            Verify = cfg.Bind("Optimize", "WaterTightTileBoundsVerify", false,
+            Verify = EbmConfigMove.Bind(cfg, "90 - Debugging", "WaterTightTileBoundsVerify", false,
                 "Test twin of WaterTightTileBounds: nothing is changed; the log counts torch-on-water overlaps with today's box and the tight one, and checks the real wave height against the tight box (TOO TIGHT must be 0). Off = no test.");
         }
 

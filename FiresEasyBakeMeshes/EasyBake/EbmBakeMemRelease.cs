@@ -37,9 +37,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Cache", "ReleaseBakedCpuCopies", true /* 1.2.264 Fire 11-10: on to test */,
+            Enabled = EbmConfigMove.Bind(config, "26 - Performance - Bakes And Cache", "ReleaseBakedCpuCopies", true /* 1.2.264 Fire 11-10: on to test */,
                 "Baked building meshes keep a second copy in RAM after they are sent to the graphics card. With this on, that copy is freed once the zone's cache file holds the same mesh and nothing changed for a while; if the zone is saved again later, the mesh is read back from that file. Nothing on screen changes. Saves RAM.");
-            IdleSeconds = config.Bind("Cache", "ReleaseIdleSeconds", 30f, new ConfigDescription(
+            IdleSeconds = EbmConfigMove.Bind(config, "26 - Performance - Bakes And Cache", "ReleaseIdleSeconds", 30f, new ConfigDescription(
                 "With ReleaseBakedCpuCopies on: seconds a zone must stay saved and unchanged before its meshes' RAM copies are freed.", new AcceptableValueRange<float>(5f, 600f)));
             Hook();
         }
@@ -150,7 +150,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Optimize", "GpuReleaseFence", true /* 1.2.264 Fire 11-10: on to test */,
+            Enabled = EbmConfigMove.Bind(config, "24 - Performance - GPU Drawing", "GpuReleaseFence", true /* 1.2.264 Fire 11-10: on to test */,
                 "Graphics buffers EBM replaces (when a batch grows) are freed 3 frames later instead of at once, so nothing already sent to the graphics card this frame can use a freed buffer. No visible change. Off = freed at once.");
         }
 

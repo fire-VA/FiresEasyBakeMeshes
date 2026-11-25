@@ -14,7 +14,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void Added(ZDO zdo, ZoneSystem.SectorIndex sectorIndex)
         {
             global::FiresEasyBakeMeshes.Patches.ZdoEventDirty.Dirty = true;
-            try { ScanGate.NoteSectorEvent(sectorIndex); } catch { }
+            try { ScanGate.NoteSectorAdd(zdo, sectorIndex); } catch { }   // 1.2.492: pairs with the remove of a sector move (ScanGateIgnoreInAreaMoves)
             try { SectorArrivals.OnAdd(zdo, sectorIndex); } catch { }
             try { StreamPacer.OnSectorAddHook(zdo, sectorIndex); } catch { }
         }
@@ -30,7 +30,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void Removed(ZDO zdo, ZoneSystem.SectorIndex sectorIndex)
         {
             global::FiresEasyBakeMeshes.Patches.ZdoEventDirty.Dirty = true;
-            try { ScanGate.NoteSectorEvent(sectorIndex); } catch { }
+            try { ScanGate.NoteSectorRemove(zdo, sectorIndex); } catch { }   // 1.2.492: held until the next add or the next gate decision
             try { StreamPacer.OnSectorRemoveHook(zdo); } catch { }
         }
     }

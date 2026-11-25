@@ -17,6 +17,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             public string Name; public int Hash; public bool Fire, Infinite;
             public float SecPerFuel, Range, Size; public Color Color;
+            public float LodDistance = 40f;   // 1.2.473: vanilla LightLod.m_lightDistance of this prefab (40 m when it has none): no glow nearer than where the game switches its light off
             public Vector3 LightLocal;   // 1.2.427: the Light's position in the prefab root's space (the glow's anchor; was root + 0.3 / 0.6 m up)
         }
 
@@ -56,6 +57,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (k == null) continue;
                     k.Name = go.name; k.Hash = go.name.GetStableHashCode();
                     k.Range = light != null ? Mathf.Max(2f, light.range) : 8f;
+                    var lod = go.GetComponentInChildren<LightLod>(true);   // 1.2.473
+                    k.LodDistance = lod != null && lod.m_lightDistance > 0f ? lod.m_lightDistance : Mathf.Max(40f, k.Range);
                     k.Color = light != null ? light.color : new Color(1f, 0.62f, 0.3f);
                     k.Size = Mathf.Clamp(k.Range * 0.18f, 0.6f, 5f);   // glow core in metres: torch ~1.5 m, bonfire ~4 m
                     k.LightLocal = light != null ? go.transform.InverseTransformPoint(light.transform.position) : new Vector3(0f, k.Fire ? 0.6f : 0.3f, 0f);   // 1.2.427 (Fire: "baked into the wrong spot"): rest pose of the light point

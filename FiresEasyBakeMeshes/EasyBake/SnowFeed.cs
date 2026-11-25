@@ -53,8 +53,9 @@ namespace FiresEasyBakeMeshes.EasyBake
             EasyBakeLog.Info(any
                 ? $"[Snow] snow source {owner} (priority {priority}) registered; baked piece snow: cover from {s_cover?.Owner ?? "nobody"}, exposure from {s_exposure?.Owner ?? "vanilla Cover"}, field from {s_field?.Owner ?? "nobody"}, swap by {s_apply?.Owner ?? "nobody"}"
                 : $"[Snow] snow source {owner} withdrawn");
+            EbmChurn.NoteReread(EbmChurn.Reread.Register);   // 1.2.480
             ZoneTracker.MarkAllSnowDirty();
-            Far.FarBuildingDraw.MarkSnowDirty();   // 1.2.266 ([ghost] review): far caps follow whether a snow source is registered (SnowNeedsSnowMod), so a late registration rebuilds them too
+            if (!Far.FarSnow.Layer) Far.FarBuildingDraw.MarkSnowDirty();   // 1.2.468: caps only (a layer copy has none). 1.2.266 ([ghost] review): far caps follow whether a snow source is registered (SnowNeedsSnowMod), so a late registration rebuilds them too
         }
 
         /// <summary>True while any registered snow source is live; EBM then writes snow into its instanced draws.</summary>
@@ -87,7 +88,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            RefreshPoll = config.Bind("Snow", "SnowRefreshPoll", true,
+            RefreshPoll = EbmConfigMove.Bind(config, "08 - Snow And Seasons", "SnowRefreshPoll", true,
                 "Baked and far buildings re-read the season snow whenever the snow mod's revision changes (checked once a second), when you enter a world and 10 s later. A fix: off = only when the snow mod announces a change, which can leave old snow on baked and far buildings.");
         }
 
@@ -100,8 +101,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         /// <summary>Re-read every baked group's snow and rebuild the far chunks' snow. Info only for an outside InvalidateSnow call.</summary>
         internal static void Refresh(string why, bool info)
         {
+            EbmChurn.NoteReread(EbmChurn.RereadOf(why));   // 1.2.480: [Churn] full re-reads by cause
             ZoneTracker.MarkAllSnowDirty();
-            if (Far.FarSnow.Bound) Far.FarBuildingDraw.MarkSnowDirty();   // no far snow registered = far chunks carry none: no rebuild
+            if (Far.FarSnow.Bound && !Far.FarSnow.Layer) Far.FarBuildingDraw.MarkSnowDirty();   /* 1.2.468: caps only */   // no far snow registered = far chunks carry none: no rebuild
             w_refreshes++; s_lastWhy = why; s_lastAt = Time.unscaledTime;
             if (info) EasyBakeLog.Info($"[Snow] snow re-read on baked and far buildings: {why}");
             else EasyBakeLog.Debug($"[Snow] snow re-read on baked and far buildings: {why}");

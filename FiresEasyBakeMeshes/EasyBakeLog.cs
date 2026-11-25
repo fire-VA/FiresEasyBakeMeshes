@@ -36,6 +36,13 @@ namespace FiresEasyBakeMeshes
             bool first; lock (s_saidFirst) first = s_saidFirst.Add(key);
             if (first) Info(msg + " (repeating line: the next ones are Debug)"); else Debug(msg);
         }
+        // next EBM ([lead] GO 11-22, O_20261122_080519 "EBM log: BepInEx write" 1.566 ms/frame): would InfoFirst(key, ...) write anything now? (its first time, or Debug on).
+        // A report that costs work to build asks this first and skips the build when the line would be dropped.
+        public static bool InfoFirstWouldWrite(string key)
+        {
+            bool said; lock (s_saidFirst) said = s_saidFirst.Contains(key);
+            return !said || DebugOn();
+        }
         // 1.2.85 (Fire: "we should not be adding more noisy info logs ... put them as debug logs and set our configs to see them";
         // the team, 19:05: BepInEx's own LogLevels stay as they are, a global Debug wakes every mod's spam): Debug lines follow
         // Core's [Logging] Log Level (FiresLogger.DebugEnabled, Core 0.2.279+, read by name). On (the rigs: Debug), they go out

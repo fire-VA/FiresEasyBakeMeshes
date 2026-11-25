@@ -576,6 +576,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         // player covered 10 m/s, so the position the old test read did not change between our frames. ZNet's reference position is what decides which zones and objects
         // load (in normal play it is the player's own position), so motion is judged from it. Off = the old player-position test (1.2.252), for the A/B.
         private static bool FromReference => FiresEasyBakeMeshesPlugin.StreamPacerMotionFromReference == null || FiresEasyBakeMeshesPlugin.StreamPacerMotionFromReference.Value;
+        // next EBM ([lead] GO 11-22, O_20261122_080519: spot 1 is in water, "in water True" in Vedr's [WaterProbe]; the player treading water at fixed x/z
+        // bobbed y 21-27 at up to 9.6 m/s and the 3D test below flipped moving / standing 93 times in ~4 min). On: motion is judged on x/z only. Off = today.
+        private static bool Horizontal => FiresEasyBakeMeshesPlugin.StreamPacerMotionHorizontal != null && FiresEasyBakeMeshesPlugin.StreamPacerMotionHorizontal.Value;
+        private static float s_vSpeedNow;
         private static float s_speedNow; private static double p_speedSum; private static int p_speedN; private static float p_speedMax;
 
         // 1.2.355: the far tier asks the same stillness test (velocity + reference-position motion), one shared answer per frame
@@ -593,14 +597,19 @@ namespace FiresEasyBakeMeshes.EasyBake
                 float dt = Mathf.Max(1e-4f, Time.unscaledDeltaTime);
                 if (s_motionHave)
                 {
-                    float moved = (pos - s_motionPos).magnitude;
+                    Vector3 step = pos - s_motionPos;
+                    s_vSpeedNow = Mathf.Abs(step.y) / dt;   // next EBM: the probe's vertical figure, measured whatever the key says
+                    if (Horizontal) step.y = 0f;   // next EBM [20] StreamPacerMotionHorizontal: loading is by x/z only (zones, sectors, far rings)
+                    float moved = step.magnitude;
                     s_speedNow = moved / dt;
                     if (moved < 50f) { p_speedSum += s_speedNow; p_speedN++; if (s_speedNow > p_speedMax) p_speedMax = s_speedNow; }   // a teleport is not a speed
                     if (moved > dt * StillSpeed) s_movingUntil = now + MovingHoldS;
                 }
                 s_motionPos = pos; s_motionHave = true;
             }
-            if (me.GetVelocity().sqrMagnitude >= StillSpeed * StillSpeed) return false;
+            Vector3 vel = me.GetVelocity();
+            if (Horizontal) vel.y = 0f;   // next EBM: a swim bob / jump / fall is not motion the loader cares about
+            if (vel.sqrMagnitude >= StillSpeed * StillSpeed) return false;
             if (!byPosition) return true;
             return now >= s_movingUntil;
         }
@@ -615,7 +624,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (now - s_probeStart > 60f || now < s_probeNext) return;
             s_probeNext = now + 1f;
             Vector3 p = me.transform.position, r = ZNet.instance != null ? ZNet.instance.GetReferencePosition() : Vector3.zero;
-            EasyBakeLog.Debug($"[Stream] motion probe t+{now - s_probeStart:0}s: player {p.x:0.0},{p.y:0.0},{p.z:0.0}, body speed {me.GetVelocity().magnitude:0.0} m/s, reference {r.x:0.0},{r.y:0.0},{r.z:0.0}, measured {s_speedNow:0.0} m/s ({(FromReference ? "from the reference position" : "from the player position")}), verdict {(still ? "still" : "moving")}, debug fly {me.InDebugFlyMode()}, riding a ship {me.IsAttachedToShip()}, focused {Application.isFocused}");
+            EasyBakeLog.Debug($"[Stream] motion probe t+{now - s_probeStart:0}s: player {p.x:0.0},{p.y:0.0},{p.z:0.0}, body speed {me.GetVelocity().magnitude:0.0} m/s, reference {r.x:0.0},{r.y:0.0},{r.z:0.0}, measured {s_speedNow:0.0} m/s ({(FromReference ? "from the reference position" : "from the player position")}{(Horizontal ? ", x/z only" : ", 3D")}; body horizontal {new Vector2(me.GetVelocity().x, me.GetVelocity().z).magnitude:0.0} / vertical {Mathf.Abs(me.GetVelocity().y):0.0} m/s, measured vertical {s_vSpeedNow:0.0} m/s), verdict {(still ? "still" : "moving")}, debug fly {me.InDebugFlyMode()}, riding a ship {me.IsAttachedToShip()}, focused {Application.isFocused}");
         }
 
         private static float Budget(bool arrival, out int cap)

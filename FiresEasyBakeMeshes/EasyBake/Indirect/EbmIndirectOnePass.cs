@@ -74,11 +74,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 var pos = c.transform.position;
                 s_preCams[s] = new Vector4(pos.x, pos.y, pos.z, QualitySettings.lodBias / (2f * Mathf.Max(halfTan, 0.01f)));
                 s_preCam[s] = c; s_preVP[s] = vp;
+                FillLayerCull(c, s_preLayerCull, s * 8);   // 1.2.490: camera s's own layerCullDistances (EbmIndirectViews.cs)
             }
-            for (int s = s_preCount; s < PreSlots; s++) s_preCam[s] = null;
+            for (int s = s_preCount; s < PreSlots; s++) { s_preCam[s] = null; for (int k = 0; k < 8; k++) s_preLayerCull[s * 8 + k] = Vector4.zero; }
             s_seenCount = 0;
             cs.SetVectorArray(IdOtherPlanes, s_prePlanes);
             cs.SetVectorArray(IdOtherCams, s_preCams);
+            cs.SetVectorArray(IdOtherLayerCull, s_preLayerCull);   // 1.2.490: always (all 0 = no cut)
             cs.SetInt(IdOtherCount, s_preCount);
             s_preFrame = Time.frameCount;
             return true;   // with the key on, the mode-2 pass never runs (no lights = nothing to cull)
@@ -102,6 +104,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 var b = s_batches[i];
                 if (b.Count <= 0 || (mask & (1 << b.Layer)) == 0 || !HasMesh(b)) continue;   // 1.2.213: cached alive check
+                if (BatchPastLayer(b, s_preLayerCull, slot * 8, s_preCams[slot])) { s_layerCutBatches++; continue; }   // 1.2.490: wholly past its layer's distance (the slot's table, as culled)
                 if (b.SlotProps == null)
                 {
                     b.SlotProps = new MaterialPropertyBlock[PreSlots];

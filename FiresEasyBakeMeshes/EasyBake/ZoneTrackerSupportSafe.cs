@@ -185,5 +185,111 @@ namespace FiresEasyBakeMeshes.EasyBake
                 + $"dropped at the {RecreateHardCapSeconds:0} s cap {c_hardCap}; kept past the cap {c_capKept} piece(s) in {c_capKeptZones} zone-period(s) (1.2.345: still waiting for the pacer); pieces destroyed near a hand-back {c_brokeNear}; support reads held {c_supportHeld} in {s_heldZones.Count} held zone(s) now; {HoldCensus()}");
             c_handedBack = c_landings = c_hardCap = c_framesMax = c_brokeNear = c_supportHeld = 0; c_framesSum = 0; c_secsMax = 0f; c_capKept = c_capKeptZones = 0;
         }
+
+        // ── 1.2.482 SUPPORT GRACE ([visual], [2ic] / [lead] 11-21): a code gap found while reading the piece-loss legs. NOT the proven cause of the mead
+        // breaks: on piece_loss_diag 072729_fps the 4 meads broke (vanilla no-support wear, WearNTear.cs:390-395, :487-489) BEFORE the session's first held
+        // support read (13773-13779 vs 13783), so no stand-in drop preceded them; that cause is OPEN (skiponhost_off / vanilla legs decide) ──
+        // ReleaseSkipped (every TearDown: rebake of a dirty zone, empty-zone teardown, zone removal) set every skipped piece Created = false and destroyed the
+        // zone's stand-ins in the SAME frame (DestroyStandIns -> DetachColliders). Vanilla re-creates those pieces over many frames inside its create budget
+        // (arrival: thousands), so for that time the real pieces standing on them had no collider under them; only the 10 s HaveSupport hold covered it, and
+        // when it ran out before the supporters existed, the first wear pass broke them. Every other hand-back path already waits (AwaitingRecreate ->
+        // FinishHandBacks keeps a stand-in until its real piece exists and ran UpdateSupport, rule 1 at the top of this file); this one did not.
+        // Now: the stand-in root of a released zone is KEPT (detached from the zone state, colliders live) until each released piece is real and has read
+        // its support (SupportReady), or was skipped again (a new stand-in stands), or is gone / outside the loaded zones; capped at GraceCapSeconds. Then
+        // its colliders are detached + destroyed as before, a 10 s HaveSupport hold follows, and the drop feeds the "destroyed near a hand-back" Warning.
+        // A real piece and its kept stand-in may overlap until the drop: the same overlap the hand-back landing already accepts (rule 2 at the top).
+        private const float GraceCapSeconds = 120f;
+        private const int GraceChecksPerTick = 2000;
+        private sealed class Grace { public GameObject Root; public Vector2s Coord; public List<ZDO> Pieces; public int Next; public float Since; }
+        private static readonly List<Grace> s_graces = new List<Grace>();
+        private static int c_graceKept, c_graceDropped, c_graceCapped, c_gracePieces; private static float c_graceMaxSecs;
+
+        /// <summary>The pieces ReleaseSkipped hands back with the zone's stand-ins still standing: the skipped ones and a hand-back in flight.</summary>
+        private static List<ZDO> ReleasedForGrace(ZoneState state)
+        {
+            var list = new List<ZDO>(state.Skipped.Count + (state.AwaitingRecreate != null ? state.AwaitingRecreate.Count : 0));
+            foreach (var kv in state.Skipped) if (kv.Key != null) list.Add(kv.Key);
+            if (state.AwaitingRecreate != null) foreach (var z in state.AwaitingRecreate) if (z != null) list.Add(z);
+            return list;
+        }
+
+        /// <summary>True = the zone's stand-in root is kept until its released pieces exist (the caller must not destroy it); false = nothing to keep.</summary>
+        private static bool KeepStandInsUntilCreated(ZoneState state, List<ZDO> released)
+        {
+            if (released == null || released.Count == 0 || state.StandInRoot == null) return false;
+            NoteStandInsTouched(state);
+            s_graces.Add(new Grace { Root = state.StandInRoot, Coord = state.Coord, Pieces = released, Since = Time.unscaledTime });
+            state.StandInRoot = null;   // the zone builds a fresh root for its next skips; the kept one belongs to the grace list now
+            state.StandIns.Clear();
+            c_graceKept++; c_gracePieces += released.Count;
+            return true;
+        }
+
+        // True when this released piece no longer needs its kept stand-in.
+        private static bool GraceDone(ZDO zdo)
+        {
+            if (zdo == null || !zdo.IsValid()) return true;
+            if (ZoneSystem.instance == null || !ZoneSystem.instance.IsZoneLoaded(zdo.GetPosition())) return true;   // its zone left: nothing stands on it here
+            if (IsSkipped(zdo)) return true;   // skipped again: its new stand-in stands (EnsureStandIn before every skip)
+            var inst = ZNetScene.instance != null ? ZNetScene.instance.FindInstance(zdo) : null;
+            if (inst != null) return SupportReady(inst);   // real: once it ran UpdateSupport (or is not ours to run it)
+            return zdo.Created;   // created by someone else without an instance (another mod's skip): not coming back soon
+        }
+
+        /// <summary>Each slow tick (and while disabling): drop the kept stand-ins whose pieces are all back, or at the cap.</summary>
+        internal static void GraceTick(float now)
+        {
+            if (s_graces.Count == 0) return;
+            int budget = GraceChecksPerTick;
+            for (int g = s_graces.Count - 1; g >= 0; g--)
+            {
+                var gr = s_graces[g];
+                while (gr.Next < gr.Pieces.Count && budget > 0 && GraceDone(gr.Pieces[gr.Next])) { gr.Next++; budget--; }
+                bool capped = now - gr.Since >= GraceCapSeconds;
+                if (gr.Next < gr.Pieces.Count && !capped) continue;
+                float secs = now - gr.Since; if (secs > c_graceMaxSecs) c_graceMaxSecs = secs;
+                if (capped && gr.Next < gr.Pieces.Count)
+                {
+                    c_graceCapped++;
+                    EasyBakeLog.InfoFirst("Grace cap", $"[Transition] stand-ins kept for zone ({gr.Coord.x},{gr.Coord.y}) dropped at the {GraceCapSeconds:0} s cap with {gr.Pieces.Count - gr.Next} of {gr.Pieces.Count} released piece(s) not back yet (repeating line: the next ones are Debug)");
+                }
+                else c_graceDropped++;
+                DropGrace(gr, now);
+                s_graces.RemoveAt(g);
+                if (budget <= 0) break;
+            }
+        }
+
+        private static void DropGrace(Grace gr, float now)
+        {
+            if (gr.Root != null) { DetachColliders(gr.Root); Object.Destroy(gr.Root); }
+            s_heldZones[gr.Coord] = now + SupportHoldSeconds;   // the 10 s tail: neighbours re-read their support once the kept colliders are gone
+            c_holdWhy.TryGetValue("kept stand-ins dropped", out int w); c_holdWhy["kept stand-ins dropped"] = w + 1;
+            foreach (var z in gr.Pieces) if (z != null && z.IsValid()) s_recentDrops.Add(new Drop { Pos = z.GetPosition(), Time = now });   // feeds the "destroyed near a hand-back" Warning
+            if (s_recentDrops.Count > 4096) s_recentDrops.RemoveRange(0, s_recentDrops.Count - 4096);
+        }
+
+        /// <summary>1.2.482 ([lead]): the [Churn] line's counts NOW: real WearNTear pieces EBM's zones hold (ZoneState.Pieces, the [Heap] "live piece refs"),
+        /// skipped pieces (stand-ins drawn by the bake), baked instance groups, tracked zones. A walk over the zones, once per 30 s line.</summary>
+        internal static void ChurnPieceCounts(out int real, out int skipped, out int groups, out int zones)
+        {
+            real = skipped = groups = 0; zones = _zones.Count;
+            foreach (var st in _zones.Values)
+            {
+                real += st.Pieces.Count; skipped += st.Skipped.Count;
+                var gs = st.Bake != null ? st.Bake.InstanceGroups : null;
+                if (gs != null) groups += gs.Count;
+            }
+        }
+
+        /// <summary>For the [Churn] line (Info with ChurnLine on): session totals.</summary>
+        internal static string GraceChurn() => $"stand-ins kept for released pieces (session): {c_graceKept} zone release(s), {c_gracePieces} piece(s), dropped when back {c_graceDropped}, at the {GraceCapSeconds:0} s cap {c_graceCapped}, longest {c_graceMaxSecs:0} s, kept now {s_graces.Count}";
+
+        private static void GraceReset()
+        {
+            foreach (var gr in s_graces) if (gr.Root != null) { DetachColliders(gr.Root); Object.Destroy(gr.Root); }
+            s_graces.Clear();
+            c_graceKept = c_graceDropped = c_graceCapped = c_gracePieces = 0; c_graceMaxSecs = 0f;
+        }
     }
 }

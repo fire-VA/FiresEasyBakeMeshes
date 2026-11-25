@@ -15,6 +15,16 @@ namespace FiresEasyBakeMeshes.EasyBake
         public bool[] RendererPriorEnabled;
         public bool[] LodGroupPriorEnabled;
         [System.NonSerialized] internal bool Restored;   // 1.2.255: the bake gave this piece back; the component is only waiting to be destroyed
+        // 1.2.505 ([visual], piece snow caps v1, [2ic] MUST B): EBM draws this piece's snow cap (PieceCaps), so it switched the piece's own cap renderers
+        // (m_snow / m_snowWorn / m_snowBroken and their children) off. CapClaimed is true from ClaimCaps until UnclaimCaps; ClaimedCaps holds exactly the
+        // renderers ClaimCaps switched off, and UnclaimCaps switches exactly those back on (enabled = true) - the only write of enabled = false onto a cap
+        // renderer in EBM. Public = serialized: Instantiate copies both onto a clone (references remapped to the clone's own children), whose Start ->
+        // RestoreVisuals -> UnclaimCaps gives them back. Every exit reaches UnclaimCaps: RestoreVisuals, PieceCaps' unclaims, OnDestroy.
+        public bool CapClaimed;
+        public MeshRenderer[] ClaimedCaps;
+        [System.NonSerialized] internal object CapList;   // the PieceCaps list that claimed it (census: "claimed with no cap instance")
+        [System.NonSerialized] internal int CapListBuild;   // that list's build number when it claimed / re-confirmed it
+        internal static int ClaimedNow;   // live claimed suppressions (census)
 
         public static EasyBakeSuppressedVisuals SuppressPiece(GameObject pieceRoot)
         {
@@ -76,6 +86,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
             }
             finally { renderers.Clear(); }
+            UnclaimCaps();   // 1.2.505: before PieceLeftBake, so a listener already reads EbmApi.DrawsPieceCap = false and sees its cap renderers on
             // 1.2.198 ([saddles] / [generator]): the one point a live piece the bake drew gets its own renderers back (unbake, dirty,
             // teardown, build hold, damage): visual hooks that deferred on EbmBakedPieces.Draws run now
             FiresEasyBakeMeshes.EbmBakedPieces.RaiseLeft(gameObject);
@@ -158,8 +169,48 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static readonly System.Collections.Generic.HashSet<EasyBakeSuppressedVisuals> All = new System.Collections.Generic.HashSet<EasyBakeSuppressedVisuals>();
         internal static int Changes;
 
-        private void Awake() { All.Add(this); Changes++; }
-        private void OnDestroy() { All.Remove(this); Changes++; }
+        private void Awake() { All.Add(this); Changes++; if (CapClaimed) ClaimedNow++; }   // 1.2.505: a clone arrives claimed (serialized) until its Start restores
+        private void OnDestroy() { UnclaimCaps(); All.Remove(this); Changes++; }   // 1.2.505: [2ic] MUST B safety - a claimed piece never leaves with its caps off
+
+        // ── 1.2.505 piece snow caps v1: claim / unclaim (PieceCaps calls ClaimCaps; every exit calls UnclaimCaps) ──
+        private static readonly System.Collections.Generic.List<MeshRenderer> s_capScratch = new System.Collections.Generic.List<MeshRenderer>(8);
+        private static readonly System.Collections.Generic.List<MeshRenderer> s_capFound = new System.Collections.Generic.List<MeshRenderer>(8);
+
+        /// <summary>EBM now draws this piece's cap: switch its own cap renderers off, remembering exactly which. No-op when already claimed or restored.</summary>
+        internal void ClaimCaps(object list, int build)
+        {
+            if (Restored) return;
+            if (CapClaimed) { CapList = list; CapListBuild = build; return; }
+            var wear = GetComponent<WearNTear>();
+            var renderers = s_capScratch;
+            GetComponentsInChildren(true, renderers);
+            try
+            {
+                s_capFound.Clear();
+                for (int i = 0; i < renderers.Count; i++)
+                {
+                    var r = renderers[i];
+                    if (r == null || !UnderSnowCap(r.transform, wear)) continue;
+                    if (!r.enabled) continue;   // already off: nothing to give back for it
+                    r.enabled = false;
+                    s_capFound.Add(r);
+                }
+                ClaimedCaps = s_capFound.Count > 0 ? s_capFound.ToArray() : null;
+            }
+            finally { renderers.Clear(); s_capFound.Clear(); }
+            CapClaimed = true; CapList = list; CapListBuild = build;
+            ClaimedNow++;
+        }
+
+        /// <summary>The one restore: exactly the renderers ClaimCaps switched off go back on. Safe to call any number of times.</summary>
+        internal void UnclaimCaps()
+        {
+            if (!CapClaimed) return;
+            var caps = ClaimedCaps;
+            if (caps != null) for (int i = 0; i < caps.Length; i++) if (caps[i] != null) caps[i].enabled = true;
+            ClaimedCaps = null; CapClaimed = false; CapList = null;
+            if (ClaimedNow > 0) ClaimedNow--;
+        }
 
         private void Start()
         {

@@ -160,6 +160,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (s_dirtyMax >= s_dirtyMin)
             {
                 s_buf.SetData(s_looks, s_dirtyMin, s_dirtyMin, s_dirtyMax - s_dirtyMin + 1);
+                EbmChurn.NoteLooksUpload(s_dirtyMax - s_dirtyMin + 1);   // 1.2.480: [Churn] looks upload span
                 s_dirtyMin = int.MaxValue; s_dirtyMax = -1;
             }
             return remade;

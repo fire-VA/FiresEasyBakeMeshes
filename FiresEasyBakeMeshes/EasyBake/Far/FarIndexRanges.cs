@@ -22,6 +22,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
     internal static class FarIndexRanges
     {
         internal static bool On => FiresEasyBakeMeshesPlugin.FarIndexRanges != null && FiresEasyBakeMeshesPlugin.FarIndexRanges.Value && !s_latched && SystemInfo.supportsAsyncGPUReadback;
+        // 1.2.463: the ranges themselves work (not latched, readback for the self-check), whatever the key says. FarBuildingDraw's per-piece hand-off
+        // (a real piece now draws: zero its far copy's range) tracks runs on zone targets near / inside the loaded area with this; the key still gates
+        // only the "hide removed pieces instead of a rebuild" uses above (HideRemovedInstead, HideLeftZonesInstead, ResolvePending).
+        internal static bool Usable => !s_latched && SystemInfo.supportsAsyncGPUReadback;
         private static bool s_latched;
         private static string s_latchWhy;
         internal static Action OnLatched;   // FarBuildingDraw: mark every target with hidden runs (or raw chunks) dirty
@@ -33,6 +37,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             public int[] Head, SegNext, SegChunk, SegStart, SegCount;
             public Mesh[] Meshes;
             public int HiddenCount;
+            public int[] Prefabs; public Vector3[] Pos;   // 1.2.463: per run its piece's prefab and position (null when the job did not record them)
         }
 
         // the merge's per-chunk segments, from FarChunk
@@ -47,6 +52,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 SegNext = new int[segs], SegChunk = new int[segs], SegStart = new int[segs], SegCount = new int[segs], Meshes = meshes,
             };
             for (int r = 0; r < runs; r++) t.Head[r] = -1;
+            if (job.RunPrefabs != null && job.RunPos != null && job.RunPrefabs.Count == runs && job.RunPos.Count == runs) { t.Prefabs = job.RunPrefabs.ToArray(); t.Pos = job.RunPos.ToArray(); }   // 1.2.463
             int s = 0;
             for (int ci = 0; ci < job.Result.Count; ci++)
             {

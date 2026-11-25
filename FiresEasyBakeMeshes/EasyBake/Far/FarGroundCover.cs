@@ -29,6 +29,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static readonly MaterialPropertyBlock s_mpb = new MaterialPropertyBlock();
         private struct Near { public float MinX, MaxX, MinZ, MaxZ; }
         private static readonly List<Near> s_near = new List<Near>(256);
+        private static float s_nearMinX = float.MaxValue, s_nearMaxX = float.MinValue, s_nearMinZ = float.MaxValue, s_nearMaxZ = float.MinValue;   // 1.2.485: the near list's box (empty = rejects all)
         private static Vector3 s_cam;
         private struct Region { public float MinX, MaxX, MinZ, MaxZ, Hide; }
         private static readonly List<Region> s_regions = new List<Region>(16);
@@ -43,6 +44,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (now < s_nextRefresh) return;
             s_nextRefresh = now + 0.25f;
             s_regions.Clear(); s_near.Clear();
+            s_nearMinX = s_nearMinZ = float.MaxValue; s_nearMaxX = s_nearMaxZ = float.MinValue;   // 1.2.485: bounding box of every built near chunk
             var cam = Utils.GetMainCamera();
             s_cam = cam != null ? cam.transform.position : Vector3.zero;
             var maps = s_maps();
@@ -55,7 +57,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 if (mesh == null || mesh.vertexCount == 0 || mr == null || !mr.enabled || !hm.gameObject.activeInHierarchy) continue;   // not built / not drawn = no ground
                 Vector3 c = hm.transform.position;
                 float half = hm.m_width * hm.m_scale * 0.5f;
-                if (!hm.IsDistantLod) { s_near.Add(new Near { MinX = c.x - half, MaxX = c.x + half, MinZ = c.z - half, MaxZ = c.z + half }); continue; }
+                if (!hm.IsDistantLod)
+                {
+                    s_near.Add(new Near { MinX = c.x - half, MaxX = c.x + half, MinZ = c.z - half, MaxZ = c.z + half });
+                    s_nearMinX = Mathf.Min(s_nearMinX, c.x - half); s_nearMaxX = Mathf.Max(s_nearMaxX, c.x + half);
+                    s_nearMinZ = Mathf.Min(s_nearMinZ, c.z - half); s_nearMaxZ = Mathf.Max(s_nearMaxZ, c.z + half);
+                    continue;
+                }
                 mr.GetPropertyBlock(s_mpb);
                 float hide = s_mpb.GetFloat(s_hideId);   // 0 when nobody set one: then the region hides nothing
                 s_regions.Add(new Region { MinX = c.x - half, MaxX = c.x + half, MinZ = c.z - half, MaxZ = c.z + half, Hide = hide });
@@ -69,11 +77,17 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             Refresh();
             float x = zone.x * 64f + 32f, z = zone.y * 64f + 32f;
             // a BUILT near heightmap under the point (loaded and generated; a loaded zone whose mesh is not built yet does not count)
-            for (int i = 0; i < s_near.Count; i++)
-            {
-                var n = s_near[i];
-                if (x >= n.MinX && x <= n.MaxX && z >= n.MinZ && z <= n.MaxZ) return true;
-            }
+            if (x >= s_nearMinX && x <= s_nearMaxX && z >= s_nearMinZ && z <= s_nearMaxZ)   // 1.2.485: a far zone (outside every near chunk's box) skips the list
+                for (int i = 0; i < s_near.Count; i++)
+                {
+                    var n = s_near[i];
+                    if (x >= n.MinX && x <= n.MaxX && z >= n.MinZ && z <= n.MaxZ) return true;
+                }
+            // 1.2.484 ([visual], design 3.2 "Ready = ground first"): EBM's own far ground. With [03 - Far Rendering] Far Terrain on, FarTerrainTiles.HandOff switches every
+            // TerrainLod off (their regions are destroyed, TerrainLod.OnDisable), so the region test below found NO ground past the loaded zones and FarNeedsGround hid
+            // every far rock (FarRocks.cs:175) and masked every far tree zone (ImpostorHandOff.cs:65-75) over EBM's drawn far ground. A SHOWN far tile holding the
+            // zone centre is ground. One ground test for every far layer: this method.
+            if (FarTerrainTiles.CoversPoint(x, z)) return true;
             // a built distant region whose shader draws at this point: inside the region and BEYOND its hide radius from the camera
             float dx = x - s_cam.x, dz = z - s_cam.z, d = Mathf.Sqrt(dx * dx + dz * dz);
             for (int i = 0; i < s_regions.Count; i++)

@@ -36,18 +36,18 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            On = config.Bind("Optimize", "MistShader", true /* 1.2.388 ([lead]: default ON; the same shader measured +6-8 fps in two FTS runs and Fire passed its look) */,
+            On = EbmConfigMove.Bind(config, "40 - Shaders", "MistShader", true /* 1.2.388 ([lead]: default ON; the same shader measured +6-8 fps in two FTS runs and Fire passed its look) */,
                 "EBM draws the Mistlands mist with its own lighter shader (no tessellation; same colours, fog and fades). Off = EBM stands down; FiresTossinShade's mist shader, or the game's, takes over. Applies live.");
-            Count = config.Bind("Optimize", "MistParticleCount", 1f, new ConfigDescription(
+            Count = EbmConfigMove.Bind(config, "40 - Shaders", "MistParticleCount", 1f, new ConfigDescription(
                 "How many mist puffs the Mistlands mist emits, as a share of the game's own amount. Lower = thinner mist and higher fps (the wall of mist around a Wisplight thins too). 1 = the game's amount. Range 0.1 to 1. Default 1. Applies live.",
                 new AcceptableValueRange<float>(0.1f, 1f)));
-            Opacity = config.Bind("Optimize", "MistOpacity", 1f, new ConfigDescription(
+            Opacity = EbmConfigMove.Bind(config, "40 - Shaders", "MistOpacity", 1f, new ConfigDescription(
                 "How opaque each mist puff is, as a share of the game's own. Lower = more see-through mist. 1 = the game's look. Range 0.1 to 1. Default 1. Applies live.",
                 new AcceptableValueRange<float>(0.1f, 1f)));
             On.SettingChanged += (_, __) =>
             {
                 if (Wanted) { EbmApi.RecheckShaderOwnership(On.Definition.Key + " key", true); s_scanAsked = true; }   // on: the lower mod gives the materials back first, EBM scans on the next Tick
-                else { Release("[Optimize] MistShader off"); EbmApi.RecheckShaderOwnership(On.Definition.Key + " key", true); }   // off ([seasons] review): the vanilla shader goes back first, then the lower mod is told and can take the materials
+                else { Release("[40 - Shaders] MistShader off"); EbmApi.RecheckShaderOwnership(On.Definition.Key + " key", true); }   // off ([seasons] review): the vanilla shader goes back first, then the lower mod is told and can take the materials
             };
             Count.SettingChanged += (_, __) => Tune();
             Opacity.SettingChanged += (_, __) => Tune();
@@ -82,7 +82,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void Scan()
         {
             var ours = Indirect.EbmIndirectAssets.Mist(out string why);
-            if (ours == null) { Say("[Mist] Lux mist: vanilla; [Optimize] MistShader is on but EBM/MistLux is not available: " + why); return; }
+            if (ours == null) { Say("[Mist] Lux mist: vanilla; [40 - Shaders] MistShader is on but EBM/MistLux is not available: " + why); return; }
             foreach (var kv in s_swapped) if (kv.Key == null) s_dead.Add(kv.Key);
             foreach (var m in s_dead) s_swapped.Remove(m);
             s_dead.Clear();

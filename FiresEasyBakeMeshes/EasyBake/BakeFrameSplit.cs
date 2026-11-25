@@ -153,6 +153,17 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static readonly Unity.Profiling.ProfilerMarker PacerSignals = M("pacer tail: signals");
         internal static readonly Unity.Profiling.ProfilerMarker PacerFillNote = M("pacer tail: fill note");
         internal static readonly Unity.Profiling.ProfilerMarker PacerReconcile = M("pacer tail: reconcile");
+        // next EBM ([lead] 11-22: ScanGate and the wear skip as rows in non-deep A/B captures). Markers only, no behaviour change. Placed only past each
+        // key check, never on a per-piece hot path: the wear skip's cache hit (WearNTearPatches UpdateWear / UpdateCover prefixes) is NOT wrapped, because
+        // UpdateCover runs for EVERY WearNTear in one frame each second (vanilla WearNTearUpdater.cs:40-44), so a marker there = one sample per piece in that
+        // frame; that hit cost already shows inside vanilla's own "WearNTearUpdater.Update()" row. Only the cache-miss judge, season re-check and census are rows.
+        internal static readonly Unity.Profiling.ProfilerMarker ScanGateCreate = M("ScanGate: CanSkip (create side)");     // once per CDS pass
+        internal static readonly Unity.Profiling.ProfilerMarker ScanGateDestroy = M("ScanGate: CanSkip (destroy side)");   // once per CDS pass
+        internal static readonly Unity.Profiling.ProfilerMarker ScanGateSector = M("ScanGate: sector event filter (SectorHooks)");   // per sector add / remove, only while [20] ScanGateEventHash is on
+        internal static readonly Unity.Profiling.ProfilerMarker WearSkipJudge = M("WearSkip: judge a piece (first ask, cache miss)");   // once per piece, then cached
+        internal static readonly Unity.Profiling.ProfilerMarker InvulnerableJudge = M("Invulnerable: judge a piece (first ask, cache miss)");   // once per piece, then cached
+        internal static readonly Unity.Profiling.ProfilerMarker WearSkipSeason = M("WearSkip: season re-check (all cached pieces)");   // once per Vedr visuals change
+        internal static readonly Unity.Profiling.ProfilerMarker WearSkipCensus = M("WearSkip: census (30 s, [90] WearSkipCensus)");   // only when the key is on
         // 1.2.362 ([lead]: "frame 664: 316.5 ms; top self: EBM walking zones 260.0 ms" in O_20261114_003628): the zone walk's steps (unload / reload branches,
         // far tier, give-back pump, proof tick); what stays in "EBM walking zones" self after this is the loop and its loaded / keepalive checks.
         // (class WalkMarkers, above EbmPatchMarkers)

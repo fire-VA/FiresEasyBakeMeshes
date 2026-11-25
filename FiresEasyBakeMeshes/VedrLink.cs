@@ -37,8 +37,22 @@ namespace FiresEasyBakeMeshes
             s_capsPushed = true;
             int v = capFor > 0 ? 1 : capFor == 0 ? 0 : -1;
             if (s_caps.TryGetValue(prefab, out int old) && old == v) return;
+            if (old == 1 && v != 1) EasyBake.SkipEligibility.CapsCoverChanged($"the season mod withdrew the cap of '{prefab}'");   // 1.2.514: pieces skipped on that declaration go real again
             if (s_caps.Count < 8192 || s_caps.ContainsKey(prefab)) s_caps[prefab] = v;   // bounded: one entry per piece prefab
             s_capRevision++;
+        }
+
+        // ---- 1.2.502: the snow owner's unified layer draws the snow tops (EbmApi.SetPieceSnowLayerOwner); sticky: the owner sends false only on key off /
+        // logout / a layer error, never on a transient "field not live yet" (teleport, re-centre), so teleports cause no keep-real churn
+        private static bool s_layerTops;
+        internal static bool SnowLayerDrawsTops => s_layerTops;
+        internal static void SetSnowLayerOwner(string owner, bool drawsTops)
+        {
+            if (s_layerTops == drawsTops) return;   // only a flip acts
+            s_layerTops = drawsTops;
+            bool key = EasyBake.SkipEligibility.SnowLayerKey != null && EasyBake.SkipEligibility.SnowLayerKey.Value;
+            if (!key) { EasyBakeLog.Info($"[Skip] snow layer: {owner} {(drawsTops ? "draws the snow tops" : "stopped")}; [08 - Snow And Seasons] Baked Pieces Under Snow Layer is off, so nothing changes (1.2.502)"); return; }
+            EasyBake.SkipEligibility.SnowLayerChanged($"{owner} {(drawsTops ? "draws the snow tops" : "stopped drawing them")}", drawsTops);
         }
 
         // ---- the season mod's own change event (season or stage changed, or its snow masks changed)

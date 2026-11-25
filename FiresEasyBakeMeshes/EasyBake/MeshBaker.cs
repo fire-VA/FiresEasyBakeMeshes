@@ -41,6 +41,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             public bool Ready = true;
             // 1.2.206: called once when a time-sliced bake becomes Ready (ZoneTracker announces the zone to EbmApi then). Not on DropPending.
             public Action<BakeResult> OnReady;
+            public object Caps;   // 1.2.505: PieceCaps.ZoneCaps (this bake's snow cap lists); goes with the bake
+            public int SuppressRemovals;   // 1.2.509 ([2ic] MUST): bumped at every SuppressedPieces removal; PieceCaps claims appended entries in place only while it is unchanged
             // Identity of every piece that fed at least one batch. Used on zone
             // reload to recognise the same pieces returning and disable their
             // renderers without rebaking.
@@ -631,13 +633,16 @@ namespace FiresEasyBakeMeshes.EasyBake
                     suppression.RestoreVisuals();
                     UnityEngine.Object.Destroy(suppression);
                 }
-                result.SuppressedPieces.Clear();
+                result.SuppressedPieces.Clear(); result.SuppressRemovals++;   // 1.2.509
             }
 
+            long tP = Probe.Start();   // 1.2.491 (B): the managed share, as "EasyBake:parentDestroy" (0 = the timer is off, nothing recorded)
+            HfBatches(result.Batches); HfBatches(result.FarBatches);   // 1.2.491 (A) [Hitch-EBM]: count before they are destroyed
             DestroyBatches(result.Batches);
             DestroyBatches(result.FarBatches);
             EbmTrace.Step("restore parent destroy", 0, result.Parent != null ? result.Parent.name : null);
-            if (result.Parent != null) UnityEngine.Object.Destroy(result.Parent);
+            if (result.Parent != null) { UnityEngine.Object.Destroy(result.Parent); EbmTrace.Hf(EbmTrace.HfParent); }
+            Probe.Stop("EasyBake:parentDestroy", tP);
         }
 
         // Called when a WearNTear comes back into a zone that has a cached
@@ -806,6 +811,14 @@ namespace FiresEasyBakeMeshes.EasyBake
                 });
             }
             return true;
+        }
+
+        // 1.2.491 (A) [Hitch-EBM]: batch meshes and their vertices handed to Unity's deferred destroy (vertexCount is a native read, no allocation)
+        private static void HfBatches(List<BatchInstance> batches)
+        {
+            if (batches == null) return;
+            foreach (var batch in batches)
+                if (batch.Mesh != null) { EbmTrace.Hf(EbmTrace.HfParentMeshes); EbmTrace.Hf(EbmTrace.HfParentVerts, batch.Mesh.vertexCount); }
         }
 
         private static void DestroyBatches(List<BatchInstance> batches)
@@ -1470,8 +1483,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (contributions.Count == 0) continue;
 
                 var combineArr = new CombineInstance[contributions.Count];
+                bool scanMatrices = EasyBakeLog.DebugOn();   // 1.2.487: Debug only
                 for (int i = 0; i < contributions.Count; i++)
                 {
+                    if (scanMatrices) EbmMeshCheck.NoteMatrix(contributions[i].LocalToWorld, "zone combine", coord.x, coord.y, contributions[i].Mesh);   // name built only on a hit
                     combineArr[i] = new CombineInstance
                     {
                         mesh = contributions[i].Mesh,

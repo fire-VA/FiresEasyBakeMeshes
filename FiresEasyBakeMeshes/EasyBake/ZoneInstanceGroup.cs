@@ -63,6 +63,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         public void Add(Matrix4x4 pieceLocalToWorld, MeshBaker.PieceIdentity identity)
         {
             Matrices.Add(pieceLocalToWorld * Definition.LocalOffset);
+            EbmMeshCheck.NoteInstance(Matrices[Matrices.Count - 1], PrefabHash, "add");   // 1.2.487: Debug-only NaN-risk check (degenerate / NaN matrix)
             Identities.Add(identity);
             _ver++; Indirect.EbmIndirect.MarkGroupDirty(this);   // 1.2.195
             _partsDirty = true;
@@ -80,6 +81,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         public void AddCached(Matrix4x4 instanceMatrix, MeshBaker.PieceIdentity identity)
         {
             Matrices.Add(instanceMatrix);
+            EbmMeshCheck.NoteInstance(instanceMatrix, PrefabHash, "from cache");   // 1.2.487: Debug-only NaN-risk check (degenerate / NaN matrix)
             Identities.Add(identity);
             _ver++; Indirect.EbmIndirect.MarkGroupDirty(this);   // 1.2.195
             _partsDirty = true;
@@ -473,6 +475,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             int frame = Time.frameCount;
             if (frame != s_rsFrame) { FlushResplitFrame(); s_rsFrame = frame; }
             s_rsTicks += ticks; s_rsGroups++; s_rsInstances += instances;
+            EbmChurn.NoteResplit(instances, ticks);   // 1.2.480: [Churn] re-split work and [Settle]'s last re-split
         }
 
         private static void FlushResplitFrame()
@@ -891,6 +894,10 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal int ShapeCount;
         internal int ShapeGen;
         internal void ShapeLooksChanged() { ShapeGen++; Indirect.EbmIndirect.MarkGroupDirty(this); }
+        // 1.2.507 (PieceCaps per-group change counts, [lead] proof34): CapJoinGen bumps when one of this group's pieces gets a changed cap join (EbmSnowStore.SetCap);
+        // CapAnnounceGen when this group's zone is announced / unloaded / its values dropped. Only PieceCaps reads them.
+        internal int CapJoinGen, CapAnnounceGen;
+        internal int CapVariantGen;   // 1.2.508: one of this group's pieces got a different cap variant (EbmSnowStore.SetCapVariant)
 
         // ── 1.2.206 EbmApi.SetPieceSnow (EbmSnowStore) ──
         // ExtCount = how many of this group's pieces have a pushed value; ExtGen bumps on every change (IndirectLooks.WriteGroup reads it).

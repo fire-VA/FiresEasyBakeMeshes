@@ -33,9 +33,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile cfg)
         {
-            Enabled = cfg.Bind("Optimize", "WaterHideBuriedTiles", true /* 1.2.305 ON: KEEP -0.026 ms spot4 + verify2 972 rays 0 false (DefaultsMigrated1305) */,
+            Enabled = EbmConfigMove.Bind(cfg, "41 - Water Performance", "WaterHideBuriedTiles", true /* 1.2.305 ON: KEEP -0.026 ms spot4 + verify2 972 rays 0 false (DefaultsMigrated1305) */,
                 "Water tiles that lie completely under the ground (the terrain above the water and its highest wave everywhere on the tile) are not drawn. Swimming, boats and everything else about the water are unchanged. Off = as before.");
-            Verify = cfg.Bind("Optimize", "WaterHideBuriedTilesVerify", false,
+            Verify = EbmConfigMove.Bind(cfg, "90 - Debugging", "WaterHideBuriedTilesVerify", false,
                 "Test twin of WaterHideBuriedTiles: nothing is hidden; the log counts the tiles it would hide and checks each with ground raycasts (FALSE HIDES must be 0). Off = no test.");
         }
 

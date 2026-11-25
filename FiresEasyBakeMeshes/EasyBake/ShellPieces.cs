@@ -39,8 +39,8 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static float s_nextReport;
 
         internal static void NoteDeclinedSkip() { s_declinedSkip++; SayOn(); }
-        internal static void NoteHandBack(Reason r) { if (On) s_handedBack[(int)r]++; }
-        internal static void NoteHandBack(Reason r, int n) { if (On) s_handedBack[(int)r] += n; }
+        internal static void NoteHandBack(Reason r) { EbmChurn.NoteHandBack((int)r, 1); if (On) s_handedBack[(int)r]++; }   // 1.2.480: [Churn] counts whatever ShellPieces says
+        internal static void NoteHandBack(Reason r, int n) { EbmChurn.NoteHandBack((int)r, n); if (On) s_handedBack[(int)r] += n; }
 
         // Around the silencing of a created piece the bake draws (the step that turns it into a shell).
         internal static long Begin() => On ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;

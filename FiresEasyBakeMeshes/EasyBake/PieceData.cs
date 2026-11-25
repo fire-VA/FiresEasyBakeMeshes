@@ -238,7 +238,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             AddKeys(byteArrays);
         }
 
-        private static void AddKeys<T>(List<KeyValuePair<int, T>> values)
+        private static void AddKeys<T>(FastIterableKeyValues<int, T> values)   // 1.2.518 (Valheim 1.0.30): GetData hands FastIterableKeyValues (Count + an indexer of KeyValuePair), was List<KeyValuePair>
         {
             for (int i = 0; i < values.Count; i++) s_keysOnPiece.Add(values[i].Key);
         }

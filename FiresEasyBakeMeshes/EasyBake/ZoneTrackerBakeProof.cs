@@ -282,7 +282,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 var sup = view.GetComponent<EasyBakeSuppressedVisuals>();
                 if (sup == null || sup.Restored) return;
                 sup.RestoreVisuals();
-                st.Bake.SuppressedPieces.Remove(sup);
+                st.Bake.SuppressedPieces.Remove(sup); st.Bake.SuppressRemovals++;   // 1.2.509 ([2ic] MUST: this removal bumps no group Version)
                 Object.DestroyImmediate(sup);
                 s_fixRestored++;
                 EasyBakeLog.Debug($"[BakeCensus] fix: {name} at {zdo.GetPosition()} was hidden by the bake but is not in it (drawn by nobody for 2 s+): its renderers are back");

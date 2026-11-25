@@ -30,10 +30,10 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile cfg)
         {
-            Enabled = cfg.Bind("Diagnostics", "BlackFrameWatch", true, "1.2.359: every 10 s the finished frame is sampled (a 64x36 copy, read back without a stall). If the screen centre is dark while the top band is bright, one Warning names EBM's state (indirect batches, skipped pieces, cache), so a black-world episode on any machine leaves a log line. Off = no sampling.");
-            EverySeconds = cfg.Bind("Diagnostics", "BlackFrameWatchEverySeconds", 10f, new ConfigDescription("Seconds between samples.", new AcceptableValueRange<float>(2f, 120f)));
-            DarkBelow = cfg.Bind("Diagnostics", "BlackFrameWatchDarkBelow", 15f, new ConfigDescription("Screen-centre mean (sRGB 0-255) below which the frame counts as dark.", new AcceptableValueRange<float>(1f, 128f)));
-            SkyAbove = cfg.Bind("Diagnostics", "BlackFrameWatchSkyAbove", 110f, new ConfigDescription("Top-band mean (sRGB 0-255) above which the sky counts as bright, so night and caves never trigger.", new AcceptableValueRange<float>(10f, 250f)));
+            Enabled = EbmConfigMove.Bind(cfg, "90 - Debugging", "BlackFrameWatch", true, "1.2.359: every 10 s the finished frame is sampled (a 64x36 copy, read back without a stall). If the screen centre is dark while the top band is bright, one Warning names EBM's state (indirect batches, skipped pieces, cache), so a black-world episode on any machine leaves a log line. Off = no sampling.");
+            EverySeconds = EbmConfigMove.Bind(cfg, "90 - Debugging", "BlackFrameWatchEverySeconds", 10f, new ConfigDescription("Seconds between samples.", new AcceptableValueRange<float>(2f, 120f)));
+            DarkBelow = EbmConfigMove.Bind(cfg, "90 - Debugging", "BlackFrameWatchDarkBelow", 15f, new ConfigDescription("Screen-centre mean (sRGB 0-255) below which the frame counts as dark.", new AcceptableValueRange<float>(1f, 128f)));
+            SkyAbove = EbmConfigMove.Bind(cfg, "90 - Debugging", "BlackFrameWatchSkyAbove", 110f, new ConfigDescription("Top-band mean (sRGB 0-255) above which the sky counts as bright, so night and caves never trigger.", new AcceptableValueRange<float>(10f, 250f)));
         }
 
         // Called from the plugin's LateUpdate before the batching gate: the detector must run while EBM is switched off mid-game too.

@@ -183,9 +183,17 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static bool ZdoMatches(ZDO zdo, PrefabInfo info, MeshBaker.PieceTransform cached)
         {
             if (!info.Skippable) return false;
+            if (ZoneTracker.KeptReal(zdo)) return false;   // 1.2.482: made real on request (EbmStandIns.MakeReal); no path skips it again this session
             if (PieceData.MustStayLive(zdo, zdo.GetPrefab())) return false;
-            if (info.CanShowSnow && SnowReaches(zdo)) return false;
-            if (VedrWinterSnowHere(zdo, info, out _, wantWhy: false)) return false;
+            // 1.2.502 [08 - Snow And Seasons] Baked Pieces Under Snow Layer: while the snow owner's unified layer draws the tops (cast against the stand-in
+            // colliders, which copy the prefab's own), winter snow is no reason to keep a piece real; both reasons below are skipped for every kind
+            if (SnowLayerActive) NoteLayerBaked(zdo);
+            else if (CapsCoverWinter(zdo, info)) { NoteCapsBaked(); NoteDeclaredSkip(zdo, info); }   // 1.2.514: EBM draws (or will draw) this kind's snow cap itself, so winter snow is no reason to keep it real
+            else
+            {
+                if (SnowKeepsReal(zdo, info, true)) { if (PieceCaps.Active) s_keptNoCap++; return false; }   // 1.2.481 (F2); 1.2.514: counted when caps are on but this kind has no EBM cap (yet)
+                if (VedrWinterSnowHere(zdo, info, out _, wantWhy: false)) return false;
+            }
             if (!info.AllImmune && !(StoredHealth(zdo, info) < 0f) && !DamageableSkipAllowed) return false;
             var look = WearLooks.Resolve(info.Prefab, zdo);
             if (look != cached.Look || info.BlockerFor(look) != null) return false;
@@ -197,13 +205,15 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static string DescribeMismatch(ZDO zdo, PrefabInfo info, MeshBaker.PieceTransform cached, out string detail)
         {
             detail = null;
+            if (ZoneTracker.KeptReal(zdo)) return "made real on request (EbmStandIns.MakeReal, e.g. Vedr's shovel or full snow load) and kept real this session";   // 1.2.482, the same order as ZdoMatches
             if (PieceData.MustStayLive(zdo, zdo.GetPrefab()))
             {
                 detail = PieceData.DescribeLiveEdits(zdo, zdo.GetPrefab());
                 return "a field edit or Structure Tweaks key on it changes what the piece shows or offers, which only a real piece carries";
             }
 
-            if (info.CanShowSnow && SnowReaches(zdo))
+            bool layer = SnowLayerActive || CapsCoverWinter(zdo, info);   // 1.2.502 / 1.2.514: the same bypasses as ZdoMatches
+            if (!layer && SnowKeepsReal(zdo, info, false))   // 1.2.481: the same test as the skip decision (F2), not counted
             {
                 detail = zdo.GetFloat(ZDOVars.s_snow, 0f) > 0f
                     ? $"snow buildup {zdo.GetFloat(ZDOVars.s_snow, 0f):F2} on its ZDO"
@@ -217,7 +227,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return "snow can change what it shows, which only a real piece tracks" + (onlySnow ? (canTakeSnowDamage ? " [snow ONLY; damageable]" : " [snow ONLY; invulnerable]") : " [snow + another reason]");
             }
 
-            if (VedrWinterSnowHere(zdo, info, out string winterWhy))
+            if (!layer && VedrWinterSnowHere(zdo, info, out string winterWhy))
             {
                 detail = winterWhy;
                 return "Vedr winter snow builds on pieces here, which only a real piece grows and draws";
@@ -293,6 +303,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             int mask = VedrLink.SnowBuildingBiomeMask;
             if (mask == 0 || WorldGenerator.instance == null) return false;
             Vector3 p = zdo.GetPosition();
+            if (BeyondWinterKeep(p)) return false;   // 1.2.480 WinterKeepRadius: beyond it no cap can show (Vedr hides caps past 60 m), so the piece may skip / bake
             var biome = WorldGenerator.instance.GetBiome(p);
             bool inBiome = ((int)biome & mask) != 0;
             string kind = info.Prefab != null ? info.Prefab.name : "?";
@@ -314,6 +325,45 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         private static readonly HashSet<string> s_snowSaidKeep = new HashSet<string>(), s_snowSaidSkip = new HashSet<string>();
+
+        // â”€â”€ 1.2.480 [08 - Snow And Seasons] WinterKeepRadius (EbmChurn.WinterKeepRadius; 0 = off = as before) â”€â”€
+        private static float KeepRadius => EbmChurn.WinterKeepRadius != null ? EbmChurn.WinterKeepRadius.Value : 0f;
+        // XZ distance from the local player; no player (dedicated server, loading) = no radius, the old rule
+        private static bool BeyondWinterKeep(Vector3 p)
+        {
+            float r = KeepRadius;
+            if (r <= 0f) return false;
+            var pl = Player.m_localPlayer;
+            if (pl == null) return false;
+            Vector3 q = pl.transform.position;
+            float dx = p.x - q.x, dz = p.z - q.z;
+            return dx * dx + dz * dz > r * r;
+        }
+        /// <summary>The winter keep wants this skipped piece real now (in reach, cap-capable, in a Vedr snow biome). The watch hands it back.</summary>
+        internal static bool WinterKeepNow(ZDO zdo, int prefabHash)
+        {
+            if (KeepRadius <= 0f || VedrLink.SnowBuildingBiomeMask == 0 || zdo == null) return false;
+            if (BeyondWinterKeep(zdo.GetPosition())) return false;   // the cheap test first
+            return VedrWinterSnowHere(zdo, Get(prefabHash), out _, wantWhy: false);
+        }
+        /// <summary>True when this zone is within reach of the radius and the player moved 4 m since its last radius re-check (updates lastPos).</summary>
+        internal static bool WinterRadiusDue(Vector2s zone, ref Vector3 lastPos)
+        {
+            float r = KeepRadius;
+            if (r <= 0f || VedrLink.SnowBuildingBiomeMask == 0) return false;
+            var pl = Player.m_localPlayer;
+            if (pl == null) return false;
+            Vector3 q = pl.transform.position;
+            Vector3 c = ZoneSystem.GetZonePos(zone);
+            float reach = r + ZoneSystem.c_ZoneSize * 0.71f;   // the zone's half diagonal
+            float dx = c.x - q.x, dz = c.z - q.z;
+            if (dx * dx + dz * dz > reach * reach) return false;
+            float mx = q.x - lastPos.x, mz = q.z - lastPos.z;
+            if (mx * mx + mz * mz < 16f) return false;
+            lastPos = q;
+            return true;
+        }
+        internal static int WinterKeptCount => s_winterKept.Count;   // 1.2.480 [Churn] / [Settle]
 
         // 1.2.183: Vedr's answer per kind, cached: 1 and 0 are final; -1 is asked again only after PieceSnowCapRevision moves (CapFor reads
         // ZNetScene.GetPrefab, which may realize a lazy bundle, so it never runs per piece)
@@ -356,12 +406,105 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_winterKindsVedrCap.Add(kind);
         }
 
+        // ── 1.2.502 ([visual], design DESIGN_ebm_snow_layer_gate_20261122.md v1-v1.2, [2ic] APPROVED; Vedr side [seasons]) ──
+        // [08 - Snow And Seasons] Baked Pieces Under Snow Layer (default OFF) + the owner's EbmApi.SetPieceSnowLayerOwner(owner, drawsTops). Decided at CREATE:
+        // turning it on changes zones loaded afterwards; the owner flag going false or the key going off re-checks the skipped pieces (real again under the rule above).
+        internal static BepInEx.Configuration.ConfigEntry<bool> SnowLayerKey;
+        internal static bool SnowLayerActive => SnowLayerKey != null && SnowLayerKey.Value && VedrLink.SnowLayerDrawsTops;
+        private static int s_layerWindow, s_layerTotal;   // [2ic] SHOULD: plain counters (no per-piece set): decisions made under the layer this tally window / since the flip
+        private static void NoteLayerBaked(ZDO zdo) { s_layerWindow++; s_layerTotal++; }
+
+        // ── 1.2.514 ([lead] winter-town profile pair O_20261124_124332 / O_20261124_130735: [SkipCensus] "already skipped at creation 8667" -> "3791", static
+        // structure 1682 -> 6558 live, WearNTearUpdater +0.746 ms). This skip code is byte-identical in 1.2.504 and 1.2.513; what changed is the snow owner:
+        // Vedr .26 sent SetPieceSnowLayerOwner("Vedr", true) (its log "[UnifiedLayer] build tops owner: ... sent"; EBM ":5883 [Skip] snow layer: winter
+        // keep-real OFF"), Vedr .62 draws the game's per-piece caps instead and never sends it, so the 1.2.502 gate stayed off and SnowKeepsReal /
+        // VedrWinterSnowHere kept every snowed piece real again ("ZdoChanged 344" -> "5029"). Those caps are now EBM's own draw (PieceCaps, the season mod's
+        // registered mesh per kind, drawn for skipped pieces too), so for a kind whose cap EBM draws, winter snow is no reason to keep the piece real either.
+        // Decided when a piece loads, like the layer gate; caps going inactive (key off, the owner clearing / removing a kind) re-checks the skipped pieces.
+        // v3 ([lead]: the FIRST arrival must be covered, no create-then-destroy): a kind also counts as covered when the season mod has DECLARED it gets a
+        // cap (the existing EbmApi.SetPieceSnowCap(prefab, 1), VedrLink.PieceSnowCapFor) while caps are on, so a piece is skipped at creation before the
+        // kind's mesh is registered; the mesh registration later only draws. A kind declared then withdrawn (1 -> 0 / -1) re-checks the skipped pieces
+        // (VedrLink.PushCap -> CapsCoverChanged). Undeclared kinds keep the ConvertQueue retry when their cap registers (ZoneTracker.RetryNewCapKinds).
+        private static int s_capsWindow, s_capsTotal, s_keptNoCap;
+        private static void NoteCapsBaked() { s_capsWindow++; s_capsTotal++; }
+        // v4 ([2ic] SHOULD a, "declared but never drawn"): a kind skipped on a declaration alone (no mesh registered yet) is remembered with the time of its
+        // first such skip; the 60 s tally names kinds still without a mesh 60 s later, so a run proves the count is 0. Forgotten once the mesh registers,
+        // or on CapsCoverChanged (the skipped pieces are re-checked then). Main thread (ZdoMatches' callers).
+        private sealed class DeclaredKind { internal string Name; internal float First; internal int Skips; }
+        private static readonly Dictionary<int, DeclaredKind> s_declared = new Dictionary<int, DeclaredKind>();
+        private static void NoteDeclaredSkip(ZDO zdo, PrefabInfo info)
+        {
+            int h = zdo.GetPrefab();
+            if (PieceCaps.Registered(h) || info == null || info.Prefab == null) return;
+            if (!s_declared.TryGetValue(h, out var d)) s_declared[h] = d = new DeclaredKind { Name = info.Prefab.name, First = Time.realtimeSinceStartup };
+            d.Skips++;
+        }
+        private static readonly List<int> s_declaredDone = new List<int>();
+        private static string DeclaredNoMeshPart()
+        {
+            if (s_declared.Count == 0) return "";
+            int kinds = 0, skips = 0; string first = null;
+            float now = Time.realtimeSinceStartup;
+            s_declaredDone.Clear();
+            foreach (var kv in s_declared)
+            {
+                if (PieceCaps.Registered(kv.Key)) { s_declaredDone.Add(kv.Key); continue; }
+                if (now - kv.Value.First < 60f) continue;
+                kinds++; skips += kv.Value.Skips; if (first == null) first = kv.Value.Name;
+            }
+            foreach (int h in s_declaredDone) s_declared.Remove(h);
+            return $"; declared 1 and skipped, no mesh registered after 60 s: {kinds} kind(s), {skips} skip decision(s){(first != null ? $" (first '{first}')" : "")}";
+        }
+        internal static bool CapsCoverWinter(ZDO zdo, PrefabInfo info)
+        {
+            if (zdo == null) return false;
+            if (PieceCaps.CoversWinter(zdo.GetPrefab())) return true;   // the kind's cap is registered
+            return PieceCaps.Active && info != null && info.Prefab != null && VedrLink.HasCapFor && VedrLink.PieceSnowCapFor(info.Prefab.name) == 1;   // declared up front
+        }
+        /// <summary>PieceCaps: a kind lost its EBM-drawn cap (key off, cleared, removed). Skipped pieces are asked again (real again under the winter rule). Main thread.</summary>
+        internal static void CapsCoverChanged(string why)
+        {
+            if (s_capsTotal == 0) return;   // nothing was skipped on the caps' account
+            EasyBakeLog.Info($"[Skip] EBM-drawn caps: winter keep-real back ON for the affected kinds ({why}); skipped pieces re-checked, {s_capsTotal} skip decision(s) were made on the caps' account (1.2.514)");
+            s_capsWindow = 0; s_capsTotal = 0; s_declared.Clear();   // v4: re-checked now, so nothing stays "declared, no mesh"
+            ZoneTracker.RecheckSkippedForSeason(-1, -1);
+        }
+
+        internal static void BindSnowLayer(BepInEx.Configuration.ConfigFile config)
+        {
+            SnowLayerKey = EbmConfigMove.Bind(config, "08 - Snow And Seasons", "Baked Pieces Under Snow Layer", false,
+                "With a snow owner drawing one snow layer over builds (Vedr's unified layer), winter snow is no reason to keep a piece real: winter arrival creates no more pieces than summer. Decided when a piece loads: turning it on in game changes zones loaded afterwards (set it before arriving); turning it off makes those pieces real again at once.");
+            SnowLayerKey.SettingChanged += (_, __) =>
+            {
+                // no owner layer drawing tops = the gate is off either way: nothing to switch or re-check
+                if (!VedrLink.SnowLayerDrawsTops) { EasyBakeLog.Info($"[Skip] snow layer: key {(SnowLayerKey.Value ? "on" : "off")}, but no snow owner draws a layer, so nothing changes (1.2.502)"); return; }
+                SnowLayerChanged("key " + (SnowLayerKey.Value ? "on" : "off"), SnowLayerKey.Value);
+            };
+        }
+
+        /// <summary>The key moved or the owner's flag flipped (VedrLink.SetSnowLayerOwner). Main thread.</summary>
+        internal static void SnowLayerChanged(string why, bool nowActive)
+        {
+            if (nowActive)
+            {
+                EasyBakeLog.Info($"[Skip] snow layer: winter keep-real OFF ({why}); zones loaded from now on bake winter pieces (1.2.502)");
+                return;
+            }
+            EasyBakeLog.Info($"[Skip] snow layer: winter keep-real back ON ({why}); skipped pieces re-checked, {s_layerTotal} skip decision(s) were made under the layer since it went on (1.2.502)");
+            s_layerWindow = 0; s_layerTotal = 0;
+            ZoneTracker.RecheckSkippedForSeason(-1, -1);
+        }
+
         // Null when the rule kept nothing this season.
         internal static string WinterKeepSummary()
         {
+            if (SnowLayerActive) { int w = s_layerWindow; s_layerWindow = 0; return $"winter keep: OFF under the snow layer, {w} skip decision(s) this window, {s_layerTotal} since it went on (1.2.502)"; }
+            string caps = s_capsTotal > 0 || s_keptNoCap > 0 ? $"winter keep: OFF for kinds whose snow cap EBM draws, {s_capsWindow} skip decision(s) this window, {s_capsTotal} in all; kept real, cap not registered yet {s_keptNoCap} this window{DeclaredNoMeshPart()} (1.2.514)" : null;
+            s_capsWindow = 0; s_keptNoCap = 0;
+            if (caps != null && s_winterKept.Count == 0) return caps;   // the [Skip] tally line (every 60 s)
             if (s_winterKept.Count == 0) return null;
             int vedr = s_winterKeptVedrCap.Count;
-            return $"winter keep: {s_winterKept.Count} piece(s) of {s_winterKinds.Count} kind(s) kept real ({s_winterKept.Count - vedr} with a snow cap on the prefab, {vedr} of {s_winterKindsVedrCap.Count} kind(s) for a Vedr cap, fitted or not decided yet{(VedrLink.HasCapFor ? "" : " (Vedr has no PieceSnowCapFor: all kept)")}:{string.Join(", ", s_winterKindsVedrCap)})";
+            return (caps != null ? caps + "; " : "") + $"winter keep: {s_winterKept.Count} piece(s) of {s_winterKinds.Count} kind(s) kept real ({s_winterKept.Count - vedr} with a snow cap on the prefab, {vedr} of {s_winterKindsVedrCap.Count} kind(s) for a Vedr cap, fitted or not decided yet{(VedrLink.HasCapFor ? "" : " (Vedr has no PieceSnowCapFor: all kept)")}:{string.Join(", ", s_winterKindsVedrCap)})";
         }
 
         // A new season: the once-per-kind lines may say their reason again, and the keep count starts over.
@@ -369,6 +512,18 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             s_snowSaidKeep.Clear(); s_snowSaidSkip.Clear();
             s_winterKept.Clear(); s_winterKeptVedrCap.Clear(); s_winterKinds.Clear(); s_winterKindsVedrCap.Clear();
+            s_layerWindow = 0; s_layerTotal = 0;   // 1.2.502
+            s_capsWindow = 0;   // 1.2.514 (s_capsTotal stays: CapsCoverChanged needs to know skips were made on the caps' account)
+        }
+
+        // 1.2.481 F2 ([visual], lead GO 11-21; W1 storm onset "hand-backs 5739 (watch ...)"): a cap-capable piece with snow on its ZDO stays real so its vanilla
+        // cap can show. With [08 - Snow And Seasons] WinterKeepRadiusStormCaps ON and WinterKeepRadius above 0, beyond that radius it may skip / bake (Vedr
+        // hides caps past 60 m); within it, as before. OFF (default) = exactly as before.
+        private static bool SnowKeepsReal(ZDO zdo, PrefabInfo info, bool count)
+        {
+            if (!info.CanShowSnow || !SnowReaches(zdo)) return false;
+            if (EbmChurn.StormCapsOn && BeyondWinterKeep(zdo.GetPosition())) { if (count) EbmChurn.NoteStormCapSkipped(); return false; }   // [2ic] note 1: ZdoMatches decisions only
+            return true;
         }
 
         private static bool SnowReaches(ZDO zdo)

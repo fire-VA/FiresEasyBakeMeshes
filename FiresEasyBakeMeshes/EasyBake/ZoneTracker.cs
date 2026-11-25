@@ -45,6 +45,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // to false but the cached BakeResult stays alive so the next visit
             // can reattach instead of rebaking.
             public bool ZoneActive = true;
+            public int DrawWalk = -1;   // 1.2.467: the last full walk (s_fullWalkNo) that drew this zone's groups; a gap = its groups start drawing again
             public MeshBaker.BakeResult Bake;
             // Set when this zone's bake came from the on-disk cache. After the
             // zone settles, a one-shot reconciliation checks that every cached
@@ -58,6 +59,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             public readonly Dictionary<ZDO, SkippedPiece> Skipped = new Dictionary<ZDO, SkippedPiece>();
             public float NextWatch;
             public int SeasonEpochChecked;   // 1.2.180: the Vedr season its skipped pieces were last fully re-checked for
+            public EbmChurn.Rebake? ChurnWhy;   // 1.2.480: which site set Dirty (the [Settle] build sequence names it at the rebake)
+            public Vector3 RadiusCheckPos = new Vector3(1e9f, 0f, 1e9f);   // 1.2.480 WinterKeepRadius: player position at this zone's last radius re-check
             public GameObject StandInRoot;
             public readonly Dictionary<MeshBaker.PieceIdentity, GameObject> StandIns = new Dictionary<MeshBaker.PieceIdentity, GameObject>();
             public readonly Queue<MeshBaker.PieceIdentity> StandInQueue = new Queue<MeshBaker.PieceIdentity>();
@@ -256,6 +259,31 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_convertedLive;
         private static int s_deferredForBake;
         private static int s_zonesFromCache, s_zonesBakedFresh;
+        // 1.2.480 EbmChurn: 30 s counts (take = read and reset) and the session totals; the near work test and its summary for [Settle]
+        private static int s_churnFresh, s_churnCache;
+        internal static int ChurnBakedFresh(bool take) { if (!take) return s_zonesBakedFresh; int n = s_churnFresh; s_churnFresh = 0; return n; }
+        internal static int ChurnFromCache(bool take) { if (!take) return s_zonesFromCache; int n = s_churnCache; s_churnCache = 0; return n; }
+        // + zones still waiting for their FIRST bake (active, not baked, enough pieces to bake: the bake pass's own test, :1900)
+        internal static bool ChurnAnyWorkQueued()
+        {
+            if (AnyZoneWorkQueued()) return true;
+            int min = FiresEasyBakeMeshesPlugin.BatchingMinPiecesPerZone.Value;
+            foreach (var s in _zones.Values) if (s.ZoneActive && !s.Baked && s.PresentPieces >= min) return true;
+            return false;
+        }
+        internal static string ChurnQueuesSummary()
+        {
+            int dirty = 0, recreate = 0, standIn = 0, convert = 0, unbaked = 0, min = FiresEasyBakeMeshesPlugin.BatchingMinPiecesPerZone.Value;
+            foreach (var s in _zones.Values)
+            {
+                if (!s.ZoneActive) continue;
+                if (!s.Baked && s.PresentPieces >= min) unbaked++;
+                if (s.Dirty) dirty++;
+                if (s.AwaitingRecreate != null) recreate++;
+                standIn += s.StandInQueue.Count; convert += s.ConvertQueue.Count;
+            }
+            return $"zones waiting for their first bake {unbaked}, dirty zones {dirty}, zones awaiting recreate {recreate}, stand-ins queued {standIn}, conversions queued {convert}";
+        }
         private static int s_convertedOnCached, s_convertedOnFresh, s_convertHeldNear;   // 1.2.319: + live pieces a host kept because they are inside the live band (far rule)
         private static int s_convertHeldForHandBack;   // 1.2.356: convert passes held because the zone's hand-back has not landed yet
         private static int s_standInColliders;
@@ -374,7 +402,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // No cache yet — mark dirty if we'd already baked (admin placed a
             // new piece into a baked zone). Otherwise the first bake will pick
             // it up at settle time.
-            if (state.Baked) state.Dirty = true;
+            if (state.Baked) { state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.NewPiece; EbmChurn.NoteRebake(EbmChurn.Rebake.NewPiece); }   // 1.2.480: counted
         }
 
         // A piece that arrives after its zone baked joins the zone's instanced group for its prefab, the same way a removed
@@ -518,7 +546,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 TryJoinInstanceGroup(state, wnt, identity, invulnerable);
                 return;
             }
-            state.Dirty = true;
+            state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.MergedLook; EbmChurn.NoteRebake(EbmChurn.Rebake.MergedLook);   // 1.2.480: counted
             state.LastChangeUnscaledTime = Time.unscaledTime;
         }
 
@@ -569,8 +597,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
             state.Baked = true;
             state.FromCache = true; Indirect.EbmIndirect.RequestFullWalk();
-            AnnounceWhenReady(state);   // 1.2.206 EbmApi.ZoneBaked
-            s_zonesFromCache++;
+            EbmChurn.NoteAnnounce(EbmChurn.Announce.CacheBuilt); AnnounceWhenReady(state);   // 1.2.206 EbmApi.ZoneBaked (1.2.480: counted)
+            s_zonesFromCache++; s_churnCache++; EbmChurn.NoteZoneBuilt(state.Coord, "cache");   // 1.2.480
             NoteCacheConstruct(state.Coord);
             state.NeedsCacheValidation = true;
             // Only pin via keepalive if the cached bake actually
@@ -631,7 +659,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (suppression != null)
             {
                 suppression.RestoreVisuals();
-                state.Bake.SuppressedPieces.Remove(suppression);
+                state.Bake.SuppressedPieces.Remove(suppression); state.Bake.SuppressRemovals++;   // 1.2.509: PieceCaps in-place claims stand down
                 Object.DestroyImmediate(suppression);   // 1.2.168: TryJoinInstanceGroup may suppress again this frame and would find the doomed one, leaving the piece drawn twice
             }
             state.CacheStale = true;
@@ -722,7 +750,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return;
             }
 
-            state.Dirty = true;
+            state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.MergedRemoved; EbmChurn.NoteRebake(EbmChurn.Rebake.MergedRemoved);   // 1.2.480: counted
             state.LastChangeUnscaledTime = Time.unscaledTime;
             // The rebake reads real pieces, so anything the zone skipped has to be created first.
             if (state.Skipped.Count > 0)
@@ -778,10 +806,11 @@ namespace FiresEasyBakeMeshes.EasyBake
         // InstancedDraw finds out of view never reach Unity at all.
         // 1.2.327: DrawInstances' coarse split for [SelfCost]: 0 begin (BeginFrame / settled check), 1 settled walk, 2 full zone walk, 3 indirect EndFrame (cull + draw), 4 rest
         internal static readonly long[] DwSeg = new long[5]; internal static long DwSettled;
+        private static int s_fullWalkNo = 1;   // 1.2.467: full walks so far (starts at 1 so a zone's DrawWalk -1 reads as "not drawn at the previous walk")
         public static void DrawInstances()
         {
             DrawTestFrame();   // 1.2.104 ebm_drawtest (idle unless the command ran in the last 30 s)
-            if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) return;
+            if (!FiresEasyBakeMeshesPlugin.BatchingInstancingEnabled.Value) { CapsInactive(); return; }   // 1.2.505: [2ic] MUST 1 - no claimed cap stays off while caps cannot draw
 
             long dw0 = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.327 coarse always-on split (4 reads a frame): begin / walk / indirect EndFrame / rest
             InstancedDraw.BeginFrame();
@@ -806,6 +835,10 @@ namespace FiresEasyBakeMeshes.EasyBake
                 InstancedDraw.SubAcc(InstancedDraw.SubDead, sd0);
                 if (dead) { s_deadBakes.Add(state); continue; }
                 if (keepLists) s_settledZones.Add(state);
+                // 1.2.467: this zone's baked groups start drawing this frame (it did not pass this gate at the previous full walk): the far copy hands its
+                // skipped pieces off now, not at the next 0.25 s refresh (FarBuildingDraw.NoteBakedZoneDrawing / FlushBakedDrawing below)
+                if (state.DrawWalk != s_fullWalkNo - 1) Far.FarBuildingDraw.NoteBakedZoneDrawing(state.Coord);
+                state.DrawWalk = s_fullWalkNo;
 
                 InstancedDraw.NoteZone();
                 for (int i = 0; i < bake.InstanceGroups.Count; i++)
@@ -823,11 +856,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                 }
             }
             if (indirect && !settled) Indirect.EbmIndirect.NoteFullWalkEnd();
+            if (!settled) { s_fullWalkNo++; Far.FarBuildingDraw.FlushBakedDrawing(); }   // 1.2.467: one same-frame hand-off pass if any zone started drawing (a flag check otherwise)
             }
             long dw2 = System.Diagnostics.Stopwatch.GetTimestamp(); DwSeg[settled ? 1 : 2] += dw2 - dw1;
             long se0 = InstancedDraw.SubT();
             if (indirect) { using (DwMarkers.EndFrame.Auto()) Indirect.EbmIndirect.EndFrame(); }   // 1.2.367: profiler marker only (DwSeg 3)
             InstancedDraw.SubAcc(InstancedDraw.SubIndirect, se0);
+            DrawCaps();   // 1.2.505 piece snow caps (instanced only; one check while nothing is registered or the key is off)
             long dw3 = System.Diagnostics.Stopwatch.GetTimestamp(); DwSeg[3] += dw3 - dw2;
             using (DwMarkers.Rest.Auto())   // 1.2.367: profiler marker only (DwSeg 4)
             {
@@ -927,11 +962,13 @@ namespace FiresEasyBakeMeshes.EasyBake
         // every loaded zone's groups rebuild their snow values, through the same per-frame re-split budget as Core's events.
         internal static void MarkAllSnowDirty()
         {
+            int marked = 0;   // 1.2.480: [Churn] groups marked by full re-reads
             foreach (var state in _zones.Values)
             {
                 if (state.Bake?.InstanceGroups == null) continue;
-                foreach (var group in state.Bake.InstanceGroups) { if (group == null) continue; group.MarkSnowDirty(); s_areaMarked++; }
+                foreach (var group in state.Bake.InstanceGroups) { if (group == null) continue; group.MarkSnowDirty(); s_areaMarked++; marked++; }
             }
+            EbmChurn.NoteMarkAll(marked);
         }
 
         // 1.2.158 ([visual], Fire 10-31 event/cache rule; Core 0.2.1074 SnowField.ZoneAreaChanged(zone, rect, wholeZone), raised just
@@ -942,6 +979,12 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static int s_areaEvents, s_areaLocalEvents, s_areaMarked, s_areaSpared;
 
         internal static void MarkSnowDirtyArea(Vector2s zone, Rect area, bool wholeZone)
+        {
+            int m0 = s_areaMarked;   // 1.2.480: [Churn] area events and the groups they marked
+            try { MarkSnowDirtyAreaBody(zone, area, wholeZone); } finally { EbmChurn.NoteArea(s_areaMarked - m0); }
+        }
+
+        private static void MarkSnowDirtyAreaBody(Vector2s zone, Rect area, bool wholeZone)
         {
             s_areaEvents++;
             if (wholeZone) { MarkSnowDirty(zone); return; }
@@ -1639,7 +1682,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     state.ConstructedUnscaledTime = now;
                     if (state.Baked) { long ztQueue = EbmSelfCost.ZT(); using (WalkMarkers.ReloadQueue.Auto()) QueueStandIns(state); EbmSelfCost.ZAcc(EbmSelfCost.ZsQueueStandIns, ztQueue); }
                     long rl3 = System.Diagnostics.Stopwatch.GetTimestamp();
-                    if (state.Baked) { using (WalkMarkers.ReloadAnnounce.Auto()) AnnounceWhenReady(state); }   // 1.2.206: back in range = announced again (its values went on unload)
+                    if (state.Baked) { EbmChurn.NoteAnnounce(EbmChurn.Announce.BackInRange); using (WalkMarkers.ReloadAnnounce.Auto()) AnnounceWhenReady(state); }   // 1.2.480: counted   // 1.2.206: back in range = announced again (its values went on unload)
                     long rl4 = System.Diagnostics.Stopwatch.GetTimestamp();
                     using (WalkMarkers.ReloadReadopt.Auto()) ReadoptSurvivors(state);   // 1.2.185
                     long rl5 = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1664,7 +1707,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             bool slowNow = now >= s_nextSlow || AnyZoneWorkQueued() || s_bakePassDeferred;   // s_bakePassDeferred: only ever set while [Optimize] BakePassBudgetMs is above 0
             if (slowNow) s_nextSlow = now + 0.1f;
             long checkStart = InstancedDraw.Mark(InstancedDraw.Phase.Checks);
-            if (slowNow) { using (CheckMarkers.FinishHandBacks.Auto()) FinishHandBacks(now); using (CheckMarkers.TransitionReport.Auto()) TransitionReport(now); }   // 1.2.322: + the 30 s [Transition] counters   // 1.2.363: markers only
+            if (slowNow) { using (CheckMarkers.FinishHandBacks.Auto()) FinishHandBacks(now); GraceTick(now); using (CheckMarkers.TransitionReport.Auto()) TransitionReport(now); }   // 1.2.322: + the 30 s [Transition] counters   // 1.2.363: markers only
             if (skipping && slowNow)
             {
                 if (now >= s_nextRangeCheck)
@@ -1792,7 +1835,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                         if (sectorRule && still >= StaleCacheMinMissing && still >= ids.Count * StaleCacheShare)
                         {
                             state.PendingMissing = null;
-                            state.Dirty = true;
+                            state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.CacheContent; EbmChurn.NoteRebake(EbmChurn.Rebake.CacheContent);   // 1.2.480: counted
                             state.LastChangeUnscaledTime = now;
                             s_staleCacheZones++;
                             if (FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value)
@@ -1832,7 +1875,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                         {
                             s_missingRebakes++;
                             int missing = merged;
-                            state.Dirty = true;
+                            state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.CacheMissing; EbmChurn.NoteRebake(EbmChurn.Rebake.CacheMissing);   // 1.2.480: counted
                             state.LastChangeUnscaledTime = now;
                             EasyBakeLog.Debug($"[Bake] Zone ({state.Coord.x},{state.Coord.y}): cached mesh has "
                                 + $"{missing} piece(s) removed since it was saved — rebaking to drop them.");
@@ -1916,8 +1959,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                 {
                     state.FromCache = false; Indirect.EbmIndirect.RequestFullWalk();
                     ZdoBakeFreshBakeLanded(state);   // 1.2.369: baked from live pieces now; saved as today, and not built from ZDOs again this session
-                    AnnounceWhenReady(state);   // 1.2.206 EbmApi.ZoneBaked
-                    s_zonesBakedFresh++;
+                    EbmChurn.NoteAnnounce(EbmChurn.Announce.Baked); AnnounceWhenReady(state);   // 1.2.206 EbmApi.ZoneBaked (1.2.480: counted)
+                    s_zonesBakedFresh++; s_churnFresh++;
+                    EbmChurn.NoteZoneBuilt(state.Coord, state.ChurnWhy.HasValue ? EbmChurn.RebakeName(state.ChurnWhy.Value) : "fresh"); state.ChurnWhy = null;   // 1.2.480: [Settle] build sequence
                     state.Dirty = false;
                     // Only pin via keepalive if the fresh bake produced batches.
                     // Zones with sub-threshold materials or all-PropBlock /
@@ -1958,6 +2002,8 @@ namespace FiresEasyBakeMeshes.EasyBake
                 if (state.ZoneActive && state.Baked && state.PresentPieces == 0 && state.AwaitingRecreate == null
                     && now - state.ConstructedUnscaledTime >= EmptyZoneGraceSeconds)
                 {
+                    if (EmptyZoneWaits(state, now)) continue;   // 1.2.481 F1 [09 - Disk Cache] EmptyZoneWaitsForDelivery (default off)
+                    EbmChurn.NoteEmptyTeardown(EmptyZoneUndelivered(state));   // 1.2.481: [Churn] counts every empty-zone teardown
                     bool demolished = EmptyZoneDropsCacheOn && Demolished(state, now);   // before the teardown, which forgets the bake's contributors
                     TearDown(state);
                     _dropScratch.Add(kv.Key);
@@ -1971,7 +2017,8 @@ namespace FiresEasyBakeMeshes.EasyBake
             BakeFrameSplit.Enter(BakeFrameSplit.Step.Announce);
             var due = EbmSnowStore.TakeDue(Time.unscaledTime);
             EbmSnowStore.PumpHolds(Time.unscaledTime);   // 1.2.260: zones whose wait for per-piece snow ended re-split
-            for (int i = 0; i < due.Count; i++) if (_zones.TryGetValue(due[i], out var dz) && dz.Baked) AnnounceWhenReady(dz);
+            for (int i = 0; i < due.Count; i++) if (_zones.TryGetValue(due[i], out var dz) && dz.Baked) { EbmChurn.NoteAnnounce(EbmChurn.Announce.Invalidate); AnnounceWhenReady(dz); }   // 1.2.480: counted
+            EbmChurn.Tick(Time.unscaledTime);   // 1.2.480: [Churn] / [Settle] (ChurnLine key; counters always)
             EbmSelfCost.ZAcc(EbmSelfCost.ZsReannounce, ztTail, due.Count);
             BakeFrameSplit.Enter(BakeFrameSplit.Step.HiddenRelease);
             ztTail = EbmSelfCost.ZT();
@@ -2007,6 +2054,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 bool tooMany = s_hiddenScratch.Count - i > HiddenKeepZones;
                 if (!tooMany && now - state.HiddenSinceUnscaledTime < HiddenReleaseSeconds) break;
                 EbmTrace.Step("hidden release", 0, "zone " + state.Coord.x + "," + state.Coord.y);
+                EbmTrace.Hf(EbmTrace.HfHidden);   // 1.2.491 (A) [Hitch-EBM] counts
                 TearDown(state);
                 _zones.Remove(state.Coord);
                 released++;
@@ -2029,6 +2077,34 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static readonly Dictionary<Vector2s, EmptySeen> s_emptySeen = new Dictionary<Vector2s, EmptySeen>();
         private static int s_emptyZoneDrops;
         private static bool s_saidEmptyDrop;
+        // 1.2.481 F1 ([visual], lead GO 11-21; W1 "[Settle] ... 3+ times 14; most: (-14,10) 8x: cache > cache > ..."): a zone built from cache when its TERRAIN
+        // loaded (ConstructCachedZonesInRange, out to the near simulation distance) has no pieces until the server sends its sector; the teardown above then
+        // dropped it every ~10 s and the range pass rebuilt it (a re-announce, Vedr re-registering its caps, re-splits, looks uploads, each time).
+        // With the key ON, a client keeps such a zone while its sector is UNDELIVERED: no ZDO arrived there yet (SectorArrivals) and FGN, when active, has not
+        // called it settled. Bounded ([2ic] MUST): at most EmptyZoneWaitMaxSeconds after the zone was built, then today's teardown runs (a truly empty sector
+        // never leaves a ghost). Once delivered, the teardown waits EmptyZoneGraceSeconds after the sector's last ZDO arrival, so the pieces can be matched.
+        // A server / host / single player holds every ZDO: always delivered, unchanged.
+        private static bool EmptyZoneUndelivered(ZoneState state)
+        {
+            var net = ZNet.instance;
+            if (net == null || net.IsServer()) return false;
+            // [2ic] SHOULD: with FGN active its settled signal is THE delivery test (vegetation / terrain ZDOs can arrive before the pieces); without FGN, any ZDO arrival
+            return FgnLink.Active ? !state.FgnSettled : SectorArrivals.LastArrival(state.Coord) < 0f;
+        }
+        private static bool EmptyZoneWaits(ZoneState state, float now)
+        {
+            if (!EbmChurn.EmptyWaitOn) return false;
+            if (EmptyZoneUndelivered(state))
+            {
+                if (now - state.ConstructedUnscaledTime < EbmChurn.EmptyWaitMaxSeconds) { EbmChurn.NoteEmptyHeld(state.Coord); return true; }
+                EbmChurn.NoteEmptyCapReached();   // the cap: today's teardown from here
+                return false;
+            }
+            float arrived = SectorArrivals.LastArrival(state.Coord);
+            if (arrived >= 0f && now - arrived < EmptyZoneGraceSeconds) { EbmChurn.NoteEmptyHeld(state.Coord); return true; }   // delivered just now: let its pieces be matched first
+            return false;
+        }
+
         private static bool EmptyZoneDropsCacheOn => FiresEasyBakeMeshesPlugin.CacheEmptyZoneDropsCache != null && FiresEasyBakeMeshesPlugin.CacheEmptyZoneDropsCache.Value && FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value;
 
         private static bool Demolished(ZoneState state, float now)
@@ -2156,10 +2232,12 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static void Reset()
         {
             FarForget();   // 1.2.282
+            MakeRealReset();   // 1.2.482: the make-real keep list goes with the world
             Indirect.EbmIndirect.Shutdown();   // 1.2.203: the indirect buffers + clones go with the world
             s_giveBackZones.Clear();
             foreach (var s in _zones.Values) TearDown(s);
             _zones.Clear();
+            GraceReset();   // 1.2.482: after the teardowns (they may keep stand-ins): every kept stand-in goes with the world
             MeshBaker.ClearClasses();   // 1.2.392 ([2ic], [lead]): world close or EBM off; nothing ever cleared the piece class table, so a closed world's pieces stayed in it
             EbmSnowStore.Clear();   // 1.2.206: nothing outlives the world
             _transparentByName.Clear(); s_transparentByHash.Clear();
@@ -2444,6 +2522,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             zdo.Created = true;
             state.Skipped[zdo] = new SkippedPiece(zdo, identity);
+            Far.FarBuildingDraw.NoteSkippedCreated(zdo);   // 1.2.467: drawn by its group from now on (if the group draws): the far copy hands it off this frame
             BindDamageProxy(state, identity, zdo, info);
             SkipPhase(7, ref tp);
             state.LastChangeUnscaledTime = Time.unscaledTime;
@@ -2797,6 +2876,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static void TickDisabling(float now)
         {
             FinishHandBacks(now);
+            GraceTick(now);   // 1.2.482: kept stand-ins drop once their pieces exist, also while disabling
             TransitionReport(now);
         }
 
@@ -3356,11 +3436,15 @@ namespace FiresEasyBakeMeshes.EasyBake
             _rematchedScratch.Clear();
             bool seasonRecheck = state.SeasonEpochChecked != s_seasonEpoch;   // 1.2.180: after a Vedr season change every skipped piece is asked again once
             state.SeasonEpochChecked = s_seasonEpoch;
+            // 1.2.480 [08 - Snow And Seasons] WinterKeepRadius: a skipped piece's ZDO does not change when the player walks closer, so for a zone near the
+            // player (re-checked after every 4 m the player moves) the unchanged pieces that the winter keep now wants real are asked again; they fail
+            // ZdoMatches and are handed back below (an instanced one is recreated, no rebake). Off (0) = exactly as before.
+            bool radiusRecheck = SkipEligibility.WinterRadiusDue(state.Coord, ref state.RadiusCheckPos);
             foreach (var entry in state.Skipped)
             {
                 var zdo = entry.Key;
                 var skipped = entry.Value;
-                if (!seasonRecheck && skipped.Unchanged(zdo)) continue;
+                if (!seasonRecheck && skipped.Unchanged(zdo) && !(radiusRecheck && SkipEligibility.WinterKeepNow(zdo, skipped.Identity.PrefabHash))) continue;
                 if (zdo != null && zdo.m_uid == skipped.Uid && zdoMan.GetZDO(zdo.m_uid) == zdo
                     && MeshBaker.PieceIdentity.From(zdo).Equals(skipped.Identity)
                     && state.Bake.PieceTransforms.TryGetValue(skipped.Identity, out var cached)
@@ -3379,7 +3463,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 needsRebake = !ReleaseChangedInstance(state, _changedScratch[i].Key, _changedScratch[i].Value);
             if (!needsRebake) return;
 
-            state.Dirty = true;
+            state.Dirty = true; state.ChurnWhy = EbmChurn.Rebake.ChangedInstance; EbmChurn.NoteRebake(EbmChurn.Rebake.ChangedInstance);   // 1.2.480: counted
             state.LastChangeUnscaledTime = Time.unscaledTime;
             s_handedBackForChanges += state.Skipped.Count;
             HoldRealPieces(state, 0f, "a changed instance could not be released from its group (rebake needed)");
@@ -3400,6 +3484,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 zones++; skipped += state.Skipped.Count;
                 state.NextWatch = 0f;
             }
+            EbmChurn.NoteSeasonRecheck(zones, skipped);   // 1.2.480
             EasyBakeLog.Info($"[Skip] season {season} stage {stage}: {skipped} skipped piece(s) in {zones} zone(s) re-checked for winter snow (Vedr snow-building mask {VedrLink.SnowBuildingBiomeMask})");
         }
 
@@ -3420,6 +3505,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (zdo != null) zdo.Created = false; Patches.ZdoEventDirty.Mark();
             state.CacheStale = true;
             s_handedBackForChanges++;
+            EbmChurn.NoteHandBack(EbmChurn.WatchHandBack, 1);   // 1.2.480: a changed skipped piece (or the winter keep radius) handed back by the watch
             return true;
         }
 
@@ -3668,13 +3754,15 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void ReleaseSkipped(ZoneState state, bool parkStandIns = false)
         {
             NoteStandInsTouched(state);   // 1.2.208: EbmApi.StandInsChanged after the frame (Core's shelter follows removals too)
+            // 1.2.482 support grace: the pieces handed back here (and any hand-back in flight) keep their stand-ins until each exists again (ZoneTrackerSupportSafe)
+            List<ZDO> released = !parkStandIns && state.StandInRoot != null ? ReleasedForGrace(state) : null;
             foreach (var entry in state.Skipped)
                 if (entry.Key != null) entry.Key.Created = false; Patches.ZdoEventDirty.Mark();
             state.Skipped.Clear();
             state.AwaitingRecreate = null;
             state.AwaitingIdentities = null;
             if (parkStandIns && state.StandInRoot != null) { long ztPark = EbmSelfCost.ZT(); state.StandInRoot.SetActive(false); EbmSelfCost.ZAcc(EbmSelfCost.ZsPark, ztPark); }
-            else DestroyStandIns(state);
+            else if (!KeepStandInsUntilCreated(state, released)) DestroyStandIns(state);
             state.StandInQueue.Clear();
             state.ConvertQueue.Clear();
             state.HoldReal = false;
@@ -3726,7 +3814,13 @@ namespace FiresEasyBakeMeshes.EasyBake
             NoteStandInsTouched(state);   // 1.2.208: EbmApi.StandInsChanged after the frame (Core's shelter follows removals too)
             NoteSupportHold(state, "a stand-in dropped");   // 1.2.348
             if (!state.StandIns.TryGetValue(identity, out var standIn)) return;
-            if (standIn != null) { DetachColliders(standIn); EbmTrace.Step("standin destroy", standIn.GetInstanceID(), standIn.name); Object.Destroy(standIn); }
+            if (standIn != null)
+            {
+                long tP = Probe.Start();   // 1.2.491 (B): the managed share, as "EasyBake:standinDestroy" (0 = the timer is off, nothing recorded)
+                int cols = DetachColliders(standIn); EbmTrace.Step("standin destroy", standIn.GetInstanceID(), standIn.name); Object.Destroy(standIn);
+                EbmTrace.Hf(EbmTrace.HfStandIn); EbmTrace.Hf(EbmTrace.HfColliders, cols);   // 1.2.491 (A) [Hitch-EBM] counts
+                Probe.Stop("EasyBake:standinDestroy", tP);
+            }
             state.StandIns.Remove(identity);
         }
 
@@ -3810,7 +3904,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 $"built as their pieces arrived, {s_standInZonesReused} zone revisits reused theirs); real pieces " +
                 $"brought back: {s_handedBackForBuilding} for build tools, {s_handedBackForDamage} for incoming damage, {s_handedBackForChanges} for removals or changes; " +
                 $"{s_handedBackLooks} instanced pieces went back to drawing themselves after damage, a look change, burning or a hammer highlight; " +
-                $"{s_joinedLate} pieces that arrived after their zone baked joined its instanced groups." + ExtraSkipCounters());
+                $"{s_joinedLate} pieces that arrived after their zone baked joined its instanced groups." + ExtraSkipCounters() + MakeRealSummary());   // 1.2.482
 
             string data = PieceData.Report();
             if (data != null) EasyBakeLog.Debug(data);

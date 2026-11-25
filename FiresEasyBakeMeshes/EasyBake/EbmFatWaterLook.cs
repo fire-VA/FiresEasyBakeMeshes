@@ -36,8 +36,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            On = config.Bind("Water", "FAT Water Look", false /* 1.2.437: OFF until Fire's look check */,
-                "With FiresAdminTerrain installed: its inland water (rivers, lakes, ponds, placed water) is drawn with EBM's water shader while EBM draws the water. Off = FiresAdminTerrain draws its own water. Applies live.");
+            On = EbmConfigMove.Bind(config, "40 - Shaders", "FAT Water Look", false /* 1.2.437: OFF until Fire's look check */,
+                "Needs [40 - Shaders] WaterShader = true. With FiresAdminTerrain installed: its inland water (rivers, lakes, ponds, placed water) is drawn with EBM's water shader while EBM draws the water. Off = FiresAdminTerrain draws its own water. Applies live.");
             On.SettingChanged += (_, __) => Sync("FAT Water Look key");
             EbmApi.ShaderOwnershipChanged += OnOwnership;
         }

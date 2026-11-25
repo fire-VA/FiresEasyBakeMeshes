@@ -25,12 +25,14 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static string KeyFor(long targetKey, bool isCell, bool coarse, List<Vector2s> zones, float clusterM)
         {
             ulong prints = 0, caps = 0;
+            bool layer = FarSnow.Layer;   // 1.2.468: a snow-layer copy holds no caps (ZDO cap levels never change it) and its codes come from the geometry + the owner's static class
             foreach (var z in zones)
             {
                 if (!FarBuildingDigest.Zones.TryGetValue(z, out var fz)) continue;
                 prints += fz.Print ^ ((ulong)(uint)z.x * 0x9E3779B97F4A7C15UL) ^ ((ulong)(uint)z.y << 32);
-                for (int i = 0; i < fz.Pieces.Length; i++) if (fz.Pieces[i].Cap != 0) caps += (ulong)(i + 1) * fz.Pieces[i].Cap * 0x100000001B3UL + (ulong)(uint)z.x;
+                if (!layer) for (int i = 0; i < fz.Pieces.Length; i++) if (fz.Pieces[i].Cap != 0) caps += (ulong)(i + 1) * fz.Pieces[i].Cap * 0x100000001B3UL + (ulong)(uint)z.x;
             }
+            if (layer) caps = 0x4C41594552UL;   // "LAYER": its own key space, never a cap copy's entry
             // 1.2.428: no snow revision in the key (far snow is a live material value now; the merged mesh carries no snow level)
             return FarCache.Key("merged", Version + 3, clusterM, targetKey, isCell, coarse, coarse ? FarBuildings.CoarseCluster : 1f, coarse ? FarBuildings.CoarseSmall : 0f,
                                 prints, caps, FarBuildings.InteriorOn, FarBuildings.SizeCutOn, FarBuildings.SizeCutMax, FarBuildingSources.ModTag);   // 1.2.431: the cuts change the content

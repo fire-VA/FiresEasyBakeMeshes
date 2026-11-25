@@ -178,6 +178,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             bool job = s_zdoFileJob != null;
             s_zdoFileJob = null;   // a ZdoCombine request still running finishes on its worker and is not read
+            s_zdoFileUnloaded.Clear(); s_zdoFileWhyNot.Clear();   // 1.2.518: no unloaded-zone files once the ZDO path is off
             bool swapCancelled = false;
             if (s_zdoSwap != null && s_zdoSwap.Queued == null) { CancelZdoSwap(s_zdoSwap, "[Cache] ZdoFirstBake was turned off while its batches were built", false); swapCancelled = true; }
             int queued = s_zdoSwapQueue.Count;
@@ -474,7 +475,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             state.Bake = result;
             state.Baked = true;
             state.FromCache = true; Indirect.EbmIndirect.RequestFullWalk();   // FromCache: the bake landed before vanilla reached the pieces, as for a cache hit
-            AnnounceWhenReady(state);   // EbmApi.ZoneBaked
+            EbmChurn.NoteAnnounce(EbmChurn.Announce.CacheBuilt); AnnounceWhenReady(state);   // EbmApi.ZoneBaked (1.2.480: counted with cache builds)
             if (result.HasRenderableContent) ZoneKeepalive.MarkActive(coord);
             QueueStandIns(state);
             state.CacheStale = true;   // 1.2.374: the bake pass offers it to SaveZone, which notes it for the background full file (ZdoFileWanted)
@@ -482,7 +483,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             scan.State = state;
             scan.AttachedBy = via;
             scan.AttachedAtSlice = scan.Slices;
-            s_zonesFromZdo++;
+            s_zonesFromZdo++; EbmChurn.NoteZoneBuilt(coord, "zdo");   // 1.2.480: [Settle] build sequence
             s_zdoVia[(int)via]++;
             if (s_zdoBakeWait.TryGetValue(coord, out var wait)) { s_zdoAfterWait++; scan.EarlierScans = wait.Scans; s_zdoBakeWait.Remove(coord); }
             if (!s_saidZdoBake) { s_saidZdoBake = true; EasyBakeLog.Info("[Cache] ZdoFirstBake on: a zone with no saved bake is built from its ZDOs on the first visit; pieces it cannot draw stay live, and its full cache file is built from its ZDOs in the background while you are in the area"); }   // 1.2.387: text only (was "prototype ... no cache file is written", false since 1.2.374)
@@ -570,9 +571,25 @@ namespace FiresEasyBakeMeshes.EasyBake
         //  - the sector count must not have moved between the snapshot and the save (else the job starts over later); a cache file this session did not
         //    write from ZDOs is never replaced ([2ic]);
         //  - MeshCacheStore.SaveZdoBuilt writes the file and refreshes the preload copy; the next visit loads it like any saved zone (NeedsCacheValidation).
+        // 1.2.518 ([lead] 11-25, Fire's goal "build once, load smoothly"; launcher legs rtHD1125b arm1 / arm2: the same 11 zones ZDO-baked on every arrival, "full files
+        // from ZDOs: 0 written" all session, 75 cache files before and after): those zones are baked around the spawn town on arrival and left at once, so they were never
+        // in reach AND 15 s quiet while still loaded, and a torn-down zone left the wanted list for good. On the AUTHORITATIVE side (single player / host / server: it
+        // holds every ZDO of the world, so a far zone's ZDOs are complete) a wanted zone that is torn down now stays wanted as an UNLOADED zone: the same job builds its
+        // file from its ZDOs at any distance once its piece count stood still 15 s (the same quiet rule), with no this-visit swap (nothing is drawn there). A client
+        // keeps the old rule (its far ZDOs are partial). One writer (this job, SaveZdoBuilt), the existing format; a file this session did not write is never replaced.
+        private static readonly HashSet<Vector2s> s_zdoFileUnloaded = new HashSet<Vector2s>();
+        private static readonly Dictionary<Vector2s, string> s_zdoFileWhyNot = new Dictionary<Vector2s, string>();   // 1.2.518: the last refusal reason said per zone (Debug on change)
+        private static int s_zdoFilesUnloadedSaved;
+        private static void NoteWhyNot(Vector2s coord, string why)
+        {
+            if (s_zdoFileWhyNot.TryGetValue(coord, out var last) && last == why) return;
+            s_zdoFileWhyNot[coord] = why;
+            EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): full file from ZDOs not started yet: {why} (1.2.518)");
+        }
         private sealed class ZdoFileJob
         {
-            public ZoneState State;
+            public ZoneState State;   // null = an UNLOADED zone's job (1.2.518, authoritative side only)
+            public Vector2s Coord;
             public ZdoScan Scan;
             public bool Partitioned;
             public readonly List<MeshBaker.PieceIdentity> CoveredAll = new List<MeshBaker.PieceIdentity>();   // covered + draws-nothing, for the this-visit swap
@@ -662,11 +679,12 @@ namespace FiresEasyBakeMeshes.EasyBake
             SaveOutcome(state, "ZDO-baked: its full cache file is built from ZDOs in the background once its sector is quiet");
         }
 
-        private static void ZdoFileRefuse(ZoneState state, string why, bool warn)
+        private static void ZdoFileRefuse(ZoneState state, string why, bool warn) => ZdoFileRefuse(state.Coord, why, warn);
+        private static void ZdoFileRefuse(Vector2s coord, string why, bool warn)   // 1.2.518: by coordinate (an unloaded zone has no state)
         {
-            s_zdoFileWanted.Remove(state.Coord);
-            s_zdoFileRefused.Add(state.Coord);
-            string line = $"[Cache] zone ({state.Coord.x},{state.Coord.y}): no cache file from ZDOs: {why}; the zone keeps drawing from its ZDO bake and is not asked again this session";
+            s_zdoFileWanted.Remove(coord); s_zdoFileUnloaded.Remove(coord); s_zdoFileWhyNot.Remove(coord);
+            s_zdoFileRefused.Add(coord);
+            string line = $"[Cache] zone ({coord.x},{coord.y}): no cache file from ZDOs: {why}; the zone keeps drawing from its ZDO bake and is not asked again this session";
             if (warn) EasyBakeLog.Warn(line); else EasyBakeLog.Debug(line);
         }
 
@@ -685,18 +703,31 @@ namespace FiresEasyBakeMeshes.EasyBake
                 s_zdoVerifySeen.Remove(vcoord);
                 s_zdoVerifySkipped++;
             }
-            if (s_zdoFileWanted.Count == 0 || now < s_zdoFileNextPick) return;
+            if ((s_zdoFileWanted.Count == 0 && s_zdoFileUnloaded.Count == 0) || now < s_zdoFileNextPick) return;   // 1.2.518 ([2ic] MUST): unloaded zones keep the pump going
             s_zdoFileNextPick = now + 1f;
             if (!FiresEasyBakeMeshesPlugin.CachePersistEnabled.Value || !MeshCacheStore.DiskListingDone || MeshCacheStore.TryGetWorldUid() == 0L) return;
             var zdoMan = ZDOMan.instance;
             if (zdoMan == null) return;
+            bool authoritative = ZNet.instance != null && ZNet.instance.IsServer();   // 1.2.518: holds every ZDO, so a far / unloaded zone's ZDOs are complete
             s_zdoFileScratch.Clear();
             s_zdoFileScratch.AddRange(s_zdoFileWanted);
             for (int i = 0; i < s_zdoFileScratch.Count; i++)
             {
                 var coord = s_zdoFileScratch[i];
-                if (!_zones.TryGetValue(coord, out var state) || !state.ZdoBaked) { s_zdoFileWanted.Remove(coord); continue; }   // torn down, or baked fresh from live pieces (today's save)
-                if (state.Dirty || !state.ZoneActive || s_zdoScans.ContainsKey(coord) || !ZdoFileJudgeable(state, now) || !ZdoFileQuiet(coord, now)) continue;   // not yet (in reach, then its piece count standing still)
+                if (!_zones.TryGetValue(coord, out var state))   // torn down
+                {
+                    s_zdoFileWanted.Remove(coord);
+                    if (authoritative && !s_zdoFileRefused.Contains(coord)) { s_zdoFileUnloaded.Add(coord); NoteWhyNot(coord, "the zone unloaded; it is built from its ZDOs as an unloaded zone once its pieces are quiet"); }
+                    else s_zdoFileWhyNot.Remove(coord);
+                    continue;
+                }
+                if (!state.ZdoBaked) { s_zdoFileWanted.Remove(coord); s_zdoFileWhyNot.Remove(coord); continue; }   // baked fresh from live pieces (today's save)
+                // not yet: say which gate held it (Debug, once per change of reason); 1.2.518: the reach gate is the client's only (its far ZDOs are partial)
+                if (state.Dirty) { NoteWhyNot(coord, "the zone is dirty (a change is still being baked)"); continue; }
+                if (!state.ZoneActive) { NoteWhyNot(coord, "the zone is not active"); continue; }
+                if (s_zdoScans.ContainsKey(coord)) { NoteWhyNot(coord, "a ZDO scan is still filling it"); continue; }
+                if (!authoritative && !ZdoFileJudgeable(state, now)) { NoteWhyNot(coord, "out of reach (client: only zones in the near area have all their ZDOs)"); continue; }
+                if (!ZdoFileQuiet(coord, now)) { NoteWhyNot(coord, $"its piece count has not stood still {ZdoFileQuietSeconds:0} s yet"); continue; }
                 if (MeshCacheStore.HasDiskFile(coord) && !s_zdoFilesWritten.Contains(coord))
                 {
                     s_zdoFileRefusedExisting++;
@@ -706,13 +737,42 @@ namespace FiresEasyBakeMeshes.EasyBake
                 s_zdoFileJob = StartZdoFileJob(state, null, now);
                 return;
             }
+            // 1.2.518: unloaded zones (authoritative side): the same job from the ZDOs alone; a zone that loads again goes back to the normal path (its save asks again)
+            if (!authoritative || s_zdoFileUnloaded.Count == 0) return;
+            s_zdoFileScratch.Clear();
+            s_zdoFileScratch.AddRange(s_zdoFileUnloaded);
+            for (int i = 0; i < s_zdoFileScratch.Count; i++)
+            {
+                var coord = s_zdoFileScratch[i];
+                if (_zones.ContainsKey(coord)) { s_zdoFileUnloaded.Remove(coord); s_zdoFileWhyNot.Remove(coord); continue; }
+                if (s_zdoFileRefused.Contains(coord)) { s_zdoFileUnloaded.Remove(coord); continue; }
+                if (!ZdoFileQuiet(coord, now)) { NoteWhyNot(coord, $"unloaded; its piece count has not stood still {ZdoFileQuietSeconds:0} s yet"); continue; }
+                if (MeshCacheStore.HasDiskFile(coord) && !s_zdoFilesWritten.Contains(coord))
+                {
+                    s_zdoFileRefusedExisting++;
+                    ZdoFileRefuse(coord, "a cache file this session did not write already exists for it (never replaced)", false);
+                    continue;
+                }
+                s_zdoFileJob = StartZdoFileJob(coord, now);
+                return;
+            }
         }
 
         private static void StepZdoFileJob(ZdoFileJob job)
         {
             var state = job.State;
-            var coord = state.Coord;
-            if (!_zones.TryGetValue(coord, out var current) || current != state || state.Dirty || (job.VerifyAgainst != null ? state.Bake != job.VerifyAgainst : !state.ZdoBaked))
+            var coord = job.Coord;
+            if (state == null)
+            {
+                // 1.2.518 unloaded zone: dropped if the zone loads again meanwhile (its own save asks again) or was refused
+                if (_zones.ContainsKey(coord) || s_zdoFileRefused.Contains(coord))
+                {
+                    s_zdoFileJob = null; s_zdoFileUnloaded.Remove(coord);
+                    EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): unloaded-zone file job dropped (the zone loaded again; its own save asks again)");
+                    return;
+                }
+            }
+            else if (!_zones.TryGetValue(coord, out var current) || current != state || state.Dirty || (job.VerifyAgainst != null ? state.Bake != job.VerifyAgainst : !state.ZdoBaked))
             {
                 s_zdoFileJob = null;   // the zone went away or to today's path; a wanted zone that comes back is picked again
                 EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): background file job dropped (the zone was torn down or changed)");
@@ -809,8 +869,8 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void FinishZdoFile(ZdoFileJob job)
         {
-            var state = job.State;
-            var coord = state.Coord;
+            var state = job.State;   // null = an unloaded zone (1.2.518)
+            var coord = job.Coord;
             var scan = job.Scan;
             var req = job.Request;
             if (req != null && req.Error != null) { s_zdoFileOtherFails++; ZdoFileFail(job, "the combine reported: " + req.Error, true); return; }
@@ -856,7 +916,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (fail != null) { s_zdoFileSelfCheckFails++; ZdoFileFail(job, "SELF-CHECK FAILED, nothing written: " + fail, true); return; }
             EasyBakeLog.InfoFirst("ZDO full file self-check passed", $"[Cache] zone ({coord.x},{coord.y}): ZDO full file self-check passed ({job.Contributors.Count} contributors, {(req != null && req.Near != null ? req.Near.Count : 0)} batches, {job.Groups.Count} groups{(job.VerifyAgainst != null ? "; verifier job, nothing written" : "")})");   // [lead]: the gate reads a pass (Info once, then Debug); a fail Warns
             if (job.VerifyAgainst != null) { CompareZdoFile(job, req != null && req.Near != null ? req.Near.Count : 0); return; }   // the verifier's job never saves
-            if (job.Contributors.Count == 0) { ZdoFileRefuse(state, "nothing to save (no group and no covered piece)", false); return; }
+            if (job.Contributors.Count == 0) { ZdoFileRefuse(coord, "nothing to save (no group and no covered piece)", false); return; }
 
             long uid = MeshCacheStore.TryGetWorldUid();
             if (uid == 0L) return;   // stays wanted
@@ -872,14 +932,15 @@ namespace FiresEasyBakeMeshes.EasyBake
                 FarBatches = req != null && req.Far != null ? req.Far : new List<MeshCacheStore.CachedBatchData>(),
                 InstanceGroups = job.Groups,
             };
-            if (!MeshCacheStore.SaveZdoBuilt(uid, coord, data)) { s_zdoFileOtherFails++; ZdoFileRefuse(state, "the save failed", true); return; }
-            s_zdoFileWanted.Remove(coord); s_zdoFileQuiet.Remove(coord);
+            if (!MeshCacheStore.SaveZdoBuilt(uid, coord, data)) { s_zdoFileOtherFails++; ZdoFileRefuse(coord, "the save failed", true); return; }
+            s_zdoFileWanted.Remove(coord); s_zdoFileQuiet.Remove(coord); s_zdoFileUnloaded.Remove(coord); s_zdoFileWhyNot.Remove(coord);
             s_zdoFilesWritten.Add(coord); s_zdoFileSavedCount[coord] = job.PieceCount;
             s_zdoFilesSaved++;
-            QueueZdoSwap(job, data);   // Phase 2: the same batches attached to this visit's zone
+            if (state == null) s_zdoFilesUnloadedSaved++;   // 1.2.518: an unloaded zone: no this-visit swap (nothing of it is drawn)
+            else QueueZdoSwap(job, data);   // Phase 2: the same batches attached to this visit's zone
             int leftLive = 0;
             for (int i = 0; i < scan.LeftLive.Length; i++) leftLive += scan.LeftLive[i];
-            SaveOutcome(state, $"saved from ZDOs ({data.Batches.Count} batch(es), {job.Groups.Count} instance group(s))");
+            if (state != null) SaveOutcome(state, $"saved from ZDOs ({data.Batches.Count} batch(es), {job.Groups.Count} instance group(s))");
             EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): full cache file built from ZDOs: {job.Groups.Count} group(s) with {job.GroupPieces} piece(s); combine got {job.CombinePieces} piece(s) -> {data.Batches.Count} near + {data.FarBatches.Count} far batch(es), {covered} covered, {drawsNothing} drawing nothing, {partial} partial (live); {job.Contributors.Count} contributor(s), {job.Transforms.Count} transform(s); not in the file (created live on later visits): {leftLive} ({DescribeLeftLive(scan.LeftLive)}) and the damageable pieces of keys below the minimum; from {scan.Seen} ZDO(s), {job.Slices} slice(s) over {Time.frameCount - job.StartFrame + 1} frame(s), {job.Ticks * 1000.0 / Stopwatch.Frequency:F1} ms main thread; self-check passed");
         }
 
@@ -1083,7 +1144,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (SkipCreationActive() && !ShellPieces.On)
                 for (int i = 0; i < swap.Live.Count; i++) if (swap.Live[i] != null) state.ConvertQueue.Enqueue(swap.Live[i]);
             state.LastChangeUnscaledTime = Time.unscaledTime;
-            s_zdoSwapsDone++;
+            s_zdoSwapsDone++; EbmChurn.NoteZoneBuilt(state.Coord, "zdo swap");   // 1.2.480: the swap adds the file's batches to a built zone (and restarts its settle): a build
             s_zdoSwapPiecesSilenced += swap.Live.Count;
             EasyBakeLog.Debug($"[Cache] zone ({state.Coord.x},{state.Coord.y}): {(swap.GroupsOnly ? "groups brought to the file's state this visit (no batches to attach)" : "combined batches attached this visit")}: {swap.Near.Count} near + {swap.Far.Count} far batch(es), {swap.GroupAdds.Count} group instance(s) added in {touched.Count} group(s) ({groupsOpened} new), {swap.Added.Count} piece(s) became contributors, {swap.Live.Count} live piece(s) silenced and queued to unload; built over {Time.frameCount - swap.StartFrame + 1} frame(s), {swap.Ticks * 1000.0 / Stopwatch.Frequency:F1} ms main thread before the silencing");
         }
@@ -1124,7 +1185,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void ZdoFileFail(ZdoFileJob job, string why, bool warn)
         {
-            if (job.VerifyAgainst == null) { ZdoFileRefuse(job.State, why, warn); return; }
+            if (job.VerifyAgainst == null) { ZdoFileRefuse(job.Coord, why, warn); return; }
             s_zdoVerifySkipped++;
             string line = $"[ZdoVerify] zone ({job.State.Coord.x},{job.State.Coord.y}): not compared: {why}";
             if (warn) EasyBakeLog.Warn(line); else EasyBakeLog.Debug(line);
@@ -1132,11 +1193,25 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static ZdoFileJob StartZdoFileJob(ZoneState state, MeshBaker.BakeResult verifyAgainst, float now)
         {
-            var job = new ZdoFileJob { State = state, StartFrame = Time.frameCount, VerifyAgainst = verifyAgainst };
-            job.Scan = new ZdoScan { Coord = state.Coord, Via = ZdoVia.RangePass, FileOnly = true, SectorCount = SectorCount(state.Coord), Now0 = now, StartFrame = Time.frameCount };
-            ZDOMan.instance.FindSectorObjects(state.Coord, new SimulationDistance(0, 0), job.Scan.Zdos);
-            for (int z = 0; z < job.Scan.Zdos.Count; z++) job.Scan.Uids.Add(job.Scan.Zdos[z] != null ? job.Scan.Zdos[z].m_uid : ZDOID.None);
+            var job = new ZdoFileJob { State = state, Coord = state.Coord, StartFrame = Time.frameCount, VerifyAgainst = verifyAgainst };
+            FillZdoFileScan(job, now);
             return job;
+        }
+
+        // 1.2.518: an UNLOADED zone's job (authoritative side): the same scan from the zone's ZDOs, no zone state
+        private static ZdoFileJob StartZdoFileJob(Vector2s coord, float now)
+        {
+            var job = new ZdoFileJob { State = null, Coord = coord, StartFrame = Time.frameCount };
+            FillZdoFileScan(job, now);
+            EasyBakeLog.Debug($"[Cache] zone ({coord.x},{coord.y}): full file from ZDOs started for an unloaded zone (1.2.518)");
+            return job;
+        }
+
+        private static void FillZdoFileScan(ZdoFileJob job, float now)
+        {
+            job.Scan = new ZdoScan { Coord = job.Coord, Via = ZdoVia.RangePass, FileOnly = true, SectorCount = SectorCount(job.Coord), Now0 = now, StartFrame = Time.frameCount };
+            ZDOMan.instance.FindSectorObjects(job.Coord, new SimulationDistance(0, 0), job.Scan.Zdos);
+            for (int z = 0; z < job.Scan.Zdos.Count; z++) job.Scan.Uids.Add(job.Scan.Zdos[z] != null ? job.Scan.Zdos[z].m_uid : ZDOID.None);
         }
 
         private static void CompareZdoFile(ZdoFileJob job, int nearBatches)
@@ -1352,7 +1427,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static string ZdoBakeSummary()
         {
             double ms = s_zdoBakeTicks * 1000.0 / Stopwatch.Frequency;
-            return $"[Cache] ZdoFirstBake so far: {s_zonesFromZdo} zone(s) built from ZDOs ({s_zdoBakedPieces} piece(s) instanced; via {ZdoViaNames[0]} {s_zdoVia[0]}, {ZdoViaNames[1]} {s_zdoVia[1]}, {ZdoViaNames[2]} {s_zdoVia[2]}, {ZdoViaNames[3]} {s_zdoVia[3]}; {s_zdoAfterWait} after a wait), {s_zdoBakeFallbacks} hard fallback(s), {s_zdoWaits} zone(s) waited, {s_zdoGaveUp} range-pass give-up(s); sliced scans {s_zdoSliced} ({s_zdoAttachedEarly} attached early by a creation, {s_zdoScansDropped} dropped, worst slice {s_zdoWorstSliceTicks * 1000.0 / Stopwatch.Frequency:F1} ms, {s_zdoCreatedBeforeSlice} piece(s) created before their slice, {s_zdoGoneDuringScan} ZDO(s) destroyed during a scan); full files from ZDOs: {s_zdoFilesSaved} written, {s_zdoFileWanted.Count} wanted, {s_zdoFileRefusedExisting} not written over an existing file, {s_zdoFileRestarts} restart(s), {s_zdoFileSelfCheckFails} SELF-CHECK FAIL(S), {s_zdoFileOtherFails} other failure(s); this-visit swaps {s_zdoSwapsDone} done ({s_zdoSwapPiecesSilenced} live piece(s) silenced), {s_zdoSwapsCancelled} cancelled; left live {DescribeLeftLive(s_zdoLeftLiveTotal)}; {ms:F0} ms building in all";
+            return $"[Cache] ZdoFirstBake so far: {s_zonesFromZdo} zone(s) built from ZDOs ({s_zdoBakedPieces} piece(s) instanced; via {ZdoViaNames[0]} {s_zdoVia[0]}, {ZdoViaNames[1]} {s_zdoVia[1]}, {ZdoViaNames[2]} {s_zdoVia[2]}, {ZdoViaNames[3]} {s_zdoVia[3]}; {s_zdoAfterWait} after a wait), {s_zdoBakeFallbacks} hard fallback(s), {s_zdoWaits} zone(s) waited, {s_zdoGaveUp} range-pass give-up(s); sliced scans {s_zdoSliced} ({s_zdoAttachedEarly} attached early by a creation, {s_zdoScansDropped} dropped, worst slice {s_zdoWorstSliceTicks * 1000.0 / Stopwatch.Frequency:F1} ms, {s_zdoCreatedBeforeSlice} piece(s) created before their slice, {s_zdoGoneDuringScan} ZDO(s) destroyed during a scan); full files from ZDOs: {s_zdoFilesSaved} written ({s_zdoFilesUnloadedSaved} of them for unloaded zones, 1.2.518), {s_zdoFileWanted.Count} wanted + {s_zdoFileUnloaded.Count} unloaded waiting, {s_zdoFileRefusedExisting} not written over an existing file, {s_zdoFileRestarts} restart(s), {s_zdoFileSelfCheckFails} SELF-CHECK FAIL(S), {s_zdoFileOtherFails} other failure(s); this-visit swaps {s_zdoSwapsDone} done ({s_zdoSwapPiecesSilenced} live piece(s) silenced), {s_zdoSwapsCancelled} cancelled; left live {DescribeLeftLive(s_zdoLeftLiveTotal)}; {ms:F0} ms building in all";
         }
 
         // 1.2.386 ([lead]; town run 3 logged at Info and its per-zone ZDO lines are Debug, so the log could not say how many zones the ZDO path built): one Info line
@@ -1379,6 +1454,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             ZdoCombine.Reset(); s_zdoVerifyQueue.Clear(); s_zdoVerifyZones = 0; s_zdoVerifyExtra = 0; s_zdoVerifyMissingAllowed = 0; s_zdoVerifyMissingHard = 0; s_zdoVerifyTransformMismatch = 0; s_zdoVerifySkipped = 0; s_zdoVerifyParityNear = 0; s_zdoVerifyParityFar = 0; s_zdoVerifySeen.Clear(); s_zdoVerifyUnseen = 0; s_zdoVerifyMissingChanged = 0;   // 1.2.374
             s_zdoFileQuiet.Clear(); s_zdoFileSavedCount.Clear();
             s_zdoFilesWritten.Clear(); s_zdoFileWanted.Clear(); s_zdoFileRefused.Clear(); s_zdoFileJob = null; s_zdoFilesSaved = 0; s_zdoFileRefusedExisting = 0; s_zdoFileRestarts = 0; s_zdoFileSelfCheckFails = 0; s_zdoFileOtherFails = 0;   // 1.2.374
+            s_zdoFileUnloaded.Clear(); s_zdoFileWhyNot.Clear(); s_zdoFilesUnloadedSaved = 0;   // 1.2.518
             s_zdoSliced = 0; s_zdoAttachedEarly = 0; s_zdoScansDropped = 0; s_zdoWorstSliceTicks = 0; s_zdoGoneDuringScan = 0; s_zdoCreatedBeforeSlice = 0; s_zdoWalkDue = false;
         }
     }

@@ -106,6 +106,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             return c;
         }
 
+        // 1.2.476 ([visual], lead 11-20 overnight; capture O_20261120_012725 fire_bf1: "FarRunner.Update 3.439 ms/frame" SELF, 3.1-4.4 ms in every stall frame of the
+        // 60 s window): the digest scans until frameStart + budget/2 (FarBuildings.Update), and while the far set is cold the budget is the 6 ms arrival budget, so a
+        // host with a 3000 m ring (thousands of zones, one lap never fits) re-read unchanged zones for ~3 ms EVERY frame for as long as the set stayed cold (B: the
+        // "far set cold" Info at :3110 never flipped back). LapDone: every zone of the current ring was visited once since the ring last changed (moved / new contents).
+        private static int s_changedOnlySaid = -1;   // 1.2.477
+        private static int s_lapScans; private static bool s_lapSaid; private static float s_lapStartedAt = -1f;
+        internal static bool LapDone => s_ring.Count > 0 && s_lapScans >= s_ring.Count;
+        internal static void NoteLapState(bool baseBudgetNow)
+        {
+            if (s_lapStartedAt < 0f) s_lapStartedAt = Time.unscaledTime;
+            if (!LapDone) { if (s_lapSaid) { s_lapSaid = false; s_lapStartedAt = Time.unscaledTime; } return; }
+            if (s_lapSaid) return;
+            s_lapSaid = true;
+            EasyBakeLog.Info($"{FarBuildings.Log} digest first lap done (1.2.476): {s_ring.Count} zone(s) of the ring read once in {Time.unscaledTime - s_lapStartedAt:0.0} s; "
+                + (baseBudgetNow ? $"the digest now runs on the main-thread budget ({FarBuildings.BudgetMs:0.##} ms a frame, half of it scanning) instead of the arrival / cold budget (FarDigestBaseBudgetAfterLap)" : "FarDigestBaseBudgetAfterLap is off: the digest keeps the frame's far budget"));
+        }
+
         internal static void Step(long deadline)
         {
             var zdoMan = ZDOMan.instance;
@@ -113,6 +130,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (!s_cacheLoaded) LoadIndexFromCache();
 
             bool authoritative = ZNet.instance.IsServer();
+            int co = ChangedOnly ? 1 : 0;   // 1.2.477: one Info per state of [25 - Performance - Far View] FarBuildingsChangedZonesOnly (the capture A/B's proof line)
+            if (co != s_changedOnlySaid) { s_changedOnlySaid = co; EasyBakeLog.Info($"{FarBuildings.Log} digest changed-zones-only {(co == 1 ? "ON" : "OFF")} (1.2.477): {(co == 1 ? "a zone is read again only when its object count changed, plus a safety re-read every 60 s" : "every zone of the ring is read again round-robin")}; ring {s_ring.Count} zone(s)"); }
             RebuildRingIfNeeded(authoritative);
             if (s_ring.Count == 0) return;
 
@@ -121,7 +140,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             {
                 if (s_ringIdx >= s_ring.Count) s_ringIdx = 0;
                 var zone = s_ring[s_ringIdx++];
-                scanned++;
+                scanned++; s_lapScans++;   // 1.2.476: zones visited since the lap (re)started
                 // A client's ZDOs are complete only in zones it has loaded; elsewhere an empty scan would wrongly erase a base.
                 // 0.2.1210 ([visual], Fire 11-08 shots 613-615: the BlueHills keep 190 m east of the TOWN50 spot never drew, while the
                 // client held ~120k ZDOs with no instance): a zone the client holds ZDOs for but has not loaded is read too, ADDITIVELY
@@ -170,7 +189,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (authoritative && FarBuildings.ServerSends)
                 foreach (var peer in ZNet.instance.GetPeers())
                     if (peer != null) AddRing(peer.m_refPos, FarBuildings.Reach, seen);
-            if (moved || !SameRing()) s_ringIdx = 0;
+            if (moved || !SameRing()) { s_ringIdx = 0; s_lapScans = 0; }   // 1.2.476: a new ring = a new first lap
             s_ringPrev.Clear();
         }
 
@@ -219,7 +238,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static bool ChangedOnly => FiresEasyBakeMeshesPlugin.FarBuildingsChangedZonesOnly != null && FiresEasyBakeMeshesPlugin.FarBuildingsChangedZonesOnly.Value;
 
         // vanilla's private sector lists, read through a typed field ref (never a publicized reference)
-        private static readonly HarmonyLib.AccessTools.FieldRef<ZDOMan, List<ZDO>[]> s_objectsBySector = MakeSectorsRef();
+        internal static readonly HarmonyLib.AccessTools.FieldRef<ZDOMan, List<ZDO>[]> s_objectsBySector = MakeSectorsRef();   // 1.2.492: internal, ScanGate reads the grid size through it (one field ref)
         private static HarmonyLib.AccessTools.FieldRef<ZDOMan, List<ZDO>[]> MakeSectorsRef()
         {
             try { return HarmonyLib.AccessTools.FieldRefAccess<ZDOMan, List<ZDO>[]>("m_objectsBySector"); }
@@ -311,6 +330,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 if (old != null && pieces.Count > 0 && CapsDiffer(old.Pieces, pieces))
                 {
                     old.Pieces = pieces.ToArray(); s_capOnlyChanges++;
+                    if (FarSnow.Layer) return;   // 1.2.468: a snow-layer copy holds no caps: the levels are kept (for FarSnowLayer off) but nothing rebuilds
                     Changed?.Invoke(zone);
                 }
                 // 1.2.432: same pieces, but the cached copy did not know who placed them (a v1 entry): take the scan's and write the cache as v2 (no rebuild: the print is unchanged)
@@ -544,7 +564,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
         internal static void ResetForWorld()
         {
-            Zones.Clear(); s_ring.Clear(); s_ringIdx = 0; s_cacheLoaded = false; s_indexDirty = false; s_stamps.Clear();
+            Zones.Clear(); s_ring.Clear(); s_ringIdx = 0; s_lapScans = 0; s_lapSaid = false; s_cacheLoaded = false; s_indexDirty = false; s_stamps.Clear();
             s_indexGen++; s_indexReadsPending = 0; s_indexListed.Clear();
             s_ringCenter = new Vector3(float.MaxValue, 0, 0);
         }

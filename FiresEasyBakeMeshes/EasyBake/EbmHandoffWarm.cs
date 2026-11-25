@@ -30,7 +30,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Debugging", "HandoffCensus", false,
+            Enabled = EbmConfigMove.Bind(config, "90 - Debugging", "HandoffCensus", false,
                 "Testing aid: counts frames where a piece EBM took over was hidden before its replacement reached the graphics card (gap) or shown again while its replacement was still drawn (double). Debug line every 30 s; both should read 0.");
             if (!s_hooked) { s_hooked = true; Camera.onPreCull += OnPreCull; }
         }
@@ -82,7 +82,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Optimize", "WarmEbmShaders", true /* 1.2.264 Fire 11-10: on to test */,
+            Enabled = EbmConfigMove.Bind(config, "40 - Shaders", "WarmEbmShaders", true /* 1.2.264 Fire 11-10: on to test */,
                 "When you enter the world, EBM's own graphics shaders are prepared once, before the first building that needs them appears, so that first appearance does not stutter. Nothing is drawn. Slightly longer first second in the world.");
         }
 

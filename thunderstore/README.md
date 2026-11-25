@@ -1,4 +1,11 @@
+Requires Valheim 1.0.30 or newer.
+
 # Fires Easy Bake Meshes
+
+## What's new in 1.2.434
+
+- GPU drawing on by default, far trees, real biome colours on distant ground, no more 5 s / 6-7 s hitches.
+- Updating never changes your saved settings: delete the config to get the new defaults.
 
 **Big builds, normal frame rates.** Easy Bake takes the parts of a base that never change and draws them in a much
 cheaper way, so huge bases and towns stop dragging your frame rate down. Install it and your bases get faster -

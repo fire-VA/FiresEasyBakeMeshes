@@ -14,14 +14,12 @@ namespace FiresEasyBakeMeshes.EasyBake
     //  - Caustic day mask: _FiresCausticDayMask = sun elevation ramp x sun luminance (FTS's exact drive); the water surface caustics multiply it.
     //  - Terrain season globals: _FiresSeasonGold 0, _FiresSeasonFresh 0 (as FTS since 0.3.317), _FiresMudGate 1 (mud allowed; FTS's winter gate needs Core's snow field and
     //    stays 1 without it), _FiresMudTexOn 0 (no mud texture set in EBM's bundle: plain mud colours).
-    //  - Footprint stamp ([Water] Footprint Trails, ON): _FiresPieceStamp / _FiresPieceStampRect where the local player walks; stands down while Vedr's piece snow is active.
     internal static class EbmFtsGlobals
     {
-        internal static ConfigEntry<bool> ShoreOn, StampOn;
+        internal static ConfigEntry<bool> ShoreOn;   // 1.2.461: StampOn (Footprint Trails) removed, archived in _archive_footprint_trails
         internal static void Bind(ConfigFile c)
         {
-            ShoreOn = c.Bind("Water", "Shore Field", true, "The water knows where the shore is: waves ease off in shallow water (as the game's own swim surface does), shallow water takes its shallow colour, and the sea fog stays over the sea. Without it the waves stay full right up to the beach. EBM's own copy of what FiresTossinShade did; while FiresTossinShade is installed it keeps doing it.");
-            StampOn = c.Bind("Water", "Footprint Trails", true, "Your footsteps leave a trail EBM's ground and pieces can show (snow knocked off, worn paths). Stands aside while Vedr's own piece snow trails are active.");
+            ShoreOn = EbmConfigMove.Bind(c, "43 - Water - Foam & Shore", "Shore Field", true, "Needs [40 - Shaders] WaterShader = true. The water knows where the shore is: waves ease off in shallow water (as the game's own swim surface does), shallow water takes its shallow colour, and the sea fog stays over the sea. Without it the waves stay full right up to the beach. EBM's own copy of what FiresTossinShade did; while FiresTossinShade is installed it keeps doing it.");
         }
 
         private static bool? s_fts;
@@ -30,12 +28,11 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Tick()
         {
-            if (FtsLoaded) { if (!s_said) { s_said = true; EasyBakeLog.Info("[FtsGlobals] FiresTossinShade is installed: it keeps writing the shore field, caustic day mask, terrain season globals and footprint stamp; EBM writes none of them"); } return; }
-            if (!s_said) { s_said = true; EasyBakeLog.Info("[FtsGlobals] FiresTossinShade is not installed: EBM writes the shore field, caustic day mask, terrain season globals and footprint stamp its shaders read"); }
+            if (FtsLoaded) { if (!s_said) { s_said = true; EasyBakeLog.Info("[FtsGlobals] FiresTossinShade is installed: it keeps writing the shore field, caustic day mask, terrain season globals; EBM writes none of them"); } return; }
+            if (!s_said) { s_said = true; EasyBakeLog.Info("[FtsGlobals] FiresTossinShade is not installed: EBM writes the shore field, caustic day mask, its shaders read (1.2.461: no footprint stamp, Vedr owns trails)"); }
             try { DayMask(); } catch (Exception e) { EasyBakeLog.Debug("[FtsGlobals] day mask: " + e.Message); }
-            try { Season(); } catch (Exception e) { EasyBakeLog.Debug("[FtsGlobals] season: " + e.Message); }
+            // 1.2.460: Season() removed (pushed _FiresSeasonGold/Fresh/MudGate/MudTexOn for the old FTS-copy terrain shader; EBM provides no terrain look of its own, Vedr owns these)
             try { Shore.Tick(); } catch (Exception e) { EasyBakeLog.Debug("[FtsGlobals] shore field: " + e.Message); }
-            try { Stamp.Tick(); } catch (Exception e) { EasyBakeLog.Debug("[FtsGlobals] stamp: " + e.Message); }
         }
 
         // ---- caustic day mask (FTS FiresCausticsPass.ComputeLightDrive, MoonScale 1)
@@ -54,17 +51,6 @@ namespace FiresEasyBakeMeshes.EasyBake
             Shader.SetGlobalFloat(P_Day, drive);
         }
 
-        // ---- terrain season globals (FTS PushSeason without Core's winter gate)
-        private static bool s_seasonPushed;
-        private static void Season()
-        {
-            if (s_seasonPushed) return;
-            s_seasonPushed = true;
-            Shader.SetGlobalFloat("_FiresSeasonGold", 0f);
-            Shader.SetGlobalFloat("_FiresSeasonFresh", 0f);
-            Shader.SetGlobalFloat("_FiresMudGate", 1f);
-            Shader.SetGlobalFloat("_FiresMudTexOn", 0f);
-        }
 
         // ================================================================== shore field (FTS FiresShoreField, our port)
         internal static class Shore
@@ -77,19 +63,25 @@ namespace FiresEasyBakeMeshes.EasyBake
             private static readonly System.Diagnostics.Stopwatch s_sw = new System.Diagnostics.Stopwatch();
             private static int s_bakes;
             // CPU twin, swapped in with the texture
-            private static float[] s_liveWave; private static Vector2 s_twinC; private static bool s_liveOn;
+            private static float[] s_liveWave; private static Vector2 s_twinC; private static bool s_liveOn, s_shoreSaid;
+            // 1.2.462: Vedr's tide/river shaping field (R = tide influence, G = river raise in metres: half floats, FTS FiresShoreField.cs:258 RGBAHalf linear)
+            private static readonly int P_FieldTex = Shader.PropertyToID("_FiresTideRiverField");
+            private static Texture2D s_fieldTex; private static Color[] s_fieldPx; private static bool s_bakeFieldOk, s_liveFieldOk; private static int s_bakeRev = int.MinValue, s_liveRev = int.MinValue;
 
             internal static void Tick()
             {
                 var player = Player.m_localPlayer;
-                if (ShoreOn == null || !ShoreOn.Value || WorldGenerator.instance == null || player == null)
+                if (ShoreOn == null || !ShoreOn.Value || !EbmWater.Active || WorldGenerator.instance == null || player == null)   // 1.2.444: needs [Optimize] WaterShader = true (Fire rule 11-18)
                 {
                     if (s_liveOn) { Shader.SetGlobalFloat(P_On, 0f); s_liveOn = false; }
+                    if (ShoreOn != null && ShoreOn.Value && !EbmWater.Active && !s_shoreSaid) { s_shoreSaid = true; EasyBakeLog.Info("[Water] Shore Field stands down: it needs [40 - Shaders] WaterShader = true (only EBM's water shader reads it)"); }
                     return;
                 }
                 Vector3 pp = player.transform.position; var p = new Vector2(pp.x, pp.z);
                 float tideNow = Shader.GetGlobalFloat(P_Tide);
                 bool tideMoved = s_hasLive && Mathf.Abs(tideNow - s_liveTide) > TideRebake && Time.time - s_lastTideBake > TideMinSec;
+                // 1.2.462: Vedr's tide shaping / river keys move VedrApi.SurfaceRevision (VedrApiSea.cs:74-92): re-bake the field when it differs from the live bake's
+                if (s_hasLive && VedrSurfaceRevision() != s_liveRev) tideMoved = true;
                 float reTrig = Extent * 0.35f;
                 if (!s_baking && (!s_hasLive || tideMoved || (p - s_liveC).sqrMagnitude > reTrig * reTrig))
                 {
@@ -104,7 +96,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                     Shader.SetGlobalVector(P_Center, new Vector4(s_liveC.x, 0f, s_liveC.y, 0f));
                     Shader.SetGlobalFloat(P_Ext, Extent);
                     Shader.SetGlobalFloat(P_On, 1f);
-                    Shader.SetGlobalFloat(P_FieldOn, 0f);   // no per-texel tide/river shaping field without its source (the drawn tide is uniform, as the swim surface without one)
+                    // 1.2.462 ([seasons], lead-approved; Fire 11-18: swim / boats / fish / lily pads didn't follow Vedr's tide on inland water): the per-texel tide/river
+                    // shaping field, READ from Vedr (VedrApi.TryTideFieldAt, API 36: the same sampler its own WaterVolumeTidePatch / floaters / fish use), baked with
+                    // the shore field, as FTS did (FiresShoreField.cs:166-168, :297-303). Without Vedr (or Vedr's sea off): 0, the uniform tide exactly as before.
+                    if (s_liveFieldOk) Shader.SetGlobalTexture(P_FieldTex, s_fieldTex);
+                    Shader.SetGlobalFloat(P_FieldOn, s_liveFieldOk ? 1f : 0f);
                     s_liveOn = true;
                 }
             }
@@ -116,7 +112,13 @@ namespace FiresEasyBakeMeshes.EasyBake
                     s_tex = new Texture2D(N, N, TextureFormat.RGBA32, false, true) { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear, name = "EbmShoreField" };
                     s_px = new Color[N * N]; s_depth = new float[N * N]; s_dist = new float[N * N]; s_water = new bool[N * N];
                 }
+                if (s_fieldTex == null)
+                {
+                    s_fieldTex = new Texture2D(N, N, TextureFormat.RGBAHalf, false, true) { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear, name = "EbmTideRiverField" };
+                    s_fieldPx = new Color[N * N];
+                }
                 s_baking = true; s_bakeC = c; s_row = 0; s_x = 0; s_bakeTide = tide;
+                s_bakeFieldOk = false; s_bakeRev = VedrSurfaceRevision();
             }
 
             private static void Step()
@@ -134,6 +136,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                     float sea = ZoneSystem.c_WaterLevel + (VedrOffset(wx, wz, out float off) ? off : s_bakeTide);
                     float d = Mathf.Max(0f, sea - gh);
                     int i = z * N + x; s_depth[i] = d; s_water[i] = d > 0.05f;
+                    // 1.2.462: Vedr's per-texel tide influence + river raise (FTS FiresShoreField.cs:303: (1,0) where there's no answer)
+                    if (VedrTideField(wx, wz, out float infl, out float raise)) { s_fieldPx[i] = new Color(infl, raise, 0f, 1f); s_bakeFieldOk = true; }
+                    else s_fieldPx[i] = new Color(1f, 0f, 0f, 1f);
                 }
                 if (s_row < N) return;
                 Complete(texelM);
@@ -166,6 +171,9 @@ namespace FiresEasyBakeMeshes.EasyBake
                     wave[i] = Mathf.Round(w * 255f) / 255f;   // as RGBA32 stores it (the GPU reads the 8-bit value)
                 }
                 s_tex.SetPixels(s_px); s_tex.Apply(false, false);
+                if (s_bakeFieldOk) { s_fieldTex.SetPixels(s_fieldPx); s_fieldTex.Apply(false, false); }   // 1.2.462
+                if (s_bakeFieldOk != s_liveFieldOk) EasyBakeLog.Info($"[FtsGlobals] tide/river field {(s_bakeFieldOk ? "on: inland water is drawn at Vedr's shaped tide (VedrApi.TryTideFieldAt), as swimming, boats and fish use it" : "off: Vedr's tide field isn't answering (no Vedr, or its sea is off); the drawn tide is uniform")}");
+                s_liveFieldOk = s_bakeFieldOk; s_liveRev = s_bakeRev;
                 s_liveWave = wave; s_twinC = s_bakeC;
                 s_liveC = s_bakeC; s_liveTide = s_bakeTide; s_hasLive = true; s_baking = false; s_bakes++;
                 if (s_bakes == 1) EasyBakeLog.Info($"[FtsGlobals] shore field baked ({N}x{N} over {2 * Extent:0} m around ({s_liveC.x:0},{s_liveC.y:0}), depth from {(s_vedrGet != null ? "Vedr's shaped sea" : "the flat sea level + tide")}); EBM's water and Vedr's wave physics read it");
@@ -187,6 +195,32 @@ namespace FiresEasyBakeMeshes.EasyBake
                 return true;
             }
 
+            // 1.2.462: Vedr's tide/river field sampler, by name (VedrApi.TryTideFieldAt(float, float, out float influence, out float raise), Vedr 0.8.283 API 36), and its
+            // SurfaceRevision (moves on the tide shaping / river keys). Main thread (the bake's Step runs in Tick). Absent / older Vedr = false, revision 0.
+            private static bool s_tideLooked; private static MethodInfo s_tideGet; private static PropertyInfo s_revProp; private static readonly object[] s_tideArgs = new object[4];
+            private static void LookTide()
+            {
+                if (s_tideLooked) return;
+                s_tideLooked = true;
+                var t = Type.GetType("Vedr.VedrApi, Norger.Vedr");
+                s_tideGet = t?.GetMethod("TryTideFieldAt", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(float), typeof(float), typeof(float).MakeByRefType(), typeof(float).MakeByRefType() }, null);
+                s_revProp = t?.GetProperty("SurfaceRevision", BindingFlags.Public | BindingFlags.Static);
+            }
+            private static bool VedrTideField(float x, float z, out float influence, out float raise)
+            {
+                influence = 1f; raise = 0f;
+                LookTide();
+                if (s_tideGet == null) return false;
+                try { s_tideArgs[0] = x; s_tideArgs[1] = z; s_tideArgs[2] = 1f; s_tideArgs[3] = 0f; bool ok = (bool)s_tideGet.Invoke(null, s_tideArgs); influence = (float)s_tideArgs[2]; raise = (float)s_tideArgs[3]; return ok; }
+                catch { s_tideGet = null; return false; }
+            }
+            private static int VedrSurfaceRevision()
+            {
+                LookTide();
+                if (s_revProp == null) return 0;
+                try { return Convert.ToInt32(s_revProp.GetValue(null)); } catch { s_revProp = null; return 0; }
+            }
+
             // Vedr's shaped sea, by name (VedrApi.TrySurfaceOffsetAt(float, float, out float)), when it exists; null = flat level + tide
             private static bool s_vedrLooked; private static MethodInfo s_vedrGet; private static readonly object[] s_args = new object[3];
             private static bool VedrOffset(float x, float z, out float off)
@@ -204,95 +238,5 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
         }
 
-        // ================================================================== footprint stamp (FTS FiresPieceStamp, our port)
-        internal static class Stamp
-        {
-            private const int Res = 256; private const float Size = 64f, Cell = Size / Res, Radius = 0.9f, StepM = 0.4f, UploadS = 0.5f, RefillS = 600f, FadeS = 10f, RecentreM = 16f;
-            private static readonly int P_Tex = Shader.PropertyToID("_FiresPieceStamp"), P_Rect = Shader.PropertyToID("_FiresPieceStampRect");
-            private static Texture2D s_tex; private static Color[] s_px, s_spare; private static Vector2 s_origin; private static Vector3 s_last;
-            private static bool s_dirty, s_any, s_down; private static float s_nextUpload, s_nextFade; private static int s_mask;
-
-            internal static void Tick()
-            {
-                var player = Player.m_localPlayer;
-                if (player == null || StampOn == null || !StampOn.Value) return;
-                if (VedrPieceSnow())
-                {
-                    if (!s_down) { s_down = true; Shader.SetGlobalVector(P_Rect, Vector4.zero); }
-                    return;
-                }
-                if (s_down) { s_down = false; if (s_tex != null) Shader.SetGlobalVector(P_Rect, new Vector4(s_origin.x, s_origin.y, Size, 1f)); }
-                if (s_tex == null)
-                {
-                    s_tex = new Texture2D(Res, Res, TextureFormat.RGFloat, false, true) { wrapMode = TextureWrapMode.Clamp, filterMode = FilterMode.Bilinear, name = "EbmFootprintStamp" };
-                    s_px = new Color[Res * Res]; s_mask = LayerMask.GetMask("piece", "piece_nonsolid");
-                    Recentre(player.transform.position);
-                    Shader.SetGlobalTexture(P_Tex, s_tex);
-                }
-                Vector3 at = player.transform.position;
-                float cx = s_origin.x + Size * 0.5f, cz = s_origin.y + Size * 0.5f;
-                if (Mathf.Abs(at.x - cx) > RecentreM || Mathf.Abs(at.z - cz) > RecentreM) Recentre(at);
-                if ((at - s_last).sqrMagnitude >= StepM * StepM)
-                {
-                    s_last = at;
-                    if (player.IsOnGround() || Physics.CheckSphere(at, 0.3f, s_mask, QueryTriggerInteraction.Ignore)) Put(at);
-                }
-                if (s_any && Time.time >= s_nextFade) Fade();
-                if (s_dirty && Time.time >= s_nextUpload) { s_nextUpload = Time.time + UploadS; s_dirty = false; s_tex.SetPixels(s_px); s_tex.Apply(false); }
-            }
-
-            private static void Recentre(Vector3 at)
-            {
-                var o = new Vector2(Mathf.Round((at.x - Size * 0.5f) / Cell) * Cell, Mathf.Round((at.z - Size * 0.5f) / Cell) * Cell);
-                int dx = Mathf.RoundToInt((o.x - s_origin.x) / Cell), dz = Mathf.RoundToInt((o.y - s_origin.y) / Cell);
-                if (!s_any) { s_origin = o; Shader.SetGlobalVector(P_Rect, new Vector4(o.x, o.y, Size, 1f)); return; }
-                if (s_spare == null) s_spare = new Color[s_px.Length];
-                var next = s_spare; Array.Clear(next, 0, next.Length);
-                for (int z = 0; z < Res; z++) for (int x = 0; x < Res; x++) { int sx = x + dx, sz = z + dz; if (sx >= 0 && sz >= 0 && sx < Res && sz < Res) next[z * Res + x] = s_px[sz * Res + sx]; }
-                s_spare = s_px; s_px = next; s_origin = o; s_dirty = false;
-                s_tex.SetPixels(s_px); s_tex.Apply(false); s_nextUpload = Time.time + UploadS;
-                Shader.SetGlobalVector(P_Rect, new Vector4(o.x, o.y, Size, 1f));
-            }
-
-            private static void Put(Vector3 at)
-            {
-                int r = Mathf.CeilToInt(Radius / Cell), px = Mathf.FloorToInt((at.x - s_origin.x) / Cell), pz = Mathf.FloorToInt((at.z - s_origin.y) / Cell);
-                for (int z = Mathf.Max(0, pz - r); z <= Mathf.Min(Res - 1, pz + r); z++)
-                    for (int x = Mathf.Max(0, px - r); x <= Mathf.Min(Res - 1, px + r); x++)
-                    {
-                        float dx = (x + 0.5f) * Cell + s_origin.x - at.x, dz = (z + 0.5f) * Cell + s_origin.y - at.z, d = Mathf.Sqrt(dx * dx + dz * dz);
-                        if (d > Radius) continue;
-                        float t = Mathf.Clamp01((Radius - d) / (Radius * 0.75f)), s = t * t * (3f - 2f * t);
-                        int i = z * Res + x; float g = Mathf.Max(s_px[i].g, s);
-                        s_px[i] = new Color((at.y + 1f) * g, g, 0f, 1f);
-                    }
-                s_any = true; s_dirty = true;
-            }
-
-            private static void Fade()
-            {
-                s_nextFade = Time.time + FadeS;
-                float step = FadeS / RefillS; bool any = false;
-                for (int i = 0; i < s_px.Length; i++)
-                {
-                    Color c = s_px[i]; if (c.g <= 0f) continue;
-                    float h = c.r / c.g; c.g -= step;
-                    if (c.g <= 0f) c = default; else { c.r = h * c.g; any = true; }
-                    s_px[i] = c;
-                }
-                s_any = any; s_dirty = true;
-            }
-
-            // Vedr's piece snow draws its own trails (VedrApi.PieceShaderActive, by name); re-read every 2 s
-            private static float s_vedrAt = -1f; private static bool s_vedrOn; private static PropertyInfo s_vedrProp; private static bool s_vedrLooked;
-            private static bool VedrPieceSnow()
-            {
-                if (Time.unscaledTime < s_vedrAt) return s_vedrOn;
-                s_vedrAt = Time.unscaledTime + 2f;
-                if (!s_vedrLooked) { s_vedrLooked = true; s_vedrProp = Type.GetType("Vedr.VedrApi, Norger.Vedr")?.GetProperty("PieceShaderActive", BindingFlags.Public | BindingFlags.Static); }
-                try { s_vedrOn = s_vedrProp != null && (bool)s_vedrProp.GetValue(null, null); } catch { s_vedrOn = false; }
-                return s_vedrOn;
-            }
-        }
     }
 }

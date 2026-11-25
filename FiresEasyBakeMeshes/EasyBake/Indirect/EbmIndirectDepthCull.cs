@@ -24,11 +24,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         internal static ConfigEntry<float> DepthCullNearM;
         internal static void BindDepthCull(ConfigFile config)
         {
-            DepthCullOn = config.Bind("Optimize", "IndirectDepthCull", /* 1.2.299 OFF ([lead] 11-11: the first real Verify leg, town 615 D3D11 on 1.2.298, read FALSE CULLS ~0.75 % of re-tests; off until a Verify leg reads 0) */ false,
+            DepthCullOn = EbmConfigMove.Bind(config, "24 - Performance - GPU Drawing", "IndirectDepthCull", /* 1.2.299 OFF ([lead] 11-11: the first real Verify leg, town 615 D3D11 on 1.2.298, read FALSE CULLS ~0.75 % of re-tests; off until a Verify leg reads 0) */ false,
                 "Pieces EBM draws on the graphics card are not drawn while they stand fully behind something the camera already sees (a wall, a hill, another building). Never near you or around you. Off = as before.");
-            DepthCullNearM = config.Bind("Optimize", "IndirectDepthCullNearM", 8f,
+            DepthCullNearM = EbmConfigMove.Bind(config, "24 - Performance - GPU Drawing", "IndirectDepthCullNearM", 8f,
                 new ConfigDescription("Nothing within this many metres of the camera is hidden by IndirectDepthCull.", new AcceptableValueRange<float>(0f, 64f)));
-            DepthCullVerifyOn = config.Bind("Optimize", "IndirectDepthCullVerify", false,
+            DepthCullVerifyOn = EbmConfigMove.Bind(config, "90 - Debugging", "IndirectDepthCullVerify", false,
                 "Test mode for IndirectDepthCull: nothing is hidden; a sample of what would be is checked against the next frame and any that is visible then is counted in the Debug census (should be 0).");
         }
 

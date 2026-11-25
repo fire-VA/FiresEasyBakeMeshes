@@ -49,6 +49,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         private static void Begin(string why)
         {
             s_watching = true; s_why = why; s_start = Time.unscaledTime; s_nextSample = s_start; s_farAt = -1f; s_counts.Clear();
+            EbmChurn.Arrival(why);   // 1.2.480: [Settle] starts with the same arrival
         }
 
         private static void Report(bool settled)

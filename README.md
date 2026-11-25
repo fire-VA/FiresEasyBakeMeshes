@@ -1,3 +1,5 @@
+Requires Valheim 1.0.30 or newer.
+
 # Fires Easy Bake Meshes
 
 ## What's new in 1.2.434

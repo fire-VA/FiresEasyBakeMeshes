@@ -40,7 +40,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Batching", "ParticleIdlePause", true /* 1.2.264 Fire 11-10: on to test */,
+            Enabled = EbmConfigMove.Bind(config, "23 - Performance - World Objects", "ParticleIdlePause", true /* 1.2.264 Fire 11-10: on to test */,
                 "Looping particle effects on pieces and world objects that have no particles and are not emitting (nothing to draw) are paused, and resume the same frame they emit again (a fire lit or fuelled shows at once). No visible change. Off = the game updates them every frame.");
             Enabled.SettingChanged += (_, __) => { if (!On) ResumeAll("key off"); };
             Enabled.SettingChanged += (_, __) => { if (On) ConsiderLoaded(); };   // 1.2.381: turned on mid-run, the objects created while it was off are looked at too

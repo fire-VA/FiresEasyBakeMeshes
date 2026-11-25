@@ -29,6 +29,40 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static Action<string, int, string> Registered;
 
+        // ---- 1.2.491 [Hitch-EBM] ([visual], [lead] GO 11-22: 322 untimed hitches around EBM's create/destroy handoff in Fire's 03:52 log) ----
+        // What EBM handed to Unity in ONE frame: Object.Destroy is deferred to the end of that frame (plus physics after collider changes) and a new
+        // mesh uploads at render, so no stopwatch around the call sees that cost. Counted per frame (an int add per event, no allocation); when the
+        // frame took 50 ms or more, the NEXT frame's LateUpdate prints one Debug line with that frame's counts, to read next to FDT's [Hitch] line.
+        internal const int HfStandIn = 0, HfColliders = 1, HfParent = 2, HfParentMeshes = 3, HfParentVerts = 4, HfCacheBuild = 5, HfCacheVerts = 6, HfCds = 7, HfHidden = 8;
+        private const int HfSlots = 9;
+        private static readonly long[] s_hfCur = new long[HfSlots], s_hfPrev = new long[HfSlots];
+        private static int s_hfFrame = -1, s_hfPrevFrame = -1;
+        private static void HfRoll()
+        {
+            int f = UnityEngine.Time.frameCount;
+            if (f == s_hfFrame) return;
+            bool next = f == s_hfFrame + 1;
+            for (int i = 0; i < HfSlots; i++) { s_hfPrev[i] = next ? s_hfCur[i] : 0; s_hfCur[i] = 0; }
+            s_hfPrevFrame = next ? s_hfFrame : -1;
+            s_hfFrame = f;
+        }
+        // MAIN THREAD ONLY ([2ic] 11-22): HfRoll reads Time.frameCount, which throws off the main thread; every call site destroys objects or builds a Mesh (Unity API)
+        internal static void Hf(int slot, long n = 1) { HfRoll(); s_hfCur[slot] += n; }
+        // Plugin.LateUpdateInner, first thing every frame: report the previous frame if it was a hitch and EBM handed anything to Unity in it
+        internal static void HitchFrameTick()
+        {
+            HfRoll();
+            if (s_hfPrevFrame < 0 || s_hfPrevFrame != s_hfFrame - 1) return;
+            float dt = UnityEngine.Time.unscaledDeltaTime;
+            if (dt < 0.05f) return;
+            bool any = false; for (int i = 0; i < HfSlots; i++) if (s_hfPrev[i] != 0) { any = true; break; }
+            if (!any || !EasyBakeLog.DebugOn()) return;
+            var p = s_hfPrev;
+            EasyBakeLog.Debug($"[Hitch-EBM] frame {s_hfPrevFrame} ({dt * 1000f:0} ms): stand-in destroys {p[HfStandIn]} (colliders detached {p[HfColliders]}), "
+                + $"parent destroys {p[HfParent]} (batch meshes {p[HfParentMeshes]}, verts {p[HfParentVerts]}), cache mesh builds {p[HfCacheBuild]} (verts {p[HfCacheVerts]}), "
+                + $"cds destroys {p[HfCds]}, hidden releases {p[HfHidden]} (Object.Destroy runs at the end of that frame; new meshes upload at render)");
+        }
+
         internal static void Step(string step, int id = 0, string detail = null)
         {
             if (!s_looked)

@@ -131,7 +131,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 }
                 else if (used + est <= admit && now - t.EvictedAt >= FarCapPool.QuietSeconds) { used += est; t.Evicted = false; t.Dirty = true; FarCapPool.Readmits++; }
                 else if (used + est <= budget) { if (now - t.EvictedAt < FarCapPool.QuietSeconds) FarCapPool.ReadmitBlockedQuiet++; else FarCapPool.ReadmitBlockedBand++; }   // would fit today: held back by the band or the quiet time
-                if (!t.Evicted && t.Dirty && !t.JobOut && !t.WaitingSource && !t.Retained) s_prepQueue.Add(t);
+                if (!t.Evicted && (t.Dirty || t.Prep != null) && !t.JobOut && !t.WaitingSource && !t.Retained) { if (!t.Dirty) s_prepResumed++; s_prepQueue.Add(t); }   // 1.2.476: as FarBuildingDraw.Plan
             }
         }
 
@@ -162,8 +162,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 go.GetComponent<MeshFilter>().sharedMesh = mesh;
                 var r = go.GetComponent<MeshRenderer>();
                 r.sharedMaterial = mat;
-                if (c.Snow > 0) { s_mpb.Clear(); s_mpb.SetFloat(FarSnow.SnowCoverId, c.Snow / 4f); s_mpb.SetFloat(FarSnow.LegacySnowCoverId, c.Snow / 4f); s_mpb.SetFloat(SnowLevelId, c.Snow / 4f); r.SetPropertyBlock(s_mpb); }   /* 1.2.262: _SnowLevel = a cap chunk's height (vanilla MaterialMan sets it on the whole piece too) */
-                else r.SetPropertyBlock(null);
+                ChunkBlock(r, c);   // 1.2.262 cap block / 1.2.468 layer block / none
                 go.SetActive(true);   // a new GameObject starts active; the callers decide visibility from here as before
                 FarCapPool.GoReused++;
                 return go;

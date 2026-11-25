@@ -41,6 +41,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                 var cs = EbmIndirectAssets.Cull;
                 GeometryUtility.CalculateFrustumPlanes(cam, s_otherPlanesV);
                 for (int i = 0; i < 6; i++) s_otherPlanes4[i] = new Vector4(s_otherPlanesV[i].normal.x, s_otherPlanesV[i].normal.y, s_otherPlanesV[i].normal.z, s_otherPlanesV[i].distance);
+                int cutLayers = FillLayerCull(cam, s_layerCull, 0);   // 1.2.490: this camera's own layerCullDistances (all 0 = no cut: key off, none set, or planar)
+                cs.SetVectorArray(IdLayerCull, s_layerCull);          // always: the compute keeps the last camera's table otherwise
+                if (cutLayers > 0) s_layerCutRenders++;
                 // clear only view 6's counts
                 cs.SetInt(EbmIndirectAssets.IdDrawStart, OtherView * s_batchCap);
                 cs.SetInt(EbmIndirectAssets.IdDrawCount, s_batchCap);
@@ -93,6 +96,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
                     var b = s_batches[i];
                     if (b.Count <= 0 || !HasMesh(b)) continue;   // 1.2.213: cached alive check
                     if (cpu && ((mask & (1 << b.Layer)) == 0 || (i < w && !s_otherVis[i]))) continue;
+                    if (cutLayers > 0 && BatchPastLayer(b, s_layerCull, 0, p)) { s_layerCutBatches++; continue; }   // 1.2.490: the whole batch is past its layer's distance (the GPU would draw 0)
                     sent++;
                     if (b.OtherProps == null) { b.OtherProps = new MaterialPropertyBlock(); BindOther(b.OtherProps, OtherView * s_visibleStride + b.VisibleOffset); }
                     var rp = new RenderParams(b.Material)
@@ -113,5 +117,90 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
         private static bool s_bindingsDirtyOther = true;
         private static bool[] s_otherVis = new bool[0];
         internal static long s_otherSent;   // Debug: other-camera draws submitted since the last [Indirect] line
+
+        // ---- 1.2.490 ([visual], [seasons] 11-22: Vedr's mirror sets layerCullDistances = 200 m on piece / piece_nonsolid / item / Default_small / effect / smoke /
+        // vehicle (VedrMirror.cs:55, :206-209, spherical); Unity applies them only to its own renderers, so EBM's indirect pieces were drawn into the mirror out to
+        // its 1500 m far clip (EBM/Piece 0.766 ms, 77 draws, 1583 instances in frame26086). [Optimize] IndirectOtherCameraLayerCull (ON): an other camera's
+        // own distances cut EBM's instances per layer on the GPU (EbmIndirectCull.compute LayerDist / OtherLayerDist; the batch layer rides in flags bits 8..12),
+        // and a batch wholly past its layer's distance is not submitted. Only cameras with layerCullSpherical (Unity's planar test cuts more at the sides: never
+        // cut what Unity would keep). The main camera, shadows and lights are untouched. ----
+        private static readonly int IdLayerCull = Shader.PropertyToID("_EbmLayerCull");
+        private static readonly int IdOtherLayerCull = Shader.PropertyToID("_EbmOtherLayerCull");
+        private static readonly Vector4[] s_layerCull = new Vector4[8];        // view 6: layer l at [l >> 2][l & 3]
+        private static readonly Vector4[] s_preLayerCull = new Vector4[32];    // pre-culled camera j at [j * 8 .. j * 8 + 7] (EbmIndirectOnePass)
+        private const int LayerCacheSlots = 8;
+        private static readonly Camera[] s_lcCam = new Camera[LayerCacheSlots];
+        private static readonly float[] s_lcReadAt = new float[LayerCacheSlots];
+        private static readonly float[][] s_lcDist = new float[LayerCacheSlots][];
+        private static readonly int[] s_lcLayers = new int[LayerCacheSlots];
+        private static int s_lcNext;
+        internal static long s_layerCutRenders, s_layerCutBatches;   // Debug: other-camera renders with a cut, batches not submitted (whole batch past)
+
+        private static bool LayerCullOn => FiresEasyBakeMeshesPlugin.IndirectOtherCameraLayerCull != null && FiresEasyBakeMeshesPlugin.IndirectOtherCameraLayerCull.Value;
+
+        // cam's per-layer cut distances into dst[at .. at + 7] (0 = no cut). Returns how many layers are cut (0 = key off, none set, planar, null).
+        // Camera.layerCullDistances returns a NEW float[32] on every read: each camera is read at most once a second (8 cached cameras).
+        private static int FillLayerCull(Camera cam, Vector4[] dst, int at)
+        {
+            for (int k = 0; k < 8; k++) dst[at + k] = Vector4.zero;
+            if (!LayerCullOn || cam == null || !cam.layerCullSpherical) return 0;
+            int slot = -1;
+            for (int j = 0; j < LayerCacheSlots; j++) if (s_lcCam[j] == cam) { slot = j; break; }
+            if (slot < 0)
+            {
+                // [seasons] 11-22: Vedr destroys and re-creates its mirror camera (key off / water not drawn): a slot whose camera is gone is reused first
+                // (Unity's == null on a destroyed camera); otherwise round robin. A re-created camera is a new entry: its first read says the proof line again.
+                for (int j = 0; j < LayerCacheSlots; j++) if (s_lcCam[j] == null) { slot = j; break; }
+                if (slot < 0) { slot = s_lcNext; s_lcNext = (s_lcNext + 1) % LayerCacheSlots; }
+                s_lcCam[slot] = cam; s_lcReadAt[slot] = -1f; s_lcDist[slot] = null; s_lcLayers[slot] = 0;
+            }
+            float now = Time.unscaledTime;
+            if (now >= s_lcReadAt[slot])
+            {
+                s_lcReadAt[slot] = now + 1f;
+                var d = cam.layerCullDistances;
+                int n = 0;
+                for (int l = 0; l < 32 && l < d.Length; l++) if (d[l] > 0f) n++;
+                if (!SameDistances(d, s_lcDist[slot])) SayLayerCut(cam, d, n);   // the proof line, at the change
+                s_lcDist[slot] = d; s_lcLayers[slot] = n;
+            }
+            var dist = s_lcDist[slot];
+            if (dist == null || s_lcLayers[slot] == 0) return 0;
+            for (int l = 0; l < 32 && l < dist.Length; l++)
+            {
+                float v = dist[l];
+                if (v <= 0f) continue;
+                var w = dst[at + (l >> 2)]; w[l & 3] = v; dst[at + (l >> 2)] = w;
+            }
+            return s_lcLayers[slot];
+        }
+
+        private static bool SameDistances(float[] a, float[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return a == b;
+            for (int l = 0; l < a.Length; l++) if (a[l] != b[l]) return false;
+            return true;
+        }
+
+        // the batch's world box (every instance inside it) is wholly past its layer's distance from pos: the GPU would append none
+        private static bool BatchPastLayer(Batch b, Vector4[] table, int at, Vector3 pos)
+        {
+            int l = b.Layer & 31;
+            float d = table[at + (l >> 2)][l & 3];
+            return d > 0f && b.World.SqrDistance(pos) > d * d;
+        }
+
+        // Info, only when a camera's distances change (first read, or Vedr's "Mirror prop distance" edited): which layers, how far, how many EBM batches sit on them
+        private static void SayLayerCut(Camera cam, float[] d, int n)
+        {
+            var sb = new System.Text.StringBuilder("[Indirect] layer cut (1.2.490 IndirectOtherCameraLayerCull): camera '").Append(cam.name).Append("' ");
+            if (n == 0) { sb.Append("sets no per-layer cull distances: EBM draws it to its far clip, as before."); EasyBakeLog.Info(sb.ToString()); return; }
+            sb.Append(n).Append(" layer(s) cut (spherical):");
+            int onCut = 0, nb = s_batches.Count;
+            for (int i = 0; i < nb; i++) { int l = s_batches[i].Layer & 31; if (l < d.Length && d[l] > 0f) onCut++; }
+            for (int l = 0; l < 32 && l < d.Length; l++) if (d[l] > 0f) sb.Append(' ').Append(string.IsNullOrEmpty(LayerMask.LayerToName(l)) ? l.ToString() : LayerMask.LayerToName(l)).Append(' ').Append(d[l].ToString("0")).Append(" m;");
+            sb.Append(" EBM batches on those layers now: ").Append(onCut).Append(" of ").Append(nb).Append(" (their instances past the distance leave this camera only).");
+            EasyBakeLog.Info(sb.ToString());
+        }
     }
 }

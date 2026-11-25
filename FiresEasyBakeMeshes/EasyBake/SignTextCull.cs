@@ -32,11 +32,11 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static ConfigEntry<float> DrawM;
         internal static void Bind(ConfigFile config)
         {
-            On = config.Bind("Optimize", "SignTextCull", /* on to test (lead 11-11) */ true,
+            On = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "SignTextCull", /* on to test (lead 11-11) */ true,
                 "Writing on signs farther away than SignTextDrawM is not drawn (too small to read there); it appears again as you come closer. The sign board itself always shows. Off = every sign's writing is drawn at any distance, as before.");
-            DrawM = config.Bind("Optimize", "SignTextDrawM", 30f,
+            DrawM = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "SignTextDrawM", 30f,
                 new ConfigDescription("Sign writing closer than this many metres is always drawn exactly as the game draws it.", new AcceptableValueRange<float>(5f, 200f)));
-            Verify = config.Bind("Debugging", "SignTextCullVerify", false,
+            Verify = EbmConfigMove.Bind(config, "90 - Debugging", "SignTextCullVerify", false,
                 "Every 30 s, checks that no sign within SignTextDrawM has its writing hidden; any found are named in a warning.");
             On.SettingChanged += (_, __) => { if (!On.Value) ShowAll("key turned off"); };
         }

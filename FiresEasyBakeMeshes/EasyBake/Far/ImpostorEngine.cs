@@ -37,25 +37,29 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (config == null || s_bound) return;
             s_bound = true;
-            const string s = "Far Impostors";
-            CfgEnabled = config.Bind(s, "Enabled", true /* 1.2.344 ([ghost], Fire 11-12: "we DO need to work just as well as farlands, showing distant vegetation and builds"; was parked OFF since 1.2.212): ON on his word; the rig gate after hand-back measures it (census below) */, "Draw far trees (and other registered far objects) as baked impostors out to the impostor distance. Off = nothing is baked or drawn.");
-            CfgSharpness = config.Bind(s, "Sharpness", Sharpness.Medium, "How sharp far trees look: Low 64, Medium 128, High 192, Ultra 256 pixels per view. Higher costs video memory (about 0.7 / 2.7 / 6 / 11 MB a kind). A change re-bakes in the background; the old look stays until the new one is ready.");
-            CfgSmoothViews = config.Bind(s, "Smooth views", true, "Blend the 3 nearest baked views (smooth turning). Off = 1 view, a little cheaper.");
-            CfgMidLod = config.Bind(s, "Mid-LOD trees", false, "Draw real far-LOD tree meshes between the game's own trees and the impostors (closer far trees look solid). Costs GPU time.");
-            CfgMidDistance = config.Bind(s, "Mid-LOD distance", 1200f, new ConfigDescription("Outer edge of the mid-LOD band in metres.", new AcceptableValueRange<float>(300f, 3500f)));
-            CfgDistance = config.Bind(s, "Impostor distance", 2500f, new ConfigDescription("How far impostors are drawn, in metres.", new AcceptableValueRange<float>(600f, 6000f)));
-            CfgCacheOnDisk = config.Bind(s, "Cache atlases on disk", true, "Keep baked atlases on disk so a relaunch does not bake again.");
-            CfgBakeBudget = config.Bind(s, "Bake budget ms", 2f, new ConfigDescription("Main-thread milliseconds a frame for baking (one view at most a frame).", new AcceptableValueRange<float>(0.5f, 6f)));
-            CfgUploadBudget = config.Bind(s, "Upload budget ms", 0.5f, new ConfigDescription("Main-thread milliseconds a frame for uploading far instances.", new AcceptableValueRange<float>(0.1f, 2f)));
+            const string s = "05 - Far Trees";   // 1.2.444: was "Far Impostors" (EbmConfigMove carries saved values)
+            // 1.2.458 (Fire 11-18: "We do not want to default fire trees to on ... none of the far lands esc code in ebm will default to on"): [03 - Far Rendering]
+            // Far Trees, default OFF (was [05 - Far Trees] Enabled, default ON since 1.2.344; EbmConfigMove carries a saved value), under the master switch.
+            // No SettingChanged needed: ImpostorDraw.Late reads Enabled every frame and stops itself (ImpostorDraw.cs:61-63).
+            CfgEnabled = EbmConfigMove.Bind(config, FarRendering.Section, "Far Trees", false, "Draws far trees (and the far objects other parts and mods hand to EBM's impostor engine, such as far rocks past their mesh band) as baked impostors out to the impostor distance. Off = nothing is baked or drawn. Needs Far Rendering on.");
+            CfgSharpness = EbmConfigMove.Bind(config, s, "Sharpness", Sharpness.Medium, "How sharp far trees look: Low 64, Medium 128, High 192, Ultra 256 pixels per view. Higher costs video memory (about 0.7 / 2.7 / 6 / 11 MB a kind). A change re-bakes in the background; the old look stays until the new one is ready.");
+            CfgSmoothViews = EbmConfigMove.Bind(config, s, "Smooth views", true, "Blend the 3 nearest baked views (smooth turning). Off = 1 view, a little cheaper.");
+            CfgMidLod = EbmConfigMove.Bind(config, s, "Mid-LOD trees", false, "Draw real far-LOD tree meshes between the game's own trees and the impostors (closer far trees look solid). Costs GPU time.");
+            CfgMidDistance = EbmConfigMove.Bind(config, s, "Mid-LOD distance", 1200f, new ConfigDescription("Outer edge of the mid-LOD band in metres.", new AcceptableValueRange<float>(300f, 3500f)));
+            CfgDistance = EbmConfigMove.Bind(config, s, "Impostor distance", 2500f, new ConfigDescription("How far impostors are drawn, in metres.", new AcceptableValueRange<float>(600f, 6000f)));
+            CfgCacheOnDisk = EbmConfigMove.Bind(config, s, "Cache atlases on disk", true, "Keep baked atlases on disk so a relaunch does not bake again.");
+            CfgBakeBudget = EbmConfigMove.Bind(config, s, "Bake budget ms", 2f, new ConfigDescription("Main-thread milliseconds a frame for baking (one view at most a frame).", new AcceptableValueRange<float>(0.5f, 6f)));
+            CfgUploadBudget = EbmConfigMove.Bind(config, s, "Upload budget ms", 0.5f, new ConfigDescription("Main-thread milliseconds a frame for uploading far instances.", new AcceptableValueRange<float>(0.1f, 2f)));
             EasyBakeLog.Debug(Tag + "keys bound by EBM");
         }
 
-        internal static bool Enabled => s_sessionOverride ?? (CfgEnabled != null && CfgEnabled.Value);
+        internal static bool Enabled => s_sessionOverride ?? (FarRendering.On && CfgEnabled != null && CfgEnabled.Value);   // 1.2.458: AND the Far Rendering master (the dev session command still wins)
         internal static Sharpness SharpnessNow => CfgSharpness != null ? CfgSharpness.Value : Sharpness.Medium;
         internal static bool SmoothViews => CfgSmoothViews == null || CfgSmoothViews.Value;
         internal static bool MidLodOn => CfgMidLod != null && CfgMidLod.Value;
         internal static float MidDistance => CfgMidDistance != null ? CfgMidDistance.Value : 1200f;
-        internal static float Distance => Mathf.Clamp(FarReach.Or(CfgDistance != null ? CfgDistance.Value : 2500f), 600f, 6000f);   // 1.2.344: [Far] Far reach wins when set
+        internal static float Distance => FarReach.For(OwnDistance);   // 1.2.483: Far Zone Sync = the one shared reach (FarReach.Effective), else OwnDistance
+        internal static float OwnDistance => Mathf.Clamp(FarReach.Or(CfgDistance != null ? CfgDistance.Value : 2500f), 600f, 6000f);   // 1.2.344: [Far] Far reach wins when set (1.2.483: the 1.2.482 distance, unchanged)
         internal static bool CacheOnDisk => CfgCacheOnDisk == null || CfgCacheOnDisk.Value;
         internal static float BakeBudgetMs => CfgBakeBudget != null ? CfgBakeBudget.Value : 2f;
         internal static float UploadBudgetMs => CfgUploadBudget != null ? CfgUploadBudget.Value : 0.5f;

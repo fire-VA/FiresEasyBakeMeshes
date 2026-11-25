@@ -35,11 +35,11 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile cfg)
         {
-            Enabled = cfg.Bind("Optimize", "WaterSplitLitTiles", false /* 1.2.296 OFF: [lead] A/B at swamp spot4, ON 4.452 ms vs OFF 4.103 ms (the extra base draws cost more than the light passes saved) */,
+            Enabled = EbmConfigMove.Bind(cfg, "41 - Water Performance", "WaterSplitLitTiles", false /* 1.2.296 OFF: [lead] A/B at swamp spot4, ON 4.452 ms vs OFF 4.103 ms (the extra base draws cost more than the light passes saved) */,
                 "Water tiles that a torch or other pixel light reaches are drawn as 16 smaller pieces, so the light's extra passes only cover the pieces it reaches instead of the whole 64 m tile. Same water look. Off = as before.");
-            Verify = cfg.Bind("Optimize", "WaterSplitLitTilesVerify", false,
+            Verify = EbmConfigMove.Bind(cfg, "90 - Debugging", "WaterSplitLitTilesVerify", false,
                 "Test twin of WaterSplitLitTiles: nothing is split; the Debug log counts how many light passes the split would keep. Off = no count.");
-            GridKey = cfg.Bind("Optimize", "WaterSplitGrid", 4, new ConfigDescription(
+            GridKey = EbmConfigMove.Bind(cfg, "41 - Water Performance", "WaterSplitGrid", 4, new ConfigDescription(
                 "With WaterSplitLitTiles: a lit water tile is cut into Grid x Grid pieces. 4 = 16 pieces (a light covers the least water, more draws), 2 = 4 pieces (fewer draws). Changes apply live.",
                 new AcceptableValueRange<int>(2, 4)));
         }

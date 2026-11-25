@@ -144,7 +144,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             if (want && !EbmIndirectAssets.Ready(out string why)) { EbmGpuCaps.SayOnce("off: " + why); FallBack(why); return false; }
             if (want) EbmGpuCaps.SayOnce($"on (bundle {EbmIndirectAssets.LoadedFile})");
             if (want && s_override != true && IndirectCrashGuard.FallBackThisSession(out string crashWhy)) { SetActive(false, crashWhy); return false; }   // 1.2.256 [Optimize] IndirectCrashFallback
-            SetActive(want, want ? null : "[Optimize] IndirectRenderer is off");
+            SetActive(want, want ? null : "[40 - Shaders] IndirectRenderer is off");
             if (!Active) return false;
             IndirectCrashGuard.Frame();
             HookViews();   // 1.2.209
@@ -986,7 +986,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             s_gpuBatches[i] = new GpuBatch
             {
                 Center = b.LocalBounds.center, Extents = b.LocalBounds.extents, VisibleOffset = (uint)b.VisibleOffset,
-                Flags = (b.Shadows != ShadowCastingMode.Off ? 1u : 0u) | (b.LodPerInstance ? 2u : 0u) | (b.LodLast ? 4u : 0u), Lod = b.Lod, StartHeight = b.StartHeight, EndHeight = b.EndHeight,
+                Flags = (b.Shadows != ShadowCastingMode.Off ? 1u : 0u) | (b.LodPerInstance ? 2u : 0u) | (b.LodLast ? 4u : 0u)
+                      | ((uint)(b.Layer & 31) << 8),   // 1.2.490: bits 8..12 = the batch's layer (EbmIndirectCull.compute LayerDist: another camera's layerCullDistances)
+                Lod = b.Lod, StartHeight = b.StartHeight, EndHeight = b.EndHeight,
                 Capacity = (uint)RangeOf(b),   // E9: a caster leader's range holds its whole group's casters (own capacity otherwise)
                 Pad = (uint)CasterLeaderOf(i),  // E9: the caster leader the cull appends caster views to (own index = not merged, today's path)
             };
@@ -1404,7 +1406,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             var sb = new System.Text.StringBuilder(256);
             sb.Append($"[Indirect] ON: {TakenGroups} group(s) taken, {RefusedGroups} on the instanced path; {s_batches.Count} batch(es), {s_live} instance slot(s) of {s_high}, {LastCalls} indirect draw(s) a frame");
             // 1.2.210: how often the costly steps ran since the last line (the spike proof: both should sit near 0 while standing still)
-            sb.Append($"; {s_layouts} full layout(s) + {s_moved} batch(es) placed alone, uploads {s_upSlots} slot(s) in {s_upRuns} run(s) ({s_upBytes / 1024} KB), {s_cascadeRecords} cascade + {s_localRecords} light-buffer re-record(s), {s_lastCascadeDraws} cascade + {s_lastLocalDraws} light caster draw(s) recorded in {s_slotCount} light buffer(s), other cameras {s_otherRenders} render(s) / {s_otherSent} draw(s)");
+            sb.Append($"; {s_layouts} full layout(s) + {s_moved} batch(es) placed alone, uploads {s_upSlots} slot(s) in {s_upRuns} run(s) ({s_upBytes / 1024} KB), {s_cascadeRecords} cascade + {s_localRecords} light-buffer re-record(s), {s_lastCascadeDraws} cascade + {s_lastLocalDraws} light caster draw(s) recorded in {s_slotCount} light buffer(s), other cameras {s_otherRenders} render(s) / {s_otherSent} draw(s), layer cut (1.2.490) in {s_layerCutRenders} own-pass render(s), {s_layerCutBatches} whole batch(es) not submitted");
             sb.Append($"; cascade draws recorded now {s_recCount[0]}/{s_recCount[1]}/{s_recCount[2]}/{s_recCount[3]} (replayed every frame; {s_lastCascadeDraws} in all)");   // 1.2.367 ([visual]): replay cost per frame is one indirect draw per count
             sb.Append($"; caster material changes at the last full record {s_recMatSwitch[0]}/{s_recMatSwitch[1]}/{s_recMatSwitch[2]}/{s_recMatSwitch[3]} (the least SetPass calls those cascades can make; appended rows not counted); cascade scans skipped {s_recScanSkipped} (IndirectCascadeScanReuse)");   // 1.2.388
             s_recScanSkipped = 0;
@@ -1413,7 +1415,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             sb.Append($"; cascade re-records by reason: {s_recForced} forced, {s_recGained} gained, {s_recStale} stale; {s_recAppends} append(s) of {s_recAppendedDraws} draw(s), appended now {s_appendCount[0]}/{s_appendCount[1]}/{s_appendCount[2]}/{s_appendCount[3]}; [Optimize] CascadeAppendOnGain {(AppendOnGainOn ? "on" : "off")}");   // 1.2.372 ([visual]): the re-record reasons and the appends since the last line
             sb.Append($"; camera draw sort mode {CameraDrawSortMode}{(CameraDrawSortMode >= 1 && !(s_orderCount == s_batches.Count && s_camOrderCount == s_batches.Count) ? " (order not current: index order this frame)" : "")}");   // 1.2.376
             sb.Append($" [keys: sparse {(SparseOn ? "on" : "off")}, stable {(StableOn ? "on" : "off")}, caster cull {(CasterCullOn ? "on" : "off")}, point faces {(FacesOn ? "on" : "off")}]");
-            s_layouts = 0; s_cascadeRecords = 0; s_moved = 0; s_recForced = 0; s_recGained = 0; s_recStale = 0; s_recAppends = 0; s_recAppendedDraws = 0; s_upSlots = 0; s_upRuns = 0; s_upBytes = 0; s_localRecords = 0; s_otherRenders = 0; s_otherSent = 0;
+            s_layouts = 0; s_cascadeRecords = 0; s_moved = 0; s_recForced = 0; s_recGained = 0; s_recStale = 0; s_recAppends = 0; s_recAppendedDraws = 0; s_upSlots = 0; s_upRuns = 0; s_upBytes = 0; s_localRecords = 0; s_otherRenders = 0; s_otherSent = 0; s_layerCutRenders = 0; s_layerCutBatches = 0;
             if (s_refusedWhy.Count > 0) { sb.Append("; refused:"); foreach (var kv in s_refusedWhy) sb.Append(' ').Append(kv.Value).Append("x ").Append(kv.Key).Append(';'); }
             s_refusedWhy.Clear();
             return sb.ToString();

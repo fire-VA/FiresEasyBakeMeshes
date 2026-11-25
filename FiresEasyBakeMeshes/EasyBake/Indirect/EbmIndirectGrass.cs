@@ -494,7 +494,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             return false;
         }
 
-        private static uint FlagsOf(InstanceRenderer r) => 8u | (r.m_frustumCull ? 1u : 0u) | (r.m_useLod ? 2u : 0u) | (r.m_useXZLodDistance ? 4u : 0u);
+        // 1.2.518 (Valheim 1.0.30): InstanceRenderer.m_frustumCull / UpdateBounds are gone and CustomUpdate draws every patch with no sphere test,
+        // so bit 1 (frustum) is never set: the same patches as vanilla 1.0.30 (an off-screen casting patch still throws its shadow into view)
+        private static uint FlagsOf(InstanceRenderer r) => 8u | (r.m_useLod ? 2u : 0u) | (r.m_useXZLodDistance ? 4u : 0u);
 
         private static void WriteRow(Patch p, Vector4 sphere, int count)
         {
@@ -737,13 +739,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
             {
                 var r = p.R;
                 if (r == null || p.Retired || p.Count <= 0) continue;
-                if (r.m_frustumCull)
-                {
-                    bool inside = true;
-                    for (int i = 0; i < 6 && inside; i++) if (s_planes[i].GetDistanceToPoint(new Vector3(p.Sphere.x, p.Sphere.y, p.Sphere.z)) < -p.Sphere.w) inside = false;
-                    if (!inside) continue;
-                }
-                onScreen++;
+                onScreen++;   // 1.2.518 (Valheim 1.0.30): vanilla has no sphere test any more (m_frustumCull removed), so every live patch counts
                 long n = r.m_useLod ? (long)VanillaTarget(r, cp) : p.Count;
                 if (n > 0) { cpuPatches++; cpuBlades += n; }
             }

@@ -32,9 +32,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         internal static void BindSkyDepth(ConfigFile config)
         {
-            SkyDepthOn = config.Bind("Optimize", "IndirectSkyDepth", false,
+            SkyDepthOn = EbmConfigMove.Bind(config, "24 - Performance - GPU Drawing", "IndirectSkyDepth", false,
                 "Roofs EBM draws on the graphics card are added to the game's rain and wet mask (the top-down map that says where open sky is), so rain does not show through a baked house seen from outside and wet looks stay right under it. The player standing under a roof is already covered by EBM's rain shelter. Off = as before.");
-            SkyDepthThrottleOn = config.Bind("Optimize", "SkyDepthThrottle", false,
+            SkyDepthThrottleOn = EbmConfigMove.Bind(config, "24 - Performance - GPU Drawing", "SkyDepthThrottle", false,
                 "The game re-draws its rain mask every second. With this on it is skipped while you have not moved (at most every 5 s). Visible: a roof just built or removed changes where rain falls up to 5 s later.");
         }
 

@@ -25,8 +25,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal static void Initialize(ConfigFile config)
         {
             if (config == null || s_scale != null) return;
-            s_scale = config.Bind("Far", "Far fog scale", 1f, new ConfigDescription(
-                "Multiplies the fog density of the main view (0.3 = fog thins to about a third, so far buildings, rocks and trees read out to ~3x the distance). 1 = the game's fog unchanged. Colour and fog mode stay the game's / the fog owner's.",
+            s_scale = EbmConfigMove.Bind(config, "03 - Far View", "Far fog scale", 1f, new ConfigDescription(
+                "Multiplies the fog density of the main view (0.3 = fog thins to about a third, so far buildings, rocks and trees read out to ~3x the distance). 1 = the game's fog unchanged. Colour and fog mode stay the game's / the fog owner's. With Vedr installed, use Vedr's [30 - Air fog] 'Game fog density scale' instead (Vedr's sky and air fog follow that one, not this) and leave this at 1; a Warning is logged when both are set.",
                 new AcceptableValueRange<float>(0.1f, 1f)));
             s_scale.SettingChanged += (_, __) => Apply();
             Apply();
@@ -45,11 +45,13 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             EasyBakeLog.Info(want ? $"[Far] Far fog scale {s_scale.Value:0.##}: the main view's fog density is multiplied by it while it renders (the 90% distance is logged once the main camera first renders)"
                                   : "[Far] Far fog scale 1: the game's fog is unchanged");
             s_saidDistance = false;
+            s_vedrSaid = null; if (s_vedrResolved) CheckVedr();   // 1.2.467: re-say the Vedr overlap on an EBM change
         }
 
         private static void PreCull(Camera cam)
         {
             if (cam == null || cam != Camera.main || s_applied) return;
+            if (!s_vedrResolved) ResolveVedr();   // 1.2.467: once, in a world (every plugin's Awake has run by the first render)
             s_cam = cam; s_saved = RenderSettings.fogDensity; s_applied = true;
             if (!s_saidDistance) { s_saidDistance = true; EasyBakeLog.Info($"[Far] Far fog scale {s_scale.Value:0.##}: game fog density {s_saved:0.0000} (~{(s_saved > 0f ? 2.3f / s_saved : 0f):0} m to 90% fog), scaled ~{(s_saved > 0f ? 2.3f / (s_saved * s_scale.Value) : 0f):0} m while the main view renders"); }
             RenderSettings.fogDensity = s_saved * s_scale.Value;
@@ -59,6 +61,49 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (!s_applied || cam != s_cam) return;
             RenderSettings.fogDensity = s_saved; s_applied = false;
+        }
+
+        // 1.2.467 ([visual], lead 11-19; Fire: "yes vedr should own it"): Vedr 0.8.292 owns the game's fog thickness ("30 - Air fog" / "Game fog density scale",
+        // VedrVolFog.cs:80, an EnvMan.SetEnv postfix; active when != 1, VedrVolFog.cs:625). Vedr's sky fog and air fog follow it; this key does not reach them
+        // ([seasons] 11-19: Vedr reads RenderSettings in LateUpdate, before this onPreCull window). Both set = the main view's fog is scaled twice, so warn.
+        // Soft read only (no reference to Vedr): Chainloader -> Vedr's ConfigFile -> TryGetEntry. Nothing is changed; the Warning is the whole effect.
+        // Runs only while this key is below 1 (PreCull is hooked only then), so scale 1 costs nothing.
+        private static bool s_vedrResolved;
+        private static ConfigEntry<float> s_vedrScale;
+        private static ConfigEntryBase s_vedrMode;
+        private static string s_vedrSaid;
+
+        private static void ResolveVedr()
+        {
+            s_vedrResolved = true;
+            try
+            {
+                if (!BepInEx.Bootstrap.Chainloader.PluginInfos.TryGetValue("Norger.Vedr", out var pi) || pi == null || pi.Instance == null) return;
+                var vc = pi.Instance.Config;
+                if (!vc.TryGetEntry(new ConfigDefinition("30 - Air fog", "Game fog density scale"), out s_vedrScale) || s_vedrScale == null) return;
+                s_vedrScale.SettingChanged += (_, __) => { s_vedrSaid = null; CheckVedr(); };
+                // "Game fog mode" is Vedr's own enum (GameFogMode { Game, ExponentialSquared }, VedrVolFog.cs:36 / :81): read untyped, by its name
+                var modeDef = new ConfigDefinition("30 - Air fog", "Game fog mode");
+                if (vc.ContainsKey(modeDef))
+                {
+                    s_vedrMode = vc[modeDef];   // ConfigEntryBase has no SettingChanged (BepInExREF ConfigEntry`1.cs:24 only): the file's event, this entry only
+                    vc.SettingChanged += (_, a) => { if (a != null && a.ChangedSetting == s_vedrMode) { s_vedrSaid = null; CheckVedr(); } };
+                }
+                CheckVedr();
+            }
+            catch (System.Exception e) { s_vedrScale = null; EasyBakeLog.Debug($"[Far] Far fog scale: Vedr's game fog key not read ({e.GetType().Name})"); }
+        }
+
+        private static void CheckVedr()
+        {
+            if (s_scale == null || s_vedrScale == null) return;
+            string mode = s_vedrMode?.BoxedValue?.ToString() ?? "Game";
+            bool vedrOn = Mathf.Abs(s_vedrScale.Value - 1f) > 0.0001f || mode != "Game";   // [lead] 11-19: active = scale != 1 or mode != Game
+            bool both = s_scale.Value < 0.999f && vedrOn;
+            string say = both ? $"[Far] Far fog scale {s_scale.Value:0.##} is set while Vedr owns the game's fog ([30 - Air fog] 'Game fog density scale' {s_vedrScale.Value:0.###}, 'Game fog mode' {mode}): the main view's fog is thinned on top of Vedr's (x{s_scale.Value * s_vedrScale.Value:0.###} in all), and Vedr's sky and air fog do not follow this key. Set EBM [03 - Far View] 'Far fog scale' back to 1." : "";
+            if (say == s_vedrSaid) return;
+            s_vedrSaid = say;
+            if (both) EasyBakeLog.Warn(say);
         }
     }
 }

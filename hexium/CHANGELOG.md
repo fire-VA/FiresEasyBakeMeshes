@@ -1,3 +1,16 @@
+Requires Valheim 1.0.30 or newer.
+
+## 1.2.518
+
+Requires Valheim 1.0.30 or newer. On an older Valheim, stay on 1.2.442.
+
+**Your settings file:** updating never changes a saved setting.
+
+- Updated for Valheim 1.0.30, together with everything since 1.2.442:
+  - far trees placed exactly where the game grows them (on for new settings files)
+  - snow on baked buildings and roofs follows winter (with Vedr)
+  - faster loading: a zone is saved to the cache once and loads ready next time
+  - lower frame cost
 ## 1.2.442
 
 **Your settings file:** updating never changes a saved setting.

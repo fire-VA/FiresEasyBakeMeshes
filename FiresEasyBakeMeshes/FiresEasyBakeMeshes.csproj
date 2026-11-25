@@ -14,6 +14,13 @@
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
     <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+    <!-- 1.2.479 ([visual], lead 11-21, Fire's rule: nothing EBM builds from lives outside valheimRip2): references through two overridable
+         properties. BepInEx / 0Harmony were ..\..\..\..\customspawnsmod\lib (Desktop\customspawnsmod, OUTSIDE valheimRip2); the SAME two files
+         (BepInEx 5.4.22.0, 0Harmony 2.9.0.0, equal SHA256, see ..\lib\BepInEx_5.4.22\SOURCE.txt) now sit in this tree, so the reference
+         identities and API surface are unchanged. Game assemblies: the same Steam Managed folder as before (was an ..\..\ relative path). -->
+    <GamePath Condition="'$(GamePath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Valheim</GamePath>
+    <Managed>$(GamePath)\valheim_Data\Managed</Managed>
+    <BepInExCore Condition="'$(BepInExCore)' == ''">$(MSBuildProjectDirectory)\..\lib\BepInEx_5.4.22</BepInExCore>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <DebugSymbols>true</DebugSymbols>
@@ -34,47 +41,47 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="UnityEngine.UIModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.UIModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.UIModule.dll</HintPath>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>..\..\..\..\customspawnsmod\lib\0Harmony.dll</HintPath>
+      <HintPath>$(BepInExCore)\0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="assembly_valheim, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
       <SpecificVersion>False</SpecificVersion>
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_valheim.dll</HintPath>
+      <HintPath>$(Managed)\assembly_valheim.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="assembly_utils">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\assembly_utils.dll</HintPath>
+      <HintPath>$(Managed)\assembly_utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="BepInEx">
-      <HintPath>..\..\..\..\customspawnsmod\lib\BepInEx.dll</HintPath>
+      <HintPath>$(BepInExCore)\BepInEx.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.ScreenCaptureModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ScreenCaptureModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.ScreenCaptureModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.AssetBundleModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.AssetBundleModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.ParticleSystemModule">
-      <HintPath>..\..\..\..\..\..\..\..\Program Files (x86)\Steam\steamapps\common\Valheim\valheim_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <HintPath>$(Managed)\UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="System" />
@@ -99,6 +106,8 @@
     <Compile Include="EasyBake\Far\FarGroundCover.cs" />
     <Compile Include="EasyBake\Far\FarTerrainTiles.cs" />
     <Compile Include="EasyBake\Far\FarReach.cs" />
+    <Compile Include="EasyBake\Far\FarRendering.cs" />
+    <Compile Include="EasyBake\Far\FarZoneSet.cs" />
     <Compile Include="EasyBake\Far\FarFog.cs" />
     <Compile Include="EasyBake\Far\FarBakeSources.cs" />
     <Compile Include="EasyBake\Far\FarBuildingSources.cs" />
@@ -120,8 +129,16 @@
     <Compile Include="EasyBake\Far\ImpostorPool.cs" />
     <Compile Include="EasyBake\Far\ImpostorTestCommand.cs" />
     <Compile Include="EasyBake\Far\ImpostorTypes.cs" />
+    <Compile Include="EasyBake\Far\FarVegKinds.cs" />
+    <Compile Include="EasyBake\Far\FarVegReplay.cs" />
+    <Compile Include="EasyBake\Far\FarVegRng.cs" />
+    <Compile Include="EasyBake\Far\FarVegRngSelfTest.cs" />
+    <Compile Include="EasyBake\Far\FarVegRunner.cs" />
+    <Compile Include="EasyBake\Far\FarVegSource.cs" />
+    <Compile Include="EasyBake\Far\FarVegSeen.cs" />
     <EmbeddedResource Include="EasyBake\Far\firescoreimpostor" />
     <Compile Include="Plugin.cs" />
+    <Compile Include="EbmConfigMove.cs" />
     <Compile Include="CoreLink.cs" />
     <Compile Include="VedrLink.cs" />
     <Compile Include="EasyBake\IdleGates.cs" />
@@ -192,6 +209,7 @@
     <Compile Include="EasyBake\Indirect\EbmIndirectCascadeStride.cs" />
     <Compile Include="EasyBake\EbmPatchSafety.cs" />
     <Compile Include="EasyBake\FillTracker.cs" />
+    <Compile Include="EasyBake\EbmChurn.cs" />
     <Compile Include="EasyBake\StreamPacer.cs" />
     <Compile Include="EasyBake\SectorArrivals.cs" />
     <Compile Include="EasyBake\SectorHooks.cs" />
@@ -203,6 +221,9 @@
     <Compile Include="EasyBake\HeightmapBulkDetach.cs" />
     <Compile Include="EasyBake\ZoneTrackerSkipCensus.cs" />
     <Compile Include="EasyBake\ZoneTrackerFarSkip.cs" />
+    <Compile Include="EasyBake\ZoneTrackerMakeReal.cs" />
+    <Compile Include="EasyBake\ZoneTrackerCaps.cs" />
+    <Compile Include="EasyBake\PieceCaps.cs" />
     <Compile Include="EasyBake\ZoneTrackerSupportSafe.cs" />
     <Compile Include="EasyBake\ArrivalTimeline.cs" />
     <Compile Include="EasyBake\Indirect\EbmIndirectDepthCull.cs" />
@@ -217,8 +238,10 @@
     <Compile Include="EasyBake\ZoneTrackerZoneKeep.cs" />
     <Compile Include="EasyBake\SignTextCull.cs" />
     <Compile Include="EasyBake\EbmTerrainShader.cs" />
+    <Compile Include="EasyBake\EbmVedrDefaults.cs" />
     <Compile Include="EasyBake\EbmMist.cs" />
     <Compile Include="EasyBake\EbmWater.cs" />
+    <Compile Include="EasyBake\EbmWaterFarRing.cs" />
     <Compile Include="EasyBake\EbmFatWaterLook.cs" />
     <Compile Include="EasyBake\Indirect\EbmCreatureVerify.cs" />
     <Compile Include="EasyBake\StandItemCull.cs" />

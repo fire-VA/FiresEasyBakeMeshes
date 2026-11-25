@@ -44,7 +44,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Indirect
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Debugging", "RenderCensus", false,
+            Enabled = EbmConfigMove.Bind(config, "90 - Debugging", "RenderCensus", false,
                 "Testing aid: one Debug line every 30 s with the frame's draw calls, set-pass calls, triangles and shadow casters (Unity's own counters), GPU / CPU frame times, and EBM's draws by path and by kind. Also on with the launch argument -ebmrendercensus. Off = no cost.");
             foreach (var a in Environment.GetCommandLineArgs()) if (string.Equals(a, "-ebmrendercensus", StringComparison.OrdinalIgnoreCase)) s_arg = true;
             Enabled.SettingChanged += (_, __) => Apply();

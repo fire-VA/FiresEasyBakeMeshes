@@ -51,3 +51,5 @@ vapieces
 # OS noise
 Thumbs.db
 desktop.ini
+# In-tree shader sources stay private (EbmHeightmap is a port of the game terrain shader)
+FiresEasyBakeMeshes/Shaders/

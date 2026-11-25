@@ -72,6 +72,100 @@ namespace FiresEasyBakeMeshes.EasyBake
             return body != null && !body.isKinematic;
         }
 
+        // ---- 1.2.494 [20] RemoveHysteresis ([visual], [lead] GO 11-22; perfcircle_20261122_091000 W_storm lap 2: a 50 m circle crossed 6 zone borders a lap and
+        // the distant-band sweep queued 2124 / 2449 / 1554 objects per 30 s, ~3400 created + ~3500 destroyed a lap, the same rows each time; Fire's "build once").
+        // A static object (persistent, not a Character / BaseAI / ZSyncTransform / free Rigidbody) that drops out of the near / distant lists but whose sector is
+        // still within Near + 1 zones of the reference zone is HELD alive instead of queued: it is queued as before once its sector is 2+ zones past the near
+        // area or after RemoveHysteresisSeconds. Coming back within that time re-creates nothing (its instance never left). Why it is safe: vanilla WearNTear
+        // applies no wear / support outside its 1.5-zone active area (WearNTear.cs:363-368, ZNetScene.PointInsideActiveArea :318-331), the same as for the
+        // objects vanilla itself keeps in the near rings 2..Near; movers, creatures and synced transforms keep vanilla's rule. Off = today exactly.
+        private struct Held { public float Since; public ZDOID Uid; public int Prefab; }   // 1.2.495: Prefab = for the "gone while held" names (which objects a reset hit)
+        // 1.2.495 FIX ([visual]; perfcircle_20261122_114840, RemoveHysteresis on: 5802 x "KeyNotFoundException: The given key '0:0' was not present in the
+        // dictionary" thrown out of ZNetScene.CreateDestroyObjects, which then created and removed nothing): vanilla ZDO hashes by its uid
+        // (ZDO.cs:46 GetHashCode => m_uid.GetHashCode(); Equals by m_uid), and a pooled ZDO reset to 0:0 while held changed its hash inside this
+        // dictionary, so s_held[zdo] threw. Held entries are now keyed by the object itself (reference identity), never by the ZDO's own hash.
+        private sealed class RefEq : IEqualityComparer<ZDO>
+        {
+            internal static readonly RefEq Instance = new RefEq();
+            public bool Equals(ZDO a, ZDO b) => ReferenceEquals(a, b);
+            public int GetHashCode(ZDO z) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(z);
+        }
+        private static readonly Dictionary<ZDO, Held> s_held = new Dictionary<ZDO, Held>(RefEq.Instance);
+        // 1.2.495: any exception in the hold code releases everything, warns once and turns the hold off for the session: it may never stop a removal pass again
+        private static bool s_holdBroken;
+        private static void HoldFailed(System.Exception e)
+        {
+            if (!s_holdBroken) EasyBakeLog.Warn($"[DTS] RemoveHysteresis turned off for this session after an error ({e.GetType().Name}: {e.Message}); held objects go back to the normal removal");
+            s_holdBroken = true;
+            s_held.Clear();   // nothing is skipped any more: the next scan finds them unstamped and queues them the normal way (band / leaving sectors / full walk)
+        }
+        // 1.2.495 diagnostics ([2ic]: name what reset a persistent held ZDO): up to 5 prefab hashes a window of held objects that went away (uid reset or instance gone)
+        private static readonly System.Text.StringBuilder s_goneNames = new System.Text.StringBuilder(160); private static int s_goneNamed;
+        private static void NoteGone(int prefab, bool uidReset)
+        {
+            if (s_goneNamed >= 5) return;
+            s_goneNamed++;
+            // the prefab HASH only: ZNetScene.GetPrefab can realize a lazy asset bundle (a sync load, FDT 1.1.1156: up to 13.5 s) inside this pass
+            s_goneNames.Append(s_goneNamed > 1 ? ", " : "").Append("prefab ").Append(prefab).Append(uidReset ? " (uid reset)" : " (instance gone)");
+        }
+        // 1.2.495 count only, no behaviour change ([2ic]: the comparer change for _inQueue is its own item, logged first): _inQueue is a HashSet<ZDO> on the ZDO's
+        // uid hash too, so a Remove of a ZDO reset while queued misses (no throw; the stale entry stays). How often it happens, and how far the set drifts from the queues.
+        private static long s_qMiss;
+        private static long s_hHeldQueued, s_hRefusedQueued;   // 1.2.495: held while queued (must be 0); holds refused because already queued (the fix at work)
+        private static readonly List<ZDO> s_heldScratch = new List<ZDO>(256);
+        private static float s_nextHoldCheck;
+        private static long s_hNew, s_hBack, s_hByDist, s_hByTime, s_hGone; private static int s_hPeak;
+        private static bool HoldOn => !s_holdBroken && FiresEasyBakeMeshesPlugin.RemoveHysteresis != null && FiresEasyBakeMeshesPlugin.RemoveHysteresis.Value
+                                      && ZNet.instance != null && !ZNet.instance.IsDedicated();
+        private static float HoldSeconds => FiresEasyBakeMeshesPlugin.RemoveHysteresisSeconds != null ? FiresEasyBakeMeshesPlugin.RemoveHysteresisSeconds.Value : 30f;
+        // held objects expire on time with nothing else changing, so the idle / ScanGate skips let a pass run once a second while any are held
+        private static bool HoldDue => s_held.Count > 0 && Time.unscaledTime >= s_nextHoldCheck;
+        private static int RingDist(ZDO zdo, Vector2s here) { var s = zdo.GetSector(); return Mathf.Max(Mathf.Abs(s.x - here.x), Mathf.Abs(s.y - here.y)); }
+        private static bool HoldEligible(ZNetView nv, ZDO zdo)
+        {
+            if (nv == null || !zdo.Persistent) return false;
+            if (IsMover(nv)) return false;   // Character, or a Rigidbody that is not kinematic
+            return nv.GetComponent<BaseAI>() == null && nv.GetComponent<ZSyncTransform>() == null;
+        }
+        // true = held (not queued); called only for an unstamped ZDO the scan would queue
+        private static bool TryHold(Dictionary<ZDO, ZNetView> instances, ZDO zdo, Vector2s here, int holdRing, float now)
+        {
+            try
+            {
+                if (s_holdBroken) return false;
+                // 1.2.495 FIX (B log: "released 418 by time" and "418 gone while held" in one window): a ZDO already queued for removal (a released one included) is
+                // never held again; it was, and then the drain destroyed it while it sat in s_held
+                if (_inQueue.Contains(zdo)) { s_hRefusedQueued++; return false; }
+                if (RingDist(zdo, here) > holdRing) return false;
+                if (!instances.TryGetValue(zdo, out var nv) || !HoldEligible(nv, zdo)) return false;
+                s_held[zdo] = new Held { Since = now, Uid = zdo.m_uid, Prefab = zdo.GetPrefab() }; s_hNew++;
+                if (s_held.Count > s_hPeak) s_hPeak = s_held.Count;
+                return true;
+            }
+            catch (System.Exception e) { HoldFailed(e); return false; }
+        }
+        // once a pass (after this tick's stamps): back in the lists = keep and forget; gone = forget; too far or too old = queue the vanilla way
+        private static int ReleaseHeld(Dictionary<ZDO, ZNetView> instances, byte num, Vector2s here, int holdRing, float now, bool all)
+        {
+            if (s_held.Count == 0) return 0;
+            int queued = 0; float max = HoldSeconds;
+            s_heldScratch.Clear(); foreach (var kv in s_held) s_heldScratch.Add(kv.Key);
+            for (int i = 0; i < s_heldScratch.Count; i++)
+            {
+                var zdo = s_heldScratch[i]; var h = s_held[zdo];
+                if (zdo.m_uid != h.Uid || !instances.TryGetValue(zdo, out var nv) || nv == null) { s_held.Remove(zdo); s_hGone++; NoteGone(h.Prefab, zdo.m_uid != h.Uid); continue; }   // destroyed (pooled ZDO reused = new uid)
+                if (_inQueue.Contains(zdo)) s_hHeldQueued++;   // 1.2.495 proof: held AND queued at once (the re-hold bug) must stay 0
+                if (zdo.TempRemoveEarmark == num) { s_held.Remove(zdo); s_hBack++; continue; }   // in the near / distant lists again: the re-create it saved
+                bool far = RingDist(zdo, here) > holdRing, old = now - h.Since >= max;
+                if (!all && !far && !old) continue;
+                s_held.Remove(zdo);
+                if (far) s_hByDist++; else s_hByTime++;
+                if (_inQueue.Add(zdo)) { Enqueue(instances, zdo); queued++; }
+            }
+            s_heldScratch.Clear();
+            return queued;
+        }
+
         private static bool s_dequeuedSolid;
         private static readonly List<ZDO> s_batch = new List<ZDO>(512);
         private static readonly List<bool> s_batchSolid = new List<bool>(512);
@@ -267,6 +361,17 @@ namespace FiresEasyBakeMeshes.EasyBake
             double ms = 1000.0 / System.Diagnostics.Stopwatch.Frequency; long ran = Mathf.Max(1, (int)(s_cCalls - s_cGated));
             EasyBakeLog.Debug($"[DTS] census 30 s: {s_cCalls} RemoveObjects call(s), {s_cGated} skipped by the gate ({s_cIdleGated} by the idle 10 Hz limit), {s_cMovers} mover(s) destroyed in-frame; of the rest {s_cIndex} sector-diff ({s_cLean} lean, {s_cChecks} foreign-keepalive check(s){(s_leanRefused ? ", LEAN REFUSED" : "")}) + {s_cFull} FULL walk(s); earmarked {s_cEarmarked / ran} ZDOs a call, walked {s_cWalked / Mathf.Max(1, (int)s_cFull)} instances a full walk; {s_cTicks * ms / Mathf.Max(1, (int)s_cCalls):0.000} ms a call, worst {s_cWorst * ms:0.00} ms, total {s_cTicks * ms / 30.0:0.00} ms/s; {s_cSpared} queued object(s) spared (stamped again while queued), {s_cBand} queued from the distant band (DestroyDistantBandSweep {(BandSweepOn ? "on" : "off")})");
             s_cIdleGated = 0; s_cMovers = 0; s_cSpared = 0; s_cBand = 0;   // 1.2.401
+            // 1.2.494 proof: "came back" = re-creates the hold saved; released by distance / time = destroyed as before, only later
+            if (HoldOn || s_hNew + s_hBack + s_hByDist + s_hByTime + s_hGone > 0)
+                EasyBakeLog.Debug($"[DTS] hysteresis 30 s (RemoveHysteresis {(HoldOn ? "on" : "off")}, Near + 1, {HoldSeconds:0} s): {s_hNew} held, {s_hBack} came back into the lists (re-creates saved), "
+                    + $"released {s_hByDist} by distance + {s_hByTime} by time (queued as before), {s_hGone} gone while held; holding {s_held.Count} now, peak {s_hPeak}; held while queued {s_hHeldQueued} (must be 0), holds refused as already queued {s_hRefusedQueued}");
+            if (HoldOn || s_hGone > 0) { if (s_goneNamed > 0) EasyBakeLog.Debug($"[DTS] hysteresis: gone while held, first {s_goneNamed}: {s_goneNames} (prefab hashes)"); }
+            s_goneNames.Length = 0; s_goneNamed = 0; s_hHeldQueued = 0; s_hRefusedQueued = 0;
+            int qNow = _destroyQueue.Count + _solidQueue.Count;   // [2ic] nit: a finding line, not a heartbeat
+            if (s_qMiss > 0 || _inQueue.Count != qNow)
+                EasyBakeLog.Debug($"[DTS] queue set 30 s (1.2.495 count): {s_qMiss} remove(s) missed (a ZDO reset while queued), set {_inQueue.Count} vs queued {qNow}");
+            s_qMiss = 0;
+            s_hNew = s_hBack = s_hByDist = s_hByTime = s_hGone = 0; s_hPeak = s_held.Count;
             if (ArrivalDrainOn && (s_cPostDrainFrames > 0 || s_cArrivalDrained > 0)) EasyBakeLog.Debug(HeightmapBulkDetach.TakeLine()); if (ArrivalDrainOn && (s_cPostDrainFrames > 0 || s_cArrivalDrained > 0)) EasyBakeLog.Debug($"[DTS] drains 30 s: {s_cArrivalDrained} destroyed while arriving (8 ms budget), {s_cCapped} drain(s) stopped at 256; the frame after a drain: {s_cPostDrainFrames} frame(s), avg {(s_cPostDrainFrames > 0 ? s_cPostDrainSum / s_cPostDrainFrames : 0f):0.0} ms, worst {s_cPostDrainWorst:0.0} ms");   // 1.2.268
             s_cPostDrainFrames = 0; s_cPostDrainSum = 0f; s_cPostDrainWorst = 0f; s_cCapped = 0; s_cArrivalDrained = 0;
             s_cLean = 0; s_cChecks = 0; s_cCalls = s_cGated = s_cIndex = s_cFull = s_cEarmarked = s_cWalked = s_cTicks = s_cWorst = 0;
@@ -294,7 +399,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // reprieve is never evaluated against stamps we failed to write.
             // 1.2.250: nothing queued, same zone, scanned under 0.1 s ago: leave it (FGN's 1.5.99 rule). Before ScanGate, so its audit only sees scans that may run.
             Vector2s idleZone = CurrentZone(); float idleNow = Time.unscaledTime;
-            if (!Pending && IdleScanOn && idleZone.x == s_idleZone.x && idleZone.y == s_idleZone.y && idleNow < s_nextIdleScan)
+            if (!Pending && !HoldDue && IdleScanOn && idleZone.x == s_idleZone.x && idleZone.y == s_idleZone.y && idleNow < s_nextIdleScan)
             {
                 s_cGated++; s_cIdleGated++;
                 if (!s_idleSaid) { s_idleSaid = true; EasyBakeLog.Info("[DTS] idle removal scan limit on: with nothing queued and the same zone, the removal scan runs at most 10 times a second"); }
@@ -303,7 +408,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             }
             s_idleZone = idleZone; s_nextIdleScan = idleNow + 1f / IdleScanHz;
 
-            if (!Pending
+            if (!Pending && !HoldDue   // 1.2.494: a held object's time can run out with nothing else changing
                 && ScanGate.Destroy.CanSkip(near.Count, distant.Count, instances.Count, CurrentZone()))
             {
                 s_cGated++; CensusEnd(cT0);
@@ -320,6 +425,11 @@ namespace FiresEasyBakeMeshes.EasyBake
                 byte notNow = (byte)(num + 1);
                 foreach (var queued in _destroyQueue) queued.TempRemoveEarmark = notNow;
                 foreach (var queued in _solidQueue) queued.TempRemoveEarmark = notNow;
+            }
+            if (s_held.Count > 0)   // 1.2.494: the same for held objects, so "back in the lists" below is this tick's stamp, never a stale one that wrapped round
+            {
+                byte notNowHeld = (byte)(num + 1);
+                foreach (var kv in s_held) kv.Key.TempRemoveEarmark = notNowHeld;
             }
 
             // 1.2.215 [Optimize] DestroyLeanEarmark ([visual], [seasons]' read of the 134k town fill): with the sector diff below, only instances
@@ -372,6 +482,13 @@ namespace FiresEasyBakeMeshes.EasyBake
             // mirror also records a sector at ADD time, so a moved instance is stale until the next rebuild -
             // hence the full walk whenever the mirror asks for one.
             int enqueuedThisTick = 0;
+            // 1.2.494 RemoveHysteresis: needs this tick's full stamps, so never on a lean tick (lean stamps only the keepalive tail; lean is off by default)
+            bool hold = HoldOn && !lean;
+            Vector2s holdHere = CurrentZone(); float holdNow = Time.unscaledTime;
+            int holdRing = ZNet.instance != null ? ZNet.instance.GetSyncedSimulationDistance().NearSimulationDistance + 1 : 0;
+            // released objects are queued outside enqueuedThisTick on purpose: they are not "found" by the scan, and the ScanGate audit would read them as a miss.
+            // A lean tick (or the key turned off) releases everything held: nothing is held on lean ticks, and nothing may stay held for ever.
+            if (s_held.Count > 0) { try { ReleaseHeld(instances, num, holdHere, holdRing, holdNow, !HoldOn || lean); } catch (System.Exception e) { HoldFailed(e); } s_nextHoldCheck = holdNow + 1f; }   // 1.2.495: never throws out of the pass
             // 1.2.122: on the ring "a loaded terrain zone keeps its instances" is wrong: the loaded x,z zones are the whole band column
             // while FAT instantiates by ring sector, so the index would never let ring objects go (the ~14.5k column again).
             // 1.2.167 ([generator] B1): the set was "sectors with no loaded zone". But a zone only unloads once its sector has no instances (ZoneSystem.UpdateTTL), so
@@ -401,7 +518,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (!SectorInstanceMirror.TryGetSectorZdos(_bandSectors[i], out var inBand)) continue;
                     foreach (var zdo in inBand)
                     {
-                        if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                        if (zdo.TempRemoveEarmark != num && !s_held.ContainsKey(zdo) && !(hold && TryHold(instances, zdo, holdHere, holdRing, holdNow)) && _inQueue.Add(zdo))   // 1.2.494
                         {
                             Enqueue(instances, zdo);
                             enqueuedThisTick++; s_cBand++;
@@ -414,7 +531,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     if (!SectorInstanceMirror.TryGetSectorZdos(_leavingSectors[i], out var leaving)) continue;
                     foreach (var zdo in leaving)
                     {
-                        if (zdo.TempRemoveEarmark != num && !(lean && InRing(zdo)) && _inQueue.Add(zdo))
+                        if (zdo.TempRemoveEarmark != num && !(lean && InRing(zdo)) && !s_held.ContainsKey(zdo) && !(hold && TryHold(instances, zdo, holdHere, holdRing, holdNow)) && _inQueue.Add(zdo))   // 1.2.494
                         {
                             Enqueue(instances, zdo);
                             enqueuedThisTick++;
@@ -427,7 +544,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                 foreach (var kv in instances)
                 {
                     var zdo = kv.Key;
-                    if (zdo.TempRemoveEarmark != num && _inQueue.Add(zdo))
+                    if (zdo.TempRemoveEarmark != num && !s_held.ContainsKey(zdo) && !(hold && TryHold(instances, zdo, holdHere, holdRing, holdNow)) && _inQueue.Add(zdo))   // 1.2.494
                     {
                         Enqueue(instances, zdo);
                         enqueuedThisTick++;
@@ -440,7 +557,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             // 1.2.250: movers go now, outside the budget. Deferred to here because a destroy edits the tables the scan above walks.
             for (int i = 0; i < _destroyNow.Count; i++)
             {
-                _inQueue.Remove(_destroyNow[i]);
+                if (!_inQueue.Remove(_destroyNow[i])) s_qMiss++;   // 1.2.495 count
                 if (DestroyOne(instances, _destroyNow[i])) s_cMovers++;
             }
             _destroyNow.Clear();
@@ -486,7 +603,7 @@ namespace FiresEasyBakeMeshes.EasyBake
                     s_batch.Clear(); s_batchSolid.Clear();
                     while (s_batch.Count < 32 && drainedThisTick + s_batch.Count < cap && TryDequeue(out var bz))
                     {
-                        _inQueue.Remove(bz);
+                        if (!_inQueue.Remove(bz)) s_qMiss++;   // 1.2.495 count
                         if (bz.TempRemoveEarmark == num || (s_leanTick && InRing(bz))) { reEarmarkThisTick++; continue; }
                         if (!instances.TryGetValue(bz, out var bnv) || bnv == null) continue;
                         s_batch.Add(bz); s_batchSolid.Add(s_dequeuedSolid);
@@ -507,7 +624,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             else
             while (TryDequeue(out var zdo))
             {
-                _inQueue.Remove(zdo);
+                if (!_inQueue.Remove(zdo)) s_qMiss++;   // 1.2.495 count
 
                 // Re-earmarked while queued? Skip. Keepalive injection adding
                 // this ZDO, the player walking back into the zone, or a
@@ -539,6 +656,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             {
                 EbmTrace.Step("cds batch end", drainedThisTick, string.Format(System.Globalization.CultureInfo.InvariantCulture, "frame {0}, {1:0.0} ms, queue left {2} (GameObjects destroy at the end of this frame)", Time.frameCount, _sw.Elapsed.TotalMilliseconds, _destroyQueue.Count + _solidQueue.Count));
                 EbmTrace.NoteDestroyActivity();
+                EbmTrace.Hf(EbmTrace.HfCds, drainedThisTick);   // 1.2.491 (A) [Hitch-EBM] counts
             }
             if (drainedThisTick > 0) { s_lastDrainCount = drainedThisTick; s_lastDrainFrame = Time.frameCount; if (arrivalDrain) s_cArrivalDrained += drainedThisTick; }   // 1.2.268
             s_lastLoose = s_drainLoose; s_lastSolid = s_drainSolid; s_drainLoose = s_drainSolid = 0;   // 1.2.280: what the next frame's cost belongs to
@@ -576,6 +694,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             _solidQueue.Clear();
             _destroyNow.Clear();
             _inQueue.Clear();
+            s_held.Clear();   // 1.2.494
             s_idleZone = new Vector2s(short.MinValue, short.MinValue); s_nextIdleScan = 0f;
             _destroyedSinceReport = 0;
             _reEarmarkSkippedSinceReport = 0;

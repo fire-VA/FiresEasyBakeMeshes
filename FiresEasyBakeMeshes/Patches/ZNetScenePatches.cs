@@ -29,17 +29,17 @@ namespace FiresEasyBakeMeshes.Patches
             var cfg = BepInEx.Bootstrap.Chainloader.PluginInfos.TryGetValue(FiresEasyBakeMeshesPlugin.PluginGUID, out var pi) && pi.Instance != null ? pi.Instance.Config : null;
             if (cfg == null) { yield return "[ebm_opt] EBM's config is not available"; yield break; }
             var keys = new List<BepInEx.Configuration.ConfigDefinition>();
-            foreach (var d in cfg.Keys) if (d.Section == "Optimize" && cfg[d] is BepInEx.Configuration.ConfigEntry<bool>) keys.Add(d);
+            foreach (var d in cfg.Keys) if (EbmConfigMove.CameFrom(d, "Optimize") && cfg[d] is BepInEx.Configuration.ConfigEntry<bool>) keys.Add(d);   // 1.2.444: the same keys as before the section move (their newest old home was [Optimize])
             if (string.Equals(key, "list", System.StringComparison.OrdinalIgnoreCase))
             {
-                var sb = new System.Text.StringBuilder("[ebm_opt] [Optimize] on/off keys:");
+                var sb = new System.Text.StringBuilder("[ebm_opt] on/off keys (formerly [Optimize]):");
                 foreach (var d in keys) sb.Append(' ').Append(d.Key).Append('=').Append(((BepInEx.Configuration.ConfigEntry<bool>)cfg[d]).Value ? "on" : "off").Append(' ').Append(When(d.Key)).Append(';');
                 yield return sb.ToString();
                 yield break;
             }
             BepInEx.Configuration.ConfigEntry<bool> entry = null;
             foreach (var d in keys) if (string.Equals(d.Key, key, System.StringComparison.OrdinalIgnoreCase)) { entry = (BepInEx.Configuration.ConfigEntry<bool>)cfg[d]; break; }
-            if (entry == null) { yield return $"[ebm_opt] no [Optimize] on/off key '{key}' (ebm_opt list shows them)"; yield break; }
+            if (entry == null) { yield return $"[ebm_opt] no on/off key '{key}' (formerly [Optimize]) (ebm_opt list shows them)"; yield break; }
             word = (word ?? "status").ToLowerInvariant();
             if (word == "on" || word == "off" || word == "true" || word == "false")
             {
@@ -351,6 +351,9 @@ namespace FiresEasyBakeMeshes.Patches
             EasyBake.RemoteItemZSyncSkip.Consider(__result);
             EasyBake.IdleGates.PauseOffScreen(__result);
             EasyBake.EbmParticleIdle.Consider(__result);   // [seasons] 11-09 E34 (key off)
+            // 1.2.463: a far building piece's real instance now exists: the far copy hands that piece off this frame (no-op unless far buildings cached the zone)
+            try { EasyBake.Far.FarBuildingDraw.NoteRealCreated(__result); }
+            catch (System.Exception e) { EasyBakeLog.Debug($"[FarBuildings] piece hand-off note failed: {e.GetType().Name}: {e.Message}"); }
 
             if (FiresEasyBakeMeshesPlugin.BatchingActive())
                 EasyBake.ZoneTracker.OnInstanceCreated(__result);

@@ -1,5 +1,69 @@
-## 1.2.262
+Requires Valheim 1.0.30 or newer.
 
+## 1.2.518
+
+Requires Valheim 1.0.30 or newer. On an older Valheim, stay on 1.2.442.
+
+**Your settings file:** updating never changes a saved setting.
+
+- Updated for Valheim 1.0.30, together with everything since 1.2.442:
+  - far trees placed exactly where the game grows them (on for new settings files)
+  - snow on baked buildings and roofs follows winter (with Vedr)
+  - faster loading: a zone is saved to the cache once and loads ready next time
+  - lower frame cost
+## 1.2.442
+
+**Your settings file:** updating never changes a saved setting.
+
+### Fixed
+- Arriving by portal near a dungeon no longer waits about 30 s. This needs Fires Fixes 0.1.171 or newer; without it, nothing changes.
+- Far buildings: more of the nearby town shows. Buildings not yet built are estimated at their real size, and the nearest one is always let in while there is room.
+
+### New
+- Building snow follows the snow amount from Vedr. This is only active with a Vedr version that has snow shape mode.
+- Optional, off by default:
+  - "Water Edge Cross Fade": a smooth blend where near water meets the far water plane, with no hard rim or flicker.
+  - "FAT Water Look": Fires Admin Terrain's lakes and rivers use EBM's water look when EBM draws the water.
+  - "Far Terrain Exact Seam": fixes the zigzag shoreline where far terrain meets near terrain.
+- Arrival log: when an arrival waits a long time, the log names the objects still to be created (top 10, with counts).
+
+## 1.2.434
+
+**Your settings file:** updating never changes a saved setting (the old "defaults now on" migrations are gone). Delete the config to get every new default.
+
+### New
+- GPU drawing is on by default: buildings, trees, rocks, bushes, grass and dungeon rooms are drawn by the graphics card in a few big batches, shadows included. It falls back to normal drawing by itself on a card or driver that can't run it.
+- Far trees are drawn as flat stand-ins out to the far view. Far rocks are optional (off).
+- Far buildings: only real build pieces, interiors left out, size cut with distance, kept while near; optional far-cache of merged buildings.
+- Distant terrain keeps its real biome colours (no black or grey far ground); optional EBM far ground (off).
+- Grass on the graphics card, distant flames sharing copies, lights that keep shadows only where they matter, signs past 30 m skip their text, dungeon insides not drawn from outside.
+- EBM's own water and terrain shaders, off by default. Water keeps the game's colour and lighting when on.
+- Console: `ebm_set`, `ebm_shaderuse`, `ebm_standitems`, `ebm_vanillapieces`, `ebm_heap`.
+
+### Faster
+- Nearest objects load first, then what's in front of you; terrain edits load first.
+- Leaving a big area clears faster; cache files are written off the main thread; less RAM and garbage.
+- The 5-second and 6-7-second hitches are gone. Point-light and far shadows draw far fewer objects.
+
+### Fixed
+- Doors, ovens, stations, portals and turrets are never baked, so they no longer freeze.
+- Buildings popping during load, a half bridge with no collision, bare ground patches, a teal smear with anti-aliasing.
+- Bare trees and white rocks after a Vedr season change; a missing crypt floor; duplicate fish.
+- Rock snow no longer twinkles; rocks get rain wetness.
+- The repeating "Thread group size" and "Collection was modified" errors.
+
+## 1.2.293
+### Fixed
+- Without Fires Unified Core installed, Easy Bake Meshes ran its diagnostic timers and checks every frame, costing frame time for most players. They now stay off unless you turn them on yourself, with or without Fires Unified Core.
+
+### New
+- Setting [Debugging] PerfCensus (off): turns on Easy Bake Meshes' own performance measurements and their log lines, for troubleshooting only.
+
+## 1.2.270
+### Fixed
+- With FarLands installed, EasyBakeMeshes wrote "stood down" to the log every frame and re-checked the mod list every frame, costing frame time. It now notes it once and does nothing more while FarLands draws the far buildings. Turning the far-buildings setting off and on makes it check again.
+
+## 1.2.262
 ### New
 - New GPU drawing path for baked buildings, rocks and trees ("Indirect Renderer", OFF by default). Instead of one draw per zone, the graphics card picks what is in view and in the sun's shadow and draws everything in a few calls. It needs the extra file `ebm_indirect` next to the DLL. Anything it can't handle is drawn the old way.
 - EasyBakeMeshes now has its own piece shader. It does the same wet look, winter snow and roof-dry look as the team's snow and weather mods, so baked pieces keep those looks without needing another mod.

@@ -37,13 +37,13 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static ConfigEntry<string> Exclude;
         internal static void Bind(ConfigFile config)
         {
-            On = config.Bind("Optimize", "GpuFires", /* on to test (lead 11-11) */ true,
+            On = EbmConfigMove.Bind(config, "21 - Performance - Lights, Fires And Sound", "GpuFires", /* on to test (lead 11-11) */ true,
                 "Torch and fire flames and smoke beyond GpuFiresNearM share a few running copies drawn on the graphics card, instead of each fire running its own. Lights, heat, fuel and sound stay the game's. Off = as before.");
-            NearM = config.Bind("Optimize", "GpuFiresNearM", 12f,
+            NearM = EbmConfigMove.Bind(config, "21 - Performance - Lights, Fires And Sound", "GpuFiresNearM", 12f,
                 new ConfigDescription("Fires closer than this many metres keep their own flames (the game's exact look up close).", new AcceptableValueRange<float>(0f, 100f)));
-            Phases = config.Bind("Optimize", "GpuFiresPhases", 8,
+            Phases = EbmConfigMove.Bind(config, "21 - Performance - Lights, Fires And Sound", "GpuFiresPhases", 8,
                 new ConfigDescription("How many differently-timed copies each kind of flame runs (more = less alike, a little more cost). Takes effect for fires loaded after the change.", new AcceptableValueRange<int>(1, 16)));
-            Exclude = config.Bind("Optimize", "GpuFiresExclude", "",
+            Exclude = EbmConfigMove.Bind(config, "21 - Performance - Lights, Fires And Sound", "GpuFiresExclude", "",
                 "Prefab names (comma separated) whose fires always stay the game's own.");
         }
         private static bool Wanted => On != null && On.Value && SystemInfo.graphicsDeviceType != GraphicsDeviceType.Null;   // never on a dedicated server
@@ -489,7 +489,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             s_countScratch.Clear();
             if (burning == s_lastBurning && shared == s_lastShared) return;
             s_lastBurning = burning; s_lastShared = shared;
-            EasyBakeLog.Info($"[GpuFires] {burning} burning fire(s) known: {shared} drawn shared beyond {Near:0} m, {burning - shared} by the game (near the camera, or their kind's templates not built yet)");
+            EasyBakeLog.InfoFirst("gpufires-burning", $"[GpuFires] {burning} burning fire(s) known: {shared} drawn shared beyond {Near:0} m, {burning - shared} by the game (near the camera, or their kind's templates not built yet)");
         }
 
         // 1.2.295: every 2 s, a safety net for a burning change no UpdateState showed (a fire object reactivated, a mod's own SetActive): lit systems off the

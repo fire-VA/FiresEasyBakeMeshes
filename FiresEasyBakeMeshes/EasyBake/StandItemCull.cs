@@ -23,12 +23,12 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            CullOn = config.Bind("Optimize", "StandItemCull", false /* OFF until gate ABBA (Fire's hard rule) */,
+            CullOn = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "StandItemCull", false /* OFF until gate ABBA (Fire's hard rule) */,
                 "Items hung on item stands farther away than StandItemDrawM are not drawn; they appear as you come closer. The stand itself always shows. Off = as before.");
-            DrawM = config.Bind("Optimize", "StandItemDrawM", 25f, new ConfigDescription("Hung items closer than this many metres are always drawn.", new AcceptableValueRange<float>(5f, 200f)));
-            ShadowOn = config.Bind("Optimize", "StandItemShadowCut", false /* OFF until gate ABBA */,
+            DrawM = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "StandItemDrawM", 25f, new ConfigDescription("Hung items closer than this many metres are always drawn.", new AcceptableValueRange<float>(5f, 200f)));
+            ShadowOn = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "StandItemShadowCut", false /* OFF until gate ABBA */,
                 "Items hung on item stands farther away than StandItemShadowM cast no shadow. Off = as before.");
-            ShadowM = config.Bind("Optimize", "StandItemShadowM", 12f, new ConfigDescription("Hung items closer than this many metres keep their shadow.", new AcceptableValueRange<float>(2f, 200f)));
+            ShadowM = EbmConfigMove.Bind(config, "22 - Performance - Grass, Stands And Signs", "StandItemShadowM", 12f, new ConfigDescription("Hung items closer than this many metres keep their shadow.", new AcceptableValueRange<float>(2f, 200f)));
             CullOn.SettingChanged += (_, __) => { if (!CullOn.Value) RestoreAll(cull: true, shadow: false); };
             ShadowOn.SettingChanged += (_, __) => { if (!ShadowOn.Value) RestoreAll(cull: false, shadow: true); };
         }

@@ -29,7 +29,8 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             if (wnt == null) return false;
             if (_cache.TryGetValue(wnt, out var cached)) return cached;
-            bool result = HasNegativeHealth(wnt) || AllImmune(wnt.m_damages);
+            bool result;
+            using (EbmPatchMarkers.InvulnerableJudge.Auto()) result = HasNegativeHealth(wnt) || AllImmune(wnt.m_damages);   // next EBM: profiler marker only (cache miss)
             _cache[wnt] = result;
             return result;
         }
@@ -40,11 +41,22 @@ namespace FiresEasyBakeMeshes.EasyBake
         public static bool CanSkipWear(WearNTear wnt)
         {
             if (wnt == null) return false;
+            // 1.2.498 ([lead] 11-22, Fire shots 243-245, [seasons]' dry run: 7 shovel-held stairs at Raven's Rest, 0 stored snow, mound still drawn): vanilla hides a
+            // piece's snow mound only in UpdateSnowVisual, which runs at the end of UpdateWear (WearNTear.cs:493-495 -> :869), at Awake and in ChangeSnow. A writer
+            // that zeroes the build-up without that refresh (Vedr's shovel hold, its PieceSnowVanilla.cs:295) leaves the mound on, and skipping UpdateWear here took
+            // away the last refresh, so it stayed until a relog. While any snow mound child is drawn, the piece keeps its wear visits (one is enough to hide it).
+            // Checked BEFORE the cache: a cached "skip" must not freeze a visible mound. Three activeSelf reads per call.
+            if (SnowMoundShown(wnt)) return false;
             if (_skipWear.TryGetValue(wnt, out var cached)) return cached;
-            bool result = DecideSkipWear(wnt);
+            bool result;
+            using (EbmPatchMarkers.WearSkipJudge.Auto()) result = DecideSkipWear(wnt);   // next EBM: profiler marker only (cache miss; the hit path is not wrapped, see BakeFrameSplit.cs)
             _skipWear[wnt] = result;
             return result;
         }
+
+        // 1.2.498: a snow mound (vanilla's m_snow / m_snowWorn / m_snowBroken children) is drawn on this piece right now
+        private static bool SnowMoundShown(WearNTear wnt) =>
+            (wnt.m_snow != null && wnt.m_snow.gameObject.activeSelf) || (wnt.m_snowWorn != null && wnt.m_snowWorn.gameObject.activeSelf) || (wnt.m_snowBroken != null && wnt.m_snowBroken.gameObject.activeSelf);
 
         private static bool DecideSkipWear(WearNTear wnt)
         {
@@ -78,6 +90,7 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         private static void OnSeasonChanged(int season, int stage)
         {
+            using (EbmPatchMarkers.WearSkipSeason.Auto())   // next EBM: profiler marker only
             try
             {
                 s_recheck.Clear();
@@ -111,6 +124,41 @@ namespace FiresEasyBakeMeshes.EasyBake
         }
 
         public static void Reset() { _cache.Clear(); _skipWear.Clear(); }
+
+        // ---- 1.2.492 [WearSkip] census ([visual], [lead] GO 11-22: step 0 of "switch WearNTear off for invulnerable pieces", Tools\_visual_drafts_20261122\ebm_wearntear_disable_design.txt) ----
+        // Read-only, Debug only, every 30 s: how many live pieces the wear skip judged and how many it can skip NOW (season / snow), so the disable is
+        // sized before it is built. Counts only the skip cache (filled by the UpdateWear / UpdateCover prefixes); it judges nothing new and changes nothing.
+        private static float s_nextCensus;
+        private static readonly List<WearNTear> s_censusScratch = new List<WearNTear>();
+        internal static void CensusTick()   // Plugin.LateUpdateInner, every frame: one key read while [90] WearSkipCensus is off (the default)
+        {
+            // [2ic] MUST: Fire records Debug in normal play, so the walk is behind its own key (default off; the rig sets it), never on Debug alone
+            var key = FiresEasyBakeMeshesPlugin.WearSkipCensus; if (key == null || !key.Value) return;
+            if (Time.unscaledTime < s_nextCensus) return;
+            s_nextCensus = Time.unscaledTime + 30f;
+            if (!EasyBakeLog.DebugOn()) return;
+            using (EbmPatchMarkers.WearSkipCensus.Auto())   // next EBM: profiler marker only (past the key, timer and Debug gates)
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                int live = WearNTear.GetAllInstances().Count;
+                int judged = 0, skip = 0, skipNeg = 0, skipImmune = 0, run = 0, runSnow = 0, gone = 0;
+                s_censusScratch.Clear(); s_censusScratch.AddRange(_skipWear.Keys);
+                foreach (var wnt in s_censusScratch)
+                {
+                    if (wnt == null) { gone++; continue; }
+                    judged++;
+                    bool neg = HasNegativeHealth(wnt);
+                    if (_skipWear[wnt]) { skip++; if (neg) skipNeg++; else skipImmune++; }
+                    else { run++; if (neg && (AllImmuneWear == null || !AllImmuneWear.Value)) runSnow++; }   // invulnerable, still running = its snow builds now
+                }
+                s_censusScratch.Clear();
+                EasyBakeLog.Debug($"[WearSkip] live WearNTear {live}; judged by the wear skip {judged} ({gone} destroyed entries); can skip now {skip} "
+                    + $"(negative health {skipNeg}, all-immune {skipImmune}); run vanilla wear {run}, of them invulnerable but snow builds now {runSnow}; "
+                    + $"census {sw.Elapsed.TotalMilliseconds:0.00} ms (1.2.492 step 0, read-only)");
+            }
+            catch (System.Exception ex) { EasyBakeLog.Debug("[WearSkip] census failed: " + ex.Message); }
+        }
 
         private static bool HasNegativeHealth(WearNTear wnt)
         {

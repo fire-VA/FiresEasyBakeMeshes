@@ -26,6 +26,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             public bool Dirty = true, Drawn, Evicted; public int Generation; public bool JobOut;
             public int PrepZone, PrepPiece; public FarJob Prep; public Dictionary<long, FarJob.Bucket> PrepBuckets; public Dictionary<Material, int> PrepMats;
             public bool WaitingSource; public float HoldUntil = -1f; public bool ShownKnown, Shown;   // 1.2.249: the chunks' state, so an unchanged target touches no GameObject
+            public float SyncKeepUntil = -1f;   // 1.2.484 [2ic] SHOULD 1: Far Zone Sync keeps a drawn target dropped by a band step until its replacement draws (cap 60 s)
             public List<GameObject> Chunks = new List<GameObject>(); public int Verts; public long Bytes;
             public FarIndexRanges.Table Runs;   // [Optimize] FarIndexRanges: the drawn chunks' per-piece index ranges (null = not tracked)
             public bool Retained; public float RetainedAt;
@@ -36,6 +37,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             public int SplitBuilt = -1, PrepSplit = -1;
             public float Rank; public int Est, EstAt = -1;   // 1.2.432: cap order (lower first) and the cached vertex estimate   // 1.2.429: pieces in the built / in-prep split copy of a loaded zone (-1 = a full copy)   // 1.2.428: when its merged-cache read went out (a read older than 10 s is asked again)   // 1.2.428: live far snow (eased) and the value last set on its chunks (-1 = new chunks, set at the next pass): a LOADED zone on the edge of the loaded area, built ahead and hidden so it is ready the moment it unloads
             public float AdmittedAt;   // 1.2.355: when Plan first admitted this target (the moving backlog line's oldest-unbuilt age)
+            public ulong SplitSigBuilt, PrepSig;   // 1.2.463: membership signature of the built split copy / the sum being gathered (SigOf)
+            public bool WaitRebuild; public int WaitSince;   // 1.2.463: hidden whole because a real piece in it now draws and it has no index ranges; Time.frameCount it began
+            public HashSet<long> InKeys;   // 1.2.463: a split copy built without runs: the pieces it holds (StandKey)
+            public bool FreshNear; public long BuildTicks;   // 1.2.463 measure: built fresh because the merged cache is skipped near the loaded area; its main-thread ticks (prep + upload)
             public float EvictedAt;   // [Optimize] FarCapHysteresis: when the vertex cap last evicted it (quiet time before it may return)   // [Optimize] FarKeepHandedOff: handed off, hidden, kept for a quick re-show (FarBuildingDrawHandoff.cs)
         }
 
@@ -46,6 +51,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static float s_nextDrawnCensus;
         private static int s_capBuilt, s_capEst;   // 1.2.346: last cap pass: built targets over the cap / unbuilt targets held back by estimate
         private static int s_coarseSmallOut;   // 1.2.353: pieces left out of coarse cells for size, this 30 s window
+        private static int s_prepResumed, s_prepResumedTotal;   // 1.2.476: half-gathered targets re-queued by Plan (this pass / session)
         internal static int ColdTargets { get; private set; }   // 1.2.346: admitted far targets not built yet (set by Plan, every 2 s)
         internal static void DrawnCensus()
         {
@@ -216,6 +222,93 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (FarSnow.Active && FarSnow.CoverAt(piece.Pos) > 0f) return piece.Cap;
             return 0;
         }
+        // ── 1.2.468 far snow LAYER ([visual], Fire 11-19 "bakes have no use for snow layers that are meant to change constantly") ──────────────────────
+        // With a far snow class registered (EbmApi.RegisterFarPieceSnowShapeSource, FarSnow.Layer), a far copy merges NO vanilla cap meshes and bakes no
+        // amount: each body part buckets by its piece's static code = the owner's class (1 winter ground / 3 snow base, at full openness) x EBM's own shelter
+        // (open 1 / roofed 0, from the copy's geometry: ShelterOf), in the near shape encoding (0 / 0..1 / 2..3, EbmApi.SetPieceSnowShape). The chunk carries
+        // it in FarChunk.Snow as LayerFlag | code (code = encoded x 2 + 1, so 1, 2 and 3 stay apart from "no snow" 0); the owner's piece shader turns it
+        // into snow with its live amount. A ZDO scan, SnowFeed or a far snow revision no longer changes a layer copy (its key ignores the cap levels).
+        internal const byte LayerFlag = 0x80;
+        internal const string LayerChunkName = "FarBuildings chunk layer";
+        private static int s_capsLayer, s_layerSnowy, s_layerRoofed, s_layerPlain;
+        internal static string TakeLayerCounts() { string s = $"snow layer: {s_capsLayer} vanilla cap part(s) left out, pieces {s_layerSnowy} open / {s_layerRoofed} roofed / {s_layerPlain} no snow class"; s_capsLayer = s_layerSnowy = s_layerRoofed = s_layerPlain = 0; return s; }
+        internal static float LayerEncoded(byte snow) => (snow & LayerFlag) == 0 ? 0f : ((snow & 0x7F) - 1) * 0.5f;   // FarChunk.Snow -> the near shape encoding
+        // chunk object name: LiveSnow skips cap and layer chunks by it (1.2.428 pattern)
+        internal static string ChunkName(FarChunk c) => (c.Snow & LayerFlag) != 0 ? LayerChunkName + " " + (char)('0' + (c.Snow & 0x7F)) : c.Snow > 0 ? CapChunkName : "FarBuildings chunk";   // a layer chunk's code (1-7) rides its name for LiveSnow
+        // a new or pooled chunk's property block: cap = its _SnowLevel / cover (1.2.262); layer = its code as the owner's piece shader reads a live piece's
+        // class x shelter (_VedrSnowCover, PieceSnowDriver 0.8.272 encoding; EBM's own piece shader name too); body = none (LiveSnow sets it)
+        internal static void ChunkBlock(Renderer r, FarChunk c)
+        {
+            if (r == null) return;
+            if (s_mpb == null) s_mpb = new MaterialPropertyBlock();
+            if ((c.Snow & LayerFlag) != 0)
+            {
+                float enc = LayerEncoded(c.Snow);
+                if (!FarSnow.OwnerShapeActive) enc = 0f;   // not decoded by the owner's shader: LiveSnow writes cover x openness within a second
+                s_mpb.Clear(); s_mpb.SetFloat(FarSnow.LegacySnowCoverId, enc); s_mpb.SetFloat(FarSnow.SnowCoverId, enc); r.SetPropertyBlock(s_mpb);
+                s_layerChunks++;
+                return;
+            }
+            if (c.Snow > 0) { s_mpb.Clear(); s_mpb.SetFloat(FarSnow.SnowCoverId, c.Snow / 4f); s_mpb.SetFloat(FarSnow.LegacySnowCoverId, c.Snow / 4f); s_mpb.SetFloat(SnowLevelId, c.Snow / 4f); r.SetPropertyBlock(s_mpb); return; }
+            r.SetPropertyBlock(null);
+        }
+        private static int s_layerChunks;
+
+        private static byte LayerCode(FarZone fz, FarPiece piece, FarSource src)
+        {
+            float cls = FarSnow.ClassAt(piece.Pos);
+            if (cls <= 0f) { s_layerPlain++; return 0; }
+            bool roofed = ShelterOf(fz, piece, src) < 0.5f;
+            if (roofed) s_layerRoofed++; else s_layerSnowy++;
+            float enc = cls >= 2f ? (roofed ? 2f : 3f) : (roofed ? 0f : 1f);   // snow base keeps its class when roofed (2 = base, shelter 0); winter ground roofed = no snow
+            if (enc <= 0f) return 0;
+            return (byte)(Mathf.RoundToInt(enc * 2f) + 1);   // 1 -> 3, 2 -> 5, 3 -> 7
+        }
+
+        // Shelter from the copy's own geometry: per zone, a 2 m grid of the highest piece top over each cell (from the digest and the far sources' bounds),
+        // rebuilt when the zone's fingerprint changes. A piece is roofed when something in its zone stands over its centre more than RoofGap above its own top.
+        // A piece over a zone edge reads only its own zone (UNCONFIRMED effect: a roof crossing a zone edge can leave a strip open); the near view is exact.
+        private const float ShelterCell = 2f, RoofGap = 0.5f;
+        private const int ShelterN = 32;   // 64 m / 2 m
+        private sealed class ShelterGrid { public ulong Print; public float[] Top = new float[ShelterN * ShelterN]; }
+        private static readonly Dictionary<Vector2s, ShelterGrid> s_shelter = new Dictionary<Vector2s, ShelterGrid>();
+        private static void TopBox(FarPiece p, FarSource src, out Vector3 min, out Vector3 max)
+        {
+            Vector3 c = p.Pos + p.Rot * src.LocalBounds.center, e = src.LocalBounds.extents;
+            Matrix4x4 r = Matrix4x4.Rotate(p.Rot);
+            Vector3 w = new Vector3(Mathf.Abs(r.m00) * e.x + Mathf.Abs(r.m01) * e.y + Mathf.Abs(r.m02) * e.z,
+                                    Mathf.Abs(r.m10) * e.x + Mathf.Abs(r.m11) * e.y + Mathf.Abs(r.m12) * e.z,
+                                    Mathf.Abs(r.m20) * e.x + Mathf.Abs(r.m21) * e.y + Mathf.Abs(r.m22) * e.z);
+            min = c - w; max = c + w;
+        }
+        private static float ShelterOf(FarZone fz, FarPiece piece, FarSource src)
+        {
+            if (fz == null || src == null || !src.HasBounds) return 1f;
+            if (!s_shelter.TryGetValue(fz.Zone, out var g))
+            {
+                if (s_shelter.Count >= 4096) s_shelter.Clear();   // bounded (~4 KB a zone, at most ~16 MB): a long trip starts the grids over, they rebuild on demand
+                g = new ShelterGrid { Print = ~fz.Print }; s_shelter[fz.Zone] = g;
+            }
+            Vector3 o = ZoneSystem.GetZonePos(fz.Zone) - new Vector3(ZoneSystem.c_ZoneSizeHalf, 0f, ZoneSystem.c_ZoneSizeHalf);
+            if (g.Print != fz.Print)
+            {
+                g.Print = fz.Print;
+                for (int i = 0; i < g.Top.Length; i++) g.Top[i] = float.NegativeInfinity;
+                foreach (var p in fz.Pieces)
+                {
+                    var s = FarBuildingSources.Get(p.Prefab);
+                    if (s == null || !s.HasBounds) continue;   // a source not ready yet: left out of the grid (it rebuilds with the copy when it lands)
+                    TopBox(p, s, out var mn, out var mx);
+                    int x0 = Mathf.Clamp(Mathf.FloorToInt((mn.x - o.x) / ShelterCell), 0, ShelterN - 1), x1 = Mathf.Clamp(Mathf.FloorToInt((mx.x - o.x) / ShelterCell), 0, ShelterN - 1);
+                    int z0 = Mathf.Clamp(Mathf.FloorToInt((mn.z - o.z) / ShelterCell), 0, ShelterN - 1), z1 = Mathf.Clamp(Mathf.FloorToInt((mx.z - o.z) / ShelterCell), 0, ShelterN - 1);
+                    for (int z = z0; z <= z1; z++) for (int x = x0; x <= x1; x++) { int k = z * ShelterN + x; if (mx.y > g.Top[k]) g.Top[k] = mx.y; }
+                }
+            }
+            TopBox(piece, src, out var pmn, out var pmx);
+            int cx = Mathf.Clamp(Mathf.FloorToInt((piece.Pos.x - o.x) / ShelterCell), 0, ShelterN - 1), cz = Mathf.Clamp(Mathf.FloorToInt((piece.Pos.z - o.z) / ShelterCell), 0, ShelterN - 1);
+            return g.Top[cz * ShelterN + cx] > pmx.y + RoofGap ? 0f : 1f;
+        }
+
         /// <summary>1.2.259 (SnowFeed.Refresh): every far target re-preps, so its chunks take the snow level read now.</summary>
         internal static void MarkSnowDirty() { foreach (var t in s_targets.Values) t.Dirty = true; }
         private static float s_snowCheckAt;
@@ -262,8 +355,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
             // Hand-off first (cheap), then uploads, then prep with what is left.
             long t0 = Stopwatch.GetTimestamp();
+            HandOffPieces();   // 1.2.463: per piece, this frame (FarRunner runs at execution order 31000, after ZNetScene's own Update created this frame's objects)
             // 1.2.249: the walk over every drawn target four times a second; a hold of 10 s does not need it each frame
-            if (!QuietPolling || Time.unscaledTime >= s_nextHandOff) { s_nextHandOff = Time.unscaledTime + 0.25f; HandOff(); ResolvePending(); FarIndexRanges.Tick(); FarZoneGrid.MaybeLog(); LogRequeues(); LogHandoffAndDiscipline(); FarCapPool.Tick(); FarMergedCache.MaybeLog(); InfoCensus(); }
+            if (!QuietPolling || Time.unscaledTime >= s_nextHandOff) { s_nextHandOff = Time.unscaledTime + 0.25f; HandOff(); ResolvePending(); FarIndexRanges.Tick(); FarZoneGrid.MaybeLog(); LogRequeues(); LogHandoffAndDiscipline(); FarCapPool.Tick(); FarMergedCache.MaybeLog(); InfoCensus(); PruneStand(); LogPieceHandoff(); }
             FarBuildings.S.HandoffTicks += Stopwatch.GetTimestamp() - t0;
 
             t0 = Stopwatch.GetTimestamp();
@@ -440,6 +534,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         internal const string CapChunkName = "FarBuildings chunk cap";
         private static float s_liveSnowAt; private static int s_snowBumps, s_liveSnowSets;
         private static MaterialPropertyBlock s_liveMpb;
+        private static readonly MaterialPropertyBlock s_layerMpb = new MaterialPropertyBlock();   // 1.2.468
+        private static bool s_layerShapeSent;   // 1.2.468: the owner's shape state the layer chunks were last written for
         private static void LiveSnow()
         {
             float now = Time.unscaledTime;
@@ -448,6 +544,10 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             s_liveSnowAt = now + 1f;
             bool active = FarSnow.Active;
             if (s_liveMpb == null) s_liveMpb = new MaterialPropertyBlock();
+            // 1.2.468: layer chunks carry the shape while the owner's piece shader decodes it (VedrApi.PieceShapeActive, what Vedr itself does for a live
+            // piece), else the old 0..1 cover x the chunk's openness. A flip of that state resends every target once.
+            bool shapeOn = FarSnow.OwnerShapeActive;
+            if (shapeOn != s_layerShapeSent) { s_layerShapeSent = shapeOn; foreach (var t0 in s_targets.Values) t0.SnowSent = -1f; }
             foreach (var t in s_targets.Values)
             {
                 if (!t.Drawn || t.Chunks.Count == 0) continue;
@@ -460,6 +560,16 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 foreach (var go in t.Chunks)
                 {
                     if (go == null || go.name == CapChunkName) continue;
+                    if (go.name.StartsWith(LayerChunkName, StringComparison.Ordinal))
+                    {
+                        // 1.2.468: the chunk's code rides its name ("... layer N"): shape mode = the code as is; else cover x open (1, 3 open; 2 = a roofed snow base)
+                        byte code = (byte)(go.name.Length > LayerChunkName.Length + 1 ? go.name[go.name.Length - 1] - '0' : 0);
+                        float enc = code > 0 ? (code - 1) * 0.5f : 0f;
+                        float v = shapeOn ? enc : (enc == 1f || enc == 3f ? t.SnowNow : 0f);
+                        var lr = go.GetComponent<Renderer>();
+                        if (lr != null) { s_layerMpb.Clear(); s_layerMpb.SetFloat(FarSnow.LegacySnowCoverId, v); s_layerMpb.SetFloat(FarSnow.SnowCoverId, v); lr.SetPropertyBlock(s_layerMpb); s_liveSnowSets++; }
+                        continue;
+                    }
                     var r = go.GetComponent<Renderer>(); if (r != null) { r.SetPropertyBlock(s_liveMpb); s_liveSnowSets++; }
                 }
             }
@@ -581,26 +691,383 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         // game still draws is never in the copy. So the copy is never hidden for its zone being loaded, never doubles a real piece, and covers every culled one.
         // An unloaded zone's copy holds every piece, as before. The keep / edge pre-build paths become idle for loaded zones (their copies are simply shown).
         private const float SplitMargin = 16f;   // a piece joins the copy 16 m past its LOD cull, so the two never draw at once at the boundary
-        private static bool PieceRealDrawn(FarPiece p)
+        private static bool PieceRealDrawn(FarPiece p) => PieceRealDrawnAt(p.Prefab, p.Pos);
+        private static bool PieceRealDrawnAt(int prefab, Vector3 pos)   // 1.2.463: by prefab + position (the per-run hand-off has no FarPiece)
         {
             float k = LodK(); if (k <= 0f) return true;
-            float u = FarBuildingDigest.Classify(p.Prefab).LodU;
+            float u = FarBuildingDigest.Classify(prefab).LodU;
             if (float.IsPositiveInfinity(u)) return true;   // never culled by the game: always the real piece
-            return (p.Pos - s_lodCam).magnitude <= u * k + SplitMargin;
+            return (pos - s_lodCam).magnitude <= u * k + SplitMargin;
         }
-        private static int CountSplit(Target t)
+
+        // ── 1.2.463 PER-PIECE HAND-OFF ([visual]; Fire: snow flicker on arrival that "settles after moving": "hide each far copy part the instant its real piece draws").
+        // 1.2.429's split copy left out the pieces whose real LOD is NOT culled, but only when the copy was REBUILT: Plan compared the culled-piece COUNT (CountSplit vs
+        // SplitBuilt, every 2 s / 64 m / dirty), then prep + merge + upload + swap. Until then a stale copy (a full copy from before the zone loaded, or a split copy built
+        // while a piece was still culled) drew the piece AND its merged snow cap on the same spot as the real piece and Vedr's cap; RealDrawing() was always false, so
+        // HandOff never hid it, and a count misses one-in / one-out. Now:
+        //  - a piece counts as the game's own ("real has it") when its zone is loaded, it is inside its real LOD window (PieceRealDrawn, the 16 m margin as before),
+        //    AND its real piece stands: an instance exists or it is a skipped piece drawn by its group (PieceStands, the hand-off's own proof). So a piece whose instance
+        //    is not created yet stays in the copy (no gap), and one that stands leaves it;
+        //  - zone copies near / inside the loaded area record per piece its index range (FarIndexRanges runs, "Usable": not latched, whatever the key). The frame a real
+        //    piece stands (ZNetScene.CreateObject postfix -> NoteRealCreated, a 2 m camera move, or the 0.25 s refresh for skipped pieces), that piece's ranges in the
+        //    copy are zeroed (body and cap parts alike: one run per piece, FarBuildingDraw.Prep), and Plan is asked right away to rebuild the copy without it;
+        //  - a copy without ranges (ranges latched / no readback, or a far copy from the merged cache) that holds such a piece is hidden WHOLE (RealDrawing = true)
+        //    and rebuilt at once, first in the prep queue; the rebuilt copy is shown on upload (checked again before it shows);
+        //  - Plan rebuilds a split copy when its membership signature (sum of the held pieces' keys + count) changes, not the count.
+        private const float StandRefresh = 0.25f;   // a zone's standing set is read again after this (skipped pieces whose group starts drawing, destroyed instances)
+        private const float HandMove = 2f;          // camera metres between passes: a piece joins the copy 16 m past its LOD cull, so a pass always lands well before overlap
+        private const float ZoneHalfDiag = 46f, CellHalfDiag = 363f;   // 64 m and 512 m squares
+        // Old: the previous read's set (swapped, so no allocation). Frame: Time.frameCount of the last read (-1 = never read). SkipNew (measure): skipped pieces (no instance)
+        // that stand and sit inside their LOD window at this read but did not stand at the previous one -> the earliest frame they can have started drawing (previous read + 1)
+        // EventFrame (1.2.467): the frame EBM's own baked groups of this zone started drawing (ZoneTracker full walk), -1 = none since the last read
+        // EventDue (1.2.472): a draw-start event came in since the last read: the next StandingIn reads the zone again (once, however many events), its set is reused otherwise
+        private sealed class ZoneStand { public float At = -1f; public int Frame = -1; public int EventFrame = -1; public bool EventDue; public HashSet<long> Keys = new HashSet<long>(), Old = new HashSet<long>(); public readonly Dictionary<long, int> SkipNew = new Dictionary<long, int>(); }
+        private static readonly Dictionary<Vector2s, ZoneStand> s_stand = new Dictionary<Vector2s, ZoneStand>();
+        private static readonly List<ZDO> s_standBuf = new List<ZDO>();
+        private static readonly List<Vector2s> s_standDrop = new List<Vector2s>();
+        // s_handDirty: a FULL pass is due (start / Clear). 1.2.472 ([visual], lead GO 11-19; Fire's HandTest town arrival client.log:21914 / :23469: "range tracking main thread
+        // ... avg 13.177 / 8.915 ms/frame", "19734 / 46802 piece(s) skipped at creation"): a piece event (created, skipped at creation, a zone's baked groups starting to draw)
+        // no longer asks for a full pass over every copy's table; it marks its ZONE, and the next pass (this frame) scans only the copies holding a marked zone, and in them
+        // only that zone's pieces. The 2 m camera move and the 0.25 s tick still run the full pass (the backstop), as before.
+        private static bool s_handDirty = true; private static float s_handAt; private static Vector3 s_handCam = new Vector3(float.MaxValue, 0, 0);
+        private static readonly HashSet<Vector2s> s_handZones = new HashSet<Vector2s>();
+        private static int p_fullPasses, p_zonePasses, p_tablesScanned, p_standReads;   // 1.2.472 measure
+        private static float s_nearReach;   // set by Plan: targets whose area may hold a loaded zone, and zone targets built with runs (loaded edge x 1.4143 + 128 m)
+        private static int p_pieceHandoffs, p_wholeHides, p_memberRebuilds, p_runsPrebuilds, p_waitEnded, p_waitWorst; private static long p_waitFrames;
+        private static float s_nextPieceLog;
+
+        // a piece's identity on both sides (digest piece / live ZDO): prefab + position to 0.1 m, the digest's own held-scan key (FarBuildingDigest.PieceKey)
+        internal static long StandKey(int prefab, Vector3 p) =>
+            ((long)prefab * 73856093L) ^ ((long)Mathf.RoundToInt(p.x * 10f) * 19349663L) ^ ((long)Mathf.RoundToInt(p.y * 10f) * 83492791L) ^ ((long)Mathf.RoundToInt(p.z * 10f) * 2654435761L);
+        // the far prefab id of a ZDO exactly as the digest scan takes it (FarBuildingDigest.ScanZone: a baked blueprint enters as its bake id)
+        private static int FarPrefabOf(ZDO zdo)
         {
-            int n = 0;
+            int h = zdo.GetPrefab();
+            if (h == FarBakeSources.BakeParentHash) { int bake = FarBakeSources.IdFor(zdo); if (bake != 0) h = bake; }
+            return h;
+        }
+        // the far pieces of zone z whose real piece stands now (cached StandRefresh; NoteRealCreated adds new instances at once)
+        private static HashSet<long> StandingIn(Vector2s z)
+        {
+            if (!s_stand.TryGetValue(z, out var st)) { st = new ZoneStand(); s_stand[z] = st; }
+            float now = Time.unscaledTime;
+            if (st.At >= 0f && now - st.At < StandRefresh && !st.EventDue) return st.Keys;
+            st.EventDue = false; p_standReads++;   // 1.2.472
+            long tRead = Stopwatch.GetTimestamp();   // 1.2.463 measure (counted here only when no timed hand-off pass is around it)
+            int prevFrame = st.Frame; bool firstRead = prevFrame < 0;
+            // 1.2.467: a read forced by the zone's draw-start event: its skipped pieces cannot have started drawing before that frame (measure only)
+            int skipFrom = st.EventFrame > prevFrame ? st.EventFrame : prevFrame + 1; st.EventFrame = -1;
+            var swap = st.Old; st.Old = st.Keys; st.Keys = swap;
+            st.At = now; st.Frame = Time.frameCount; st.Keys.Clear(); st.SkipNew.Clear();
+            var scene = ZNetScene.instance; var man = ZDOMan.instance;
+            if (scene == null || man == null) return st.Keys;
+            int why = s_blockWhy; bool anySkipped = s_anySkippedProof;   // PieceStands writes AllInstanced's census fields: kept as they were
+            s_standBuf.Clear();
+            man.FindSectorObjects(z, s_oneSector, s_standBuf, null);
+            foreach (var zdo in s_standBuf)
+            {
+                if (zdo == null || !zdo.IsValid()) continue;
+                int prefab = FarPrefabOf(zdo);
+                if (!FarBuildingDigest.Classify(prefab).Draw) continue;
+                bool inst = scene.FindInstance(zdo) != null;
+                if (!inst && !PieceStands(zdo, scene)) continue;
+                Vector3 pos = zdo.GetPosition();
+                long key = StandKey(prefab, pos);
+                st.Keys.Add(key);
+                // measure: a skipped piece (no instance, so no create event) newly standing inside its LOD window: only this refresh can have found it
+                if (!inst && !st.Old.Contains(key) && PieceRealDrawnAt(prefab, pos)) { if (firstRead) p_skipFirstRead++; else st.SkipNew[key] = skipFrom; }
+            }
+            s_standBuf.Clear();
+            s_blockWhy = why; s_anySkippedProof = anySkipped;
+            if (!s_inHandTimer) NoteRangeTicks(Stopwatch.GetTimestamp() - tRead);
+            return st.Keys;
+        }
+        // "real has it": zone loaded (the caller checks), inside the real LOD window, and the real piece stands
+        private static bool RealHasIt(Vector2s z, int prefab, Vector3 pos) => PieceRealDrawnAt(prefab, pos) && StandingIn(z).Contains(StandKey(prefab, pos));
+
+        /// <summary>1.2.463: ZNetScene.CreateObject postfix. A far piece's real instance now exists: its zone's standing set gets it and the hand-off runs this frame.</summary>
+        internal static void NoteRealCreated(GameObject go)
+        {
+            if (s_stand.Count == 0 || go == null) return;   // no loaded zone asked about yet (or far buildings off: Clear empties it)
+            var nv = go.GetComponent<ZNetView>(); var zdo = nv != null ? nv.GetZDO() : null;
+            if (zdo == null || !zdo.IsValid()) return;
+            Vector3 pos = zdo.GetPosition();
+            var z = ZoneSystem.GetZone(pos);
+            if (!s_stand.TryGetValue(z, out var st) || st.At < 0f) return;   // a zone not cached reads its set when first asked
+            int prefab = FarPrefabOf(zdo);
+            if (!FarBuildingDigest.Classify(prefab).Draw) return;
+            st.Keys.Add(StandKey(prefab, pos));
+            s_handZones.Add(z);   // 1.2.472: this zone's pieces only (was s_handDirty: a full pass)
+        }
+
+        // ── 1.2.467 ([visual], lead GO 11-19; Fire's HandTest 13:48 snow flash: f_001-f_003 shards on the fire-pit floor, f_004 clean; client.log:42974-42975
+        // "skipped-piece gap ... 16380 piece(s), avg 5.1, worst 9 frame(s)"). A skipped piece has no instance, so no create event: only the 0.25 s StandingIn refresh
+        // found it standing, and until then the far copy (body + merged cap) drew on the same spot as EBM's baked group. EBM draws those groups itself, so the two
+        // moments a skipped piece starts drawing are known exactly and now hand off on that frame:
+        //  - a zone's baked groups start drawing (ZoneTracker.DrawInstances' full walk: the zone passes its draw gate for the first walk since it last failed it);
+        //    its standing set is read again and a hand-off pass runs right after the walk, in the same LateUpdate, before anything renders;
+        //  - a piece is skipped at creation into a zone whose groups already draw it (ZoneTracker.TrySkipCreation): its key joins the standing set like NoteRealCreated.
+        // The 0.25 s refresh stays as the backstop. Measure: the skipped gap counts from the event frame, so the proof line reads "worst 0 frame(s)".
+        private static bool s_drawEventPending;
+        internal static void NoteBakedZoneDrawing(Vector2s ebmZone)
+        {
+            if (s_stand.Count == 0) return;   // no copy has asked about a loaded zone yet (or far buildings off)
+            var z = ZoneSystem.GetZone(EbmZones.Pos(ebmZone));   // the same 64 m key on a normal world; a ring world is caught by the refresh as before
+            if (!s_stand.TryGetValue(z, out var st) || st.At < 0f) return;   // a zone not read yet reads its set when first asked
+            // 1.2.472: the next StandingIn reads it again once (EventDue; At / Frame kept, so it is not a "first read" and the set stays usable by the create events)
+            st.EventDue = true; st.EventFrame = Time.frameCount;
+            s_handZones.Add(z);
+            s_drawEventPending = true;
+        }
+        /// <summary>ZoneTracker.DrawInstances, after a full walk that started any zone drawing: one hand-off pass now, before this frame renders.</summary>
+        internal static void FlushBakedDrawing()
+        {
+            if (!s_drawEventPending) return;
+            s_drawEventPending = false;
+            if (s_targets.Count == 0) return;
+            if (s_handZones.Count == 0) return;   // 1.2.472: every marked zone already had its pass this frame
+            long t0 = Stopwatch.GetTimestamp();
+            LodK();
+            ZonePass();   // 1.2.472: the zones whose groups started drawing (and any other marked since this frame's Update pass), not every copy
+            p_drawEventPasses++;
+            NoteRangeTicks(Stopwatch.GetTimestamp() - t0);
+        }
+        // 1.2.472: one pass over the copies that hold a marked zone, each scanning only the marked zones' pieces; the marks are cleared
+        private static void ZonePass()
+        {
+            s_inHandTimer = true;
+            foreach (var t in s_targets.Values) HandOffTarget(t, s_handZones);
+            s_inHandTimer = false;
+            s_handZones.Clear();
+            p_zonePasses++;
+        }
+        private static int p_drawEventPasses, p_skipAtCreate;
+        /// <summary>ZoneTracker.TrySkipCreation: a piece just skipped (no instance) that its zone's drawing group already draws.</summary>
+        internal static void NoteSkippedCreated(ZDO zdo)
+        {
+            if (s_stand.Count == 0 || zdo == null || !zdo.IsValid()) return;
+            Vector3 pos = zdo.GetPosition();
+            if (!s_stand.TryGetValue(ZoneSystem.GetZone(pos), out var st) || st.At < 0f) return;
+            var scene = ZNetScene.instance; if (scene == null) return;
+            int prefab = FarPrefabOf(zdo);
+            if (!FarBuildingDigest.Classify(prefab).Draw) return;
+            int why = s_blockWhy; bool anySkipped = s_anySkippedProof;   // PieceStands writes AllInstanced's census fields: kept as they were (as StandingIn)
+            bool stands = PieceStands(zdo, scene);
+            s_blockWhy = why; s_anySkippedProof = anySkipped;
+            if (!stands) return;   // its group is not drawing yet: the zone's draw-start event hands it off
+            long key = StandKey(prefab, pos);
+            if (st.Keys.Add(key) && PieceRealDrawnAt(prefab, pos)) { st.SkipNew[key] = Time.frameCount; p_skipAtCreate++; }   // measure: counted in the gap from this frame
+            s_handZones.Add(ZoneSystem.GetZone(pos));   // 1.2.472: this zone only (was s_handDirty: a full pass every frame a piece was skipped). FarRunner's Update (order 31000) runs after ZNetScene created / skipped this frame's objects
+        }
+
+        private static ulong SigOf(ulong sum, int n) => sum + (ulong)n * 0x9E3779B97F4A7C15UL;
+        // the membership a split copy built now would have: every piece of its zones except those the real game draws (counted exactly as Prep takes them)
+        private static ulong SplitSig(Target t)
+        {
+            ulong sum = 0UL; int n = 0;
             foreach (var z in t.Zones)
             {
                 if (!FarBuildingDigest.Zones.TryGetValue(z, out var fz)) continue;
                 bool loaded = ZoneLoaded(z);
-                foreach (var p in fz.Pieces) if (!loaded || !PieceRealDrawn(p)) n++;
+                foreach (var p in fz.Pieces) if (!loaded || !RealHasIt(z, p.Prefab, p.Pos)) { sum += (ulong)FarIndexRanges.PieceKey(p); n++; }
             }
-            return n;
+            return SigOf(sum, n);
         }
-        // a copy is hidden only during the old near hand-off, which no longer applies (split copies never overlap real pieces)
-        private static bool RealDrawing(Target t) => false;
+        // 1.2.463: a copy is hidden while it waits for the rebuild that leaves out a real piece it holds and cannot hide in place (no index ranges)
+        private static bool RealDrawing(Target t) => t.WaitRebuild;
+        // zone targets near / inside the loaded area are built with index ranges, so a real piece can be handed off in place
+        private static bool WantsRuns(Target t) => !t.IsCell && FarIndexRanges.Usable && t.Dist <= s_nearReach;
+
+        // every frame from Update: a pass when something can have changed (a real instance created, the camera moved HandMove, the StandRefresh tick)
+        private static void HandOffPieces()
+        {
+            p_rtFrames++;   // measure: frames in the window (the per-frame average divides by these)
+            if (s_targets.Count == 0) return;
+            long t0 = Stopwatch.GetTimestamp();   // measure
+            float now = Time.unscaledTime;
+            LodK();   // the frame's camera position (s_lodCam)
+            if (!s_handDirty && now < s_handAt && (s_lodCam - s_handCam).sqrMagnitude <= HandMove * HandMove)
+            {
+                if (s_handZones.Count > 0) ZonePass();   // 1.2.472: piece events since the last pass: their zones only
+                NoteRangeTicks(Stopwatch.GetTimestamp() - t0); return;
+            }
+            s_handDirty = false; s_handAt = now + StandRefresh; s_handCam = s_lodCam;
+            s_handZones.Clear();   // 1.2.472: the full pass covers every marked zone
+            s_inHandTimer = true;
+            foreach (var t in s_targets.Values) HandOffTarget(t);
+            s_inHandTimer = false;
+            p_fullPasses++;
+            NoteRangeTicks(Stopwatch.GetTimestamp() - t0);
+        }
+
+        // ── 1.2.463 measurements for the test build (Info line below)
+        private static bool s_inHandTimer;   // a standing read inside a timed section is already counted by that section
+        private static int p_skipGapN, p_skipGapWorst, p_skipFirstRead; private static long p_skipGapSum;
+        private static long p_rtTicks, p_rtWorst, p_rtFrameTicks; private static int p_rtFrame = -1, p_rtFrames;
+        private static int p_freshN; private static long p_freshTicks, p_freshWorst, p_freshWorker, p_freshWorkerWorst;
+        // main-thread range-tracking / hand-off ticks, summed per frame (worst frame kept)
+        private static void NoteRangeTicks(long ticks)
+        {
+            int f = Time.frameCount;
+            if (f != p_rtFrame) { p_rtFrame = f; p_rtFrameTicks = 0L; }
+            p_rtFrameTicks += ticks; p_rtTicks += ticks;
+            if (p_rtFrameTicks > p_rtWorst) p_rtWorst = p_rtFrameTicks;
+        }
+        // a fresh near copy (cache skipped) is up: its main-thread prep + upload ticks, and the merge worker's
+        private static void NoteFresh(Target t, long workerTicks)
+        {
+            p_freshN++; p_freshTicks += t.BuildTicks; if (t.BuildTicks > p_freshWorst) p_freshWorst = t.BuildTicks;
+            p_freshWorker += workerTicks; if (workerTicks > p_freshWorkerWorst) p_freshWorkerWorst = workerTicks;
+            t.FreshNear = false; t.BuildTicks = 0L;
+        }
+        // bytes the drawn copies' range tables hold (array payloads + ~24 B per array header; estimate), and the standing sets (~24 B an entry)
+        private static long RangeTableBytes(out int tables, out long standBytes)
+        {
+            long b = 0L; tables = 0;
+            foreach (var t in s_targets.Values)
+            {
+                var r = t.Runs; if (r == null) continue;
+                tables++;
+                long n = r.Keys.Length, s = r.SegNext.Length;
+                b += 64L + 11 * 24L + n * (8L + 4L + 1L + 4L) + s * 16L + (r.Meshes != null ? r.Meshes.Length * 8L : 0L) + (r.Prefabs != null ? n * 16L : 0L);
+            }
+            standBytes = 0L;
+            foreach (var st in s_stand.Values) standBytes += 96L + (st.Keys.Count + st.Old.Count + st.SkipNew.Count) * 24L;
+            return b;
+        }
+
+        // one drawn copy: zero the ranges of the pieces the real game now draws, or hide it whole for its rebuild
+        // 1.2.472: only != null = a zone pass: a copy holding none of those zones is skipped, and in one that does only those zones' pieces are judged
+        private static void HandOffTarget(Target t, HashSet<Vector2s> only = null)
+        {
+            if (!t.Drawn || t.Chunks.Count == 0 || t.WaitRebuild || t.Retained) return;
+            if (t.Dist - (t.IsCell ? CellHalfDiag : ZoneHalfDiag) > s_nearReach) return;   // no loaded zone can be in it
+            if (only != null && !HoldsAny(t, only)) return;
+            if (s_inHandTimer) p_tablesScanned++;   // counted inside a pass only (Upload / swap checks are not passes)
+            var r = t.Runs;
+            if (r != null && r.Prefabs != null && FarIndexRanges.Usable)
+            {
+                if (r.HiddenCount >= r.Keys.Length) return;
+                var removed = FarIndexRanges.Removed; removed.Clear();
+                Vector2s lastZ = default(Vector2s); bool haveZ = false, lastLoaded = false;
+                for (int i = 0; i < r.Keys.Length; i++)
+                {
+                    if (r.Hidden[i]) continue;
+                    var z = r.Zones[i];
+                    if (!haveZ || z.x != lastZ.x || z.y != lastZ.y) { lastZ = z; haveZ = true; lastLoaded = (only == null || only.Contains(z)) && ZoneLoaded(z); }   // 1.2.472: a zone pass judges its zones only
+                    if (lastLoaded && RealHasIt(z, r.Prefabs[i], r.Pos[i])) removed.Add(i);
+                }
+                if (removed.Count == 0) return;
+                int n = removed.Count;
+                if (FarIndexRanges.HideListed(r))
+                {
+                    p_pieceHandoffs += n; s_planDirty = true;   // Plan next frame: the signature changed, the copy is rebuilt without them
+                    // measure: skipped pieces only a refresh could find: frames from the earliest frame they can have started drawing to now (the zeroing frame)
+                    foreach (int i in removed)
+                    {
+                        if (!s_stand.TryGetValue(r.Zones[i], out var zs) || zs.SkipNew.Count == 0) continue;
+                        long key = StandKey(r.Prefabs[i], r.Pos[i]);
+                        if (!zs.SkipNew.TryGetValue(key, out int from)) continue;
+                        zs.SkipNew.Remove(key);
+                        int g = Time.frameCount - from;
+                        p_skipGapN++; p_skipGapSum += g; if (g > p_skipGapWorst) p_skipGapWorst = g;
+                    }
+                    return;
+                }
+                // a range write failed: the key latched (OnIndexRangesLatched marked every target with runs dirty); this copy waits hidden for its rebuild
+            }
+            else
+            {
+                bool any = false;
+                foreach (var z in t.Zones)
+                {
+                    if ((only != null && !only.Contains(z)) || !ZoneLoaded(z) || !FarBuildingDigest.Zones.TryGetValue(z, out var fz)) continue;   // 1.2.472: a zone pass judges its zones only
+                    foreach (var p in fz.Pieces)
+                    {
+                        if (t.SplitBuilt >= 0 && (t.InKeys == null || !t.InKeys.Contains(StandKey(p.Prefab, p.Pos)))) continue;   // a split copy: only the pieces it holds (a full copy holds them all)
+                        if (RealHasIt(z, p.Prefab, p.Pos)) { any = true; break; }
+                    }
+                    if (any) break;
+                }
+                if (!any) return;
+            }
+            t.WaitRebuild = true; t.WaitSince = Time.frameCount; t.Dirty = true; s_planDirty = true; p_wholeHides++;
+            t.WaitingSource = false;   // queued now even if its last build lacked a source (that build drew without it too; a missing source sets this again)
+            SetVisible(t, false);
+        }
+
+        // 1.2.472: does the copy hold any of these zones (a 64 m zone copy holds 1, a 512 m cell up to 64)
+        private static bool HoldsAny(Target t, HashSet<Vector2s> zones)
+        {
+            var list = t.Zones;
+            for (int i = 0; i < list.Count; i++) if (zones.Contains(list[i])) return true;
+            return false;
+        }
+
+        // the wait ends when the chunks go (a rebuild landing, an eviction, a drop): DestroyChunks
+        private static void EndWait(Target t)
+        {
+            if (!t.WaitRebuild) return;
+            t.WaitRebuild = false;
+            int f = Time.frameCount - t.WaitSince;
+            p_waitEnded++; p_waitFrames += f; if (f > p_waitWorst) p_waitWorst = f;
+        }
+
+        // the prep queue with copies hidden for their rebuild first (each group in its existing order)
+        private static readonly List<Target> s_waitTmp = new List<Target>();
+        private static void WaitFirst()
+        {
+            if (s_prepQueue.Count < 2) return;
+            s_waitTmp.Clear();
+            foreach (var t in s_prepQueue) if (t.WaitRebuild) s_waitTmp.Add(t);
+            if (s_waitTmp.Count == 0 || s_waitTmp.Count == s_prepQueue.Count) { s_waitTmp.Clear(); return; }
+            foreach (var t in s_prepQueue) if (!t.WaitRebuild) s_waitTmp.Add(t);
+            s_prepQueue.Clear(); s_prepQueue.AddRange(s_waitTmp); s_waitTmp.Clear();
+        }
+
+        // 0.25 s tick: standing sets of zones that unloaded are dropped
+        private static void PruneStand()
+        {
+            if (s_stand.Count == 0) return;
+            s_standDrop.Clear();
+            foreach (var kv in s_stand) if (!ZoneLoaded(kv.Key)) s_standDrop.Add(kv.Key);
+            foreach (var z in s_standDrop) s_stand.Remove(z);
+            s_standDrop.Clear();
+        }
+
+        // Info, 30 s (test build: the arrival leg captures it without Debug); only when something happened in the window
+        private static void LogPieceHandoff()
+        {
+            float now = Time.unscaledTime;
+            if (now < s_nextPieceLog) return;
+            s_nextPieceLog = now + 30f;
+            int waiting = 0; foreach (var t in s_targets.Values) if (t.WaitRebuild) waiting++;
+            // 1.2.468 proof line (Info the first time, Debug after: the repeating-line rule)
+            if (s_capsLayer + s_layerSnowy + s_layerRoofed + s_layerPlain + s_layerChunks > 0)
+            {
+                EasyBakeLog.InfoFirst("far-snow-layer", $"{FarBuildings.Log} far snow layer 30 s (1.2.468, FarSnowLayer {(FarSnow.Layer ? "on" : "off")}): {s_layerChunks} layer chunk(s) built; {TakeLayerCounts()}; shelter grids {s_shelter.Count} zone(s); far snow follows the owner's live amount (no rebuild on snow change)");
+                s_layerChunks = 0;
+            }
+            if (p_pieceHandoffs + p_wholeHides + p_memberRebuilds + p_runsPrebuilds + p_waitEnded + waiting + p_skipGapN + p_skipFirstRead + p_freshN + p_drawEventPasses + p_skipAtCreate > 0
+                && EasyBakeLog.InfoFirstWouldWrite("far-piece-handoff"))   // next EBM ([lead] GO 11-22): Info once, Debug after; the range-table walk skipped when dropped (counters still zeroed below)
+            {
+                double ms = 1000.0 / Stopwatch.Frequency;
+                long tableBytes = RangeTableBytes(out int tables, out long standBytes);
+                EasyBakeLog.InfoFirst("far-piece-handoff", $"{FarBuildings.Log} piece hand-off 30 s: {p_pieceHandoffs} far piece(s) hidden in place the frame their real piece stood (index ranges {(FarIndexRanges.Usable ? "usable" : "NOT usable: whole-copy fallback only")}); " +
+                                 $"{p_wholeHides} copy(ies) without ranges hidden whole for a rebuild; rebuilds from a membership change {p_memberRebuilds}; rebuilt ahead to get ranges {p_runsPrebuilds}; " +
+                                 $"hidden waiting for the rebuild: {p_waitEnded} wait(s) ended, {p_waitFrames} frame(s) in all, worst {p_waitWorst} frame(s), {waiting} waiting now; " +
+                                 $"skipped-piece gap (found by the {StandRefresh:0.00} s refresh, frames from the zone's previous read + 1 to the zeroing = upper bound): {p_skipGapN} piece(s), avg {(p_skipGapN > 0 ? (double)p_skipGapSum / p_skipGapN : 0.0):0.0}, worst {p_skipGapWorst} frame(s) ({p_skipFirstRead} more found at a zone's first read, start unknown; 1.2.467 draw-start events: {p_drawEventPasses} same-frame pass(es) after a zone's baked groups started drawing, {p_skipAtCreate} piece(s) skipped at creation into a drawing group, both counted in the gap from their event frame); " +
+                                 $"range tracking main thread (hand-off tables built + hand-off passes + standing reads): avg {(p_rtFrames > 0 ? p_rtTicks * ms / p_rtFrames : 0.0):0.000} ms/frame over {p_rtFrames} frame(s), worst frame {p_rtWorst * ms:0.00} ms; " +
+                                 $"passes (1.2.472, piece events scan their zone only): {p_zonePasses} zone pass(es), {p_fullPasses} full pass(es), {p_tablesScanned} table(s) scanned, {p_standReads} standing read(s); " +
+                                 $"range tables {tables} holding ~{tableBytes:N0} B, standing sets {s_stand.Count} zone(s) ~{standBytes:N0} B; " +
+                                 $"fresh near-copy builds (merged cache skipped) {p_freshN}: main thread (prep + upload) total {p_freshTicks * ms:0.0} ms, worst {p_freshWorst * ms:0.00} ms per build; worker merge total {p_freshWorker * ms:0.0} ms, worst {p_freshWorkerWorst * ms:0.0} ms");
+            }
+            p_pieceHandoffs = p_wholeHides = p_memberRebuilds = p_runsPrebuilds = p_waitEnded = p_waitWorst = 0; p_waitFrames = 0L;
+            p_skipGapN = p_skipGapWorst = p_skipFirstRead = 0; p_skipGapSum = 0L; p_drawEventPasses = p_skipAtCreate = 0;   // 1.2.467
+            p_rtTicks = p_rtWorst = 0L; p_rtFrames = 0;
+            p_zonePasses = p_fullPasses = p_tablesScanned = p_standReads = 0;   // 1.2.472
+            p_freshN = 0; p_freshTicks = p_freshWorst = p_freshWorker = p_freshWorkerWorst = 0L;
+        }
 
         private static bool ZoneTargetShown(Vector2s z) => s_targets.TryGetValue(KeyFor(z, false), out var zt) && zt.Drawn && zt.Chunks.Count > 0 && zt.ShownKnown && zt.Shown;
         private static bool ZoneLoaded(Vector2s z) => FarZoneGrid.On ? FarZoneGrid.Loaded(z) : ZoneSystem.instance.IsZoneLoaded(z);
@@ -653,6 +1120,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             // Target (2 lists) per far zone / cell, a set per kept target and 2 lists each time. Now pooled scratch; a Target or zone list is
             // made only for a new target or one whose zones changed.
             var want = s_want; want.Clear(); s_scratchUsed = 0;
+            s_heldForGround = 0;   // 1.2.484: per plan (FarZoneSet census)
             foreach (var kv in FarBuildingDigest.Zones)
             {
                 var z = kv.Key;
@@ -663,9 +1131,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 // (with FarKeepHandedOff): those zones are built ahead and kept hidden, so a zone that unloads always has its far copy ready (Fire 11-16)
                 bool edge = false;
                 if (ZoneLoaded(z)) edge = true;   // 1.2.429: every loaded zone with far pieces gets a zone-level split copy (only its LOD-culled pieces)
-                bool coarse = !edge && coarseOn && d > coarseFrom;   // 1.2.353: per zone, as the cell split is
+                bool coarse = !edge && ((coarseOn && d > coarseFrom) || d > FarZoneSet.BuildingsCoarseFrom);   // 1.2.353: per zone, as the cell split is; 1.2.484: + the set's coarse band (infinity unless Far Zone Sync)
                 bool cell = !edge && (d > cellFrom || coarse);
                 long key = KeyFor(z, cell, coarse);
+                // 1.2.484 (design 3.2 ground first, [2ic] MUST 2): under Far Zone Sync a FAR zone (not loaded) joins a target only when its ground is drawn; loaded
+                // (edge) zones always join, and a target already drawn keeps its zones (Ready never hides what is shown). Retained / held hand-off copies are kept by :1147.
+                if (!edge && FarZoneSet.On && !(s_targets.TryGetValue(key, out var shown) && shown.Drawn) && !FarZoneSet.Ready(z)) { s_heldForGround++; continue; }
                 if (!want.TryGetValue(key, out var w))
                 {
                     w = NextScratch(); w.IsCell = cell; w.Coarse = coarse;
@@ -679,7 +1150,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
             // Drop targets no longer wanted (unless holding for a hand-off), merge membership into kept ones.
             var drop = s_drop; drop.Clear();
-            foreach (var kv in s_targets) if (!want.ContainsKey(kv.Key) && kv.Value.HoldUntil < 0f && !kv.Value.Retained) drop.Add(kv.Key);   // a kept copy (FarKeepHandedOff) stays until it expires
+            foreach (var kv in s_targets) if (!want.ContainsKey(kv.Key) && kv.Value.HoldUntil < 0f && !kv.Value.Retained && !(FarZoneSet.On && KeepForReplacement(kv.Value, want))) drop.Add(kv.Key);   // a kept copy (FarKeepHandedOff) stays until it expires
             foreach (var k in drop) { DestroyChunks(s_targets[k]); s_targets.Remove(k); }
             foreach (var kv in want)
             {
@@ -694,14 +1165,23 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 else s_targets[kv.Key] = t = new Target { Key = kv.Key, IsCell = kv.Value.IsCell, Coarse = kv.Value.Coarse, Origin = kv.Value.Origin, Zones = new List<Vector2s>(kv.Value.Zones), AdmittedAt = Time.unscaledTime };   // 1.2.355 AdmittedAt + 1.2.353 Coarse (merged 1.2.357)
                 t.Dist = Vector2.Distance(new Vector2(t.Origin.x, t.Origin.z), new Vector2(center.x, center.z));
                 t.Edge = kv.Value.Edge;
+                t.SyncKeepUntil = -1f;   // 1.2.484: wanted again
             }
 
             // 1.2.429: a split copy (loaded zone) is rebuilt when the set of its LOD-culled pieces changes, and a copy whose zone loaded or unloaded switches kind
+            // 1.2.463: the SET (membership signature, SplitSig), not the count, so one piece in and one out rebuilds too; "culled" = not drawn by the real game (RealHasIt).
+            // A zone copy near or inside the loaded area that has no index ranges (merged-cache read, or built before) is rebuilt once with them (WantsRuns).
+            s_nearReach = (ZNet.instance != null && ZoneSystem.instance != null ? ZNet.instance.GetSyncedSimulationDistance().NearSimulationDistance * ZoneSystem.instance.m_zoneSize : 0f) * 1.4143f + 128f;
             foreach (var st in s_targets.Values)
             {
                 if (!st.Drawn || st.JobOut || st.Prep != null || st.Dirty) continue;
-                if (AnyZoneLoaded(st)) { if (CountSplit(st) != st.SplitBuilt) { st.Dirty = true; p_splitRebuilds++; } }
+                if (AnyZoneLoaded(st))
+                {
+                    if (st.SplitBuilt < 0 || SplitSig(st) != st.SplitSigBuilt) { st.Dirty = true; p_splitRebuilds++; if (st.SplitBuilt >= 0) p_memberRebuilds++; }
+                    else if (st.Runs == null && FarIndexRanges.Usable) { st.Dirty = true; p_runsPrebuilds++; }
+                }
                 else if (st.SplitBuilt >= 0) { st.Dirty = true; p_splitRebuilds++; }
+                else if (st.Runs == null && WantsRuns(st)) { st.Dirty = true; p_runsPrebuilds++; }
             }
             // Vertex cap: nearest first; past the cap a target is evicted (counted, not drawn).
             var order = s_order; order.Clear(); foreach (var tv in s_targets.Values) order.Add(tv);
@@ -731,7 +1211,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             order.Sort(s_byRank);
             int budget = FarBuildings.MaxVertices, used = 0;
             s_prepQueue.Clear();
-            if (FarCapPool.HysteresisOn) CapPassHysteresis(order, budget);   // [Optimize] FarCapHysteresis (FarCapPool.cs): 90 % re-admit band, quiet time, eviction budget
+            if (FarZoneSet.On) used = SyncCapPass(order, budget, loadedEdge, reach);   // 1.2.484 (design 3.4, [2ic] MUST 1): no target is evicted under Far Zone Sync; the set's coarse band answers the cap
+            else if (FarCapPool.HysteresisOn) CapPassHysteresis(order, budget);   // [Optimize] FarCapHysteresis (FarCapPool.cs): 90 % re-admit band, quiet time, eviction budget
             else
             {
             // 1.2.346 ([visual] / [ghost], Fire run_8 :81049 "75 of 524 drawn, 225 not built yet, evicted by the vertex cap 224 (nearest evicted
@@ -754,17 +1235,61 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 if (!fits && !t.Evicted) { t.Evicted = true; DestroyChunks(t); FarBuildings.S.Evictions++; }
                 if (!fits) { if (built) s_capBuilt++; else s_capEst++; }
                 if (fits && t.Evicted) { t.Evicted = false; t.Dirty = true; }
-                if (!t.Evicted && t.Dirty && !t.JobOut && !t.WaitingSource && !t.Retained) s_prepQueue.Add(t);   // a kept copy is rebuilt once its zone unloads (shown meanwhile)
+                if (!t.Evicted && (t.Dirty || t.Prep != null) && !t.JobOut && !t.WaitingSource && !t.Retained) { if (!t.Dirty) s_prepResumed++; s_prepQueue.Add(t); }   // 1.2.476: a half-gathered target (Prep set, Dirty already cleared at its gather start) is re-queued; it was dropped by every plan pass that ran mid-gather and stayed unbuilt (cold) for good   // a kept copy is rebuilt once its zone unloads (shown meanwhile)
             }
             used = usedBuilt + pendingEst;
             }
             ViewFirst(center);   // [Optimize] FarBuildViewFirst: build order only
             EdgeFirst();         // 1.2.424: edge-ring targets go first (stable), whatever the view order
+            WaitFirst();         // 1.2.463: copies hidden whole for their rebuild go before everything
             // 1.2.346 ([visual], Fire run_8: 225 targets inside 824 m "not built yet" after 20 min): how many admitted targets still wait to be built;
             // FarBuildings reads it to keep the arrival budget while the far set is cold (see FarColdBudget)
             int cold = 0, edgeCold = 0; foreach (var t in s_targets.Values) if (!t.Evicted && !t.Drawn && !t.Retained) { cold++; if (t.Edge) edgeCold++; }
             ColdTargets = cold; EdgeColdTargets = edgeCold;
+            if (s_prepResumed > 0) { EasyBakeLog.InfoFirst("far-prep-resumed", $"{FarBuildings.Log} re-queued {s_prepResumed} half-gathered far target(s) that a plan pass had dropped (1.2.476: they stayed unbuilt and kept the far set cold); {cold} admitted target(s) not built now"); s_prepResumedTotal += s_prepResumed; s_prepResumed = 0; }
             FarBuildings.S.Targets = s_targets.Count;
+        }
+
+        // 1.2.484 (design 3.4, [2ic] MUST 1): the cap pass under Far Zone Sync. Every wanted target stays admitted (a target evicted before Sync was turned on is
+        // re-admitted and rebuilt); the vertices are only COUNTED (built = real, unbuilt = scaled estimate) and handed to FarZoneSet, which moves the coarse band.
+        // The build admission is the exact line of both old loops (:1230 / FarCapPool.cs:134), so building goes on as before.
+        // 1.2.484 ([2ic] SHOULD 1, "never one without the other" in time): a DRAWN target no longer wanted (a coarse band step changed its key) stays drawn while any
+        // wanted target sharing one of its zones is not drawn yet, at most 60 s from its first hold; then it drops as before. Both may draw for up to one plan (2 s).
+        // Not for HoldUntil: the hand-off loop clears that for every zone that is not loaded (:1655).
+        // Cost ([2ic]): O(want x zones x t.Zones) per dropped DRAWN target; only at band steps (at most one per 10 s), fine at the 2 s plan cadence.
+        private const float SyncKeepSeconds = 60f;
+        private static bool KeepForReplacement(Target t, Dictionary<long, PlanScratch> want)
+        {
+            if (!t.Drawn) return false;
+            float now = Time.unscaledTime;
+            if (t.SyncKeepUntil < 0f) t.SyncKeepUntil = now + SyncKeepSeconds;
+            if (now >= t.SyncKeepUntil) return false;
+            foreach (var kv in want)
+            {
+                bool shares = false;
+                foreach (var z in kv.Value.Zones) if (t.Zones.Contains(z)) { shares = true; break; }
+                if (!shares) continue;
+                if (!(s_targets.TryGetValue(kv.Key, out var r) && r.Drawn)) return true;   // its replacement is not drawn yet
+            }
+            return false;
+        }
+        private static int s_heldForGround;   // 1.2.484: far zones held back this plan because their ground is not drawn yet (Ready false)
+        internal static int HeldForGround => s_heldForGround;
+        internal static int DrawnTargets { get { int n = 0; foreach (var t in s_targets.Values) if (t.Drawn) n++; return n; } }   // 1.2.484: FarZoneSet census
+        private static int SyncCapPass(List<Target> order, int budget, float loadedEdge, float reach)
+        {
+            long used = 0, built = 0; s_capBuilt = s_capEst = 0;
+            foreach (var t in order)
+            {
+                if (t.SyncKeepUntil >= 0f) continue;   // SHOULD 1: a held old target (waiting for its replacement) is neither counted nor rebuilt
+                if (t.Evicted) { t.Evicted = false; t.Dirty = true; }
+                if (t.Verts > 0) { used += t.Verts; built += t.Verts; } else used += ScaledEst(t);
+                if (!t.Evicted && (t.Dirty || t.Prep != null) && !t.JobOut && !t.WaitingSource && !t.Retained) { if (!t.Dirty) s_prepResumed++; s_prepQueue.Add(t); }
+            }
+            // [2ic] MUST 1: the coarse band steps on BUILT vertices only (1.2.346's rule: estimates never push the cap), so arrival / cold estimates cannot move it
+            // in and back out again (every step changes target keys = rebuilds, against Fire's build-once rule). `used` (with estimates) is only reported.
+            FarZoneSet.NoteBuildings(built, budget, loadedEdge, reach);
+            return (int)Math.Min(int.MaxValue, used);
         }
 
         // 1.2.234 [ghost]: Plan's reused scratch (bounded by the far zones in reach)
@@ -812,12 +1337,16 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static void Prep(Vector3 center, long deadline)
         {
             bool snow = FarSnow.Active;
+            bool layer = FarSnow.Layer;   // 1.2.468: far snow as a layer (no vanilla caps merged; bodies bucket by their static snow code)
             for (int qi = 0; qi < s_prepQueue.Count; qi++)
             {
                 var t = s_prepQueue[qi];
+                long tPrep = Stopwatch.GetTimestamp();   // 1.2.463 measure: a fresh near copy's main-thread prep time (finally below; every continue / return passes it)
+                try {
                 // 1.2.425 FarMergedCache: an unchanged target is read from disk (worker) and shown without a gather or a merge; a miss builds as before and is saved
-                if (t.Prep == null && FarMergedCache.On && !AnyZoneLoaded(t))   // 1.2.429: split copies (loaded zones) depend on the camera: never cached
+                if (t.Prep == null && FarMergedCache.On && !AnyZoneLoaded(t) && !WantsRuns(t))   // 1.2.429: split copies (loaded zones) depend on the camera: never cached. 1.2.463: nor zone copies near the loaded area (built with index ranges, which a cache read has not)
                 {
+                    t.FreshNear = false;   // 1.2.463 measure: a cached build is not a fresh near build
                     if (t.CacheState == 1 && Time.unscaledTime - t.CacheAskedAt < 10f) continue;   // its read is out (1.2.428: never longer than 10 s, a lost answer is asked again)
                     string ck = FarMergedCache.KeyFor(t.Key, t.IsCell, t.Coarse, t.Zones, FarBuildings.ClusterFor(t.Dist, t.IsCell, t.Coarse));
                     if (ck != t.CacheKey || t.CacheState != 2) { t.CacheKey = ck; t.CacheState = 1; t.CacheAskedAt = Time.unscaledTime; StartCacheRead(t, ck); continue; }
@@ -826,16 +1355,22 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 {
                     t.Generation++;
                     t.Dirty = false;   // [worldgen] 11-09 lost-change fix: cleared when the gather STARTS, so a change during it (zone, snow, E16 fallback) keeps the target dirty
+                    EbmChurn.NoteFarBuild(t.Drawn);   // 1.2.480: [Churn] far copies built (first) vs rebuilt (it already drew)
                     float clusterM = FarBuildings.ClusterFor(t.Dist, t.IsCell, t.Coarse);   // 1.2.432: zone copies past "Simplify zones from" are clustered too
                     t.Prep = new FarJob { TargetKey = t.Key, Generation = t.Generation, Simplify = clusterM > 0f, Cluster = clusterM > 0f ? clusterM : 1f };   // 1.2.353: coarse grid
-                    if (FarIndexRanges.On && VaDistantReach.Count == 0) { t.Prep.TrackRuns = true; t.Prep.RunKeys = new List<long>(); t.Prep.RunZones = new List<Vector2s>(); }   // [Optimize] FarIndexRanges
+                    t.PrepSplit = AnyZoneLoaded(t) ? 0 : -1;   // 1.2.429: a loaded zone's copy takes only its LOD-culled pieces (1.2.463: set first, the run choice below reads it)
+                    t.PrepSig = 0UL;   // 1.2.463
+                    bool handRuns = FarIndexRanges.Usable && (t.PrepSplit >= 0 || WantsRuns(t));   // 1.2.463: runs for the per-piece hand-off
+                    t.Prep.HandRuns = handRuns;   // 1.2.463 measure: its range table build counts as range-tracking cost
+                    t.FreshNear = FarMergedCache.On && t.PrepSplit < 0 && WantsRuns(t); t.BuildTicks = 0L;   // 1.2.463 measure: built fresh only because the cache is skipped near the loaded area
+                    if ((FarIndexRanges.On && VaDistantReach.Count == 0) || handRuns) { t.Prep.TrackRuns = true; t.Prep.RunKeys = new List<long>(); t.Prep.RunZones = new List<Vector2s>(); t.Prep.RunPrefabs = new List<int>(); t.Prep.RunPos = new List<Vector3>(); }   // [Optimize] FarIndexRanges
+                    else if (t.PrepSplit >= 0) t.Prep.InKeys = new HashSet<long>();   // 1.2.463: no ranges: the pieces this split copy holds, for the whole-copy fallback
                     t.Prep.Pooled = FarCapPool.PooledOn;   // [Optimize] FarMergePooled: decided per job, so a live toggle never mixes
                     t.PrepBuckets = new Dictionary<long, FarJob.Bucket>(); t.PrepMats = new Dictionary<Material, int>();
                     t.PrepZone = 0; t.PrepPiece = 0;
                     t.PrepRefs = new List<int>();
                     t.Prep.Boxes = FarBuildings.InteriorOn ? new List<FarJob.PieceBox>() : null;   // 1.2.431 interior cut
-                    t.PrepSplit = AnyZoneLoaded(t) ? 0 : -1;   // 1.2.429: a loaded zone's copy takes only its LOD-culled pieces
-                    t.Prep.CacheKey = FarMergedCache.On && t.CacheState == 2 ? t.CacheKey : null;   // 1.2.425: a miss is saved after its merge
+                    t.Prep.CacheKey = FarMergedCache.On && t.CacheState == 2 && t.PrepSplit < 0 ? t.CacheKey : null;   // 1.2.425: a miss is saved after its merge. 1.2.463: never a split copy (its zone loaded after the miss) under the full copy's key
                 }
                 bool waiting = false;
                 while (t.PrepZone < t.Zones.Count)
@@ -843,10 +1378,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (Stopwatch.GetTimestamp() >= deadline) return;
                     if (!FarBuildingDigest.Zones.TryGetValue(t.Zones[t.PrepZone], out var fz) || t.PrepPiece >= fz.Pieces.Length) { t.PrepZone++; t.PrepPiece = 0; continue; }
                     var piece = fz.Pieces[t.PrepPiece];
-                    if (t.PrepSplit >= 0)   // 1.2.429: counted exactly as CountSplit counts (before any other skip), so an unchanged set never rebuilds
+                    if (t.PrepSplit >= 0)   // 1.2.429: counted exactly as CountSplit counts (before any other skip), so an unchanged set never rebuilds. 1.2.463: as SplitSig takes it
                     {
-                        if (ZoneLoaded(t.Zones[t.PrepZone]) && PieceRealDrawn(piece)) { t.PrepPiece++; continue; }   // the game draws this one itself
-                        t.PrepSplit++;
+                        var pz = t.Zones[t.PrepZone];
+                        if (ZoneLoaded(pz) && RealHasIt(pz, piece.Prefab, piece.Pos)) { t.PrepPiece++; continue; }   // the game draws this one itself (1.2.463: and its real piece stands)
+                        t.PrepSplit++; t.PrepSig += (ulong)FarIndexRanges.PieceKey(piece);
                     }
                     var src = FarBuildingSources.Get(piece.Prefab);
                     if (src == null)
@@ -862,15 +1398,18 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (t.PrepSplit < 0) { float small = FarBuildings.SmallCutAt(t.Dist, t.Coarse); if (small > 0f && FarBuildingDigest.Classify(piece.Prefab).Extent < small) { s_coarseSmallOut++; s_sizeCutPieces++; s_sizeCutVerts += src.Vertices; continue; } }
                     byte level = 0;   // 1.2.428: no snow level baked into the merge (it was FarSnow.Level in quarter steps); the chunk's snow is set live (LiveSnow)
                     int run = -1;
-                    if (t.Prep.TrackRuns) { run = t.Prep.RunKeys.Count; t.Prep.RunKeys.Add(FarIndexRanges.PieceKey(piece)); t.Prep.RunZones.Add(t.Zones[t.PrepZone]); }   // one run per drawn piece
+                    if (t.Prep.TrackRuns) { run = t.Prep.RunKeys.Count; t.Prep.RunKeys.Add(FarIndexRanges.PieceKey(piece)); t.Prep.RunZones.Add(t.Zones[t.PrepZone]); t.Prep.RunPrefabs.Add(piece.Prefab); t.Prep.RunPos.Add(piece.Pos); }   // one run per drawn piece (body AND cap parts: every Item below carries it). 1.2.463: + prefab / position
+                    else if (t.Prep.InKeys != null) t.Prep.InKeys.Add(StandKey(piece.Prefab, piece.Pos));   // 1.2.463
                     Matrix4x4 world = Matrix4x4.TRS(piece.Pos - t.Origin, piece.Rot, Vector3.one);
-                    byte cap = CapShown(piece);   // 1.2.262: 0 = this copy's cap parts are left out
+                    byte cap = layer ? (byte)0 : CapShown(piece);   // 1.2.262: 0 = this copy's cap parts are left out. 1.2.468: never with the snow layer
+                    byte code = layer ? LayerCode(fz, piece, src) : (byte)0;   // 1.2.468: the piece's static snow code (class x shelter), 0 = no snow
                     int pieceBox = -1;   // 1.2.431: this piece's box for the interior cut (body parts only)
                     if (t.Prep.Boxes != null && src.HasBounds) { pieceBox = t.Prep.Boxes.Count; t.Prep.Boxes.Add(new FarJob.PieceBox { C = piece.Pos - t.Origin + piece.Rot * src.LocalBounds.center, R = piece.Rot, H = src.LocalBounds.extents }); }
                     foreach (var part in src.Parts)
                     {
                         if (part.IsCap)
                         {
+                            if (layer) { s_capsLayer++; continue; }   // 1.2.468: the layer replaces the vanilla cap meshes
                             if (cap == 0) { s_capsOut++; continue; }
                             s_capsIn++;
                         }
@@ -883,7 +1422,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                             if (!t.PrepMats.TryGetValue(mat, out int mi)) { mi = t.PrepMats.Count; t.PrepMats[mat] = mi; t.PrepRefs.Add(piece.Prefab); t.PrepRefs.Add(src.Parts.IndexOf(part)); t.PrepRefs.Add(s); }   // 1.2.425: (prefab, part, sub) for the merged cache
                             // a cap part buckets by its cap level (its chunk's _SnowLevel), in its own key space (bit 7), never mixed with the body's cover level
                             byte bl = part.IsCap ? cap : level;
-                            long bk = ((long)mi << 8) | bl | (part.IsCap ? 0x80L : 0L);
+                            // 1.2.468: a body part of a snow-layer piece buckets by its code (bit 6 key space; the chunk's Snow carries LayerFlag | code)
+                            if (code != 0 && !part.IsCap) bl = (byte)(LayerFlag | code);
+                            long bk = ((long)mi << 8) | bl | (part.IsCap ? 0x80L : 0L) | (code != 0 && !part.IsCap ? 0x40000L : 0L);
                             if (!t.PrepBuckets.TryGetValue(bk, out var b)) { b = new FarJob.Bucket { MatIdx = mi, Snow = bl }; t.PrepBuckets[bk] = b; }
                             b.Items.Add(new FarJob.Item { Part = part, Sub = s, M = m, Mirror = mirror, Run = run, Piece = part.IsCap ? -1 : pieceBox });   // 1.2.431: caps never cut
                         }
@@ -901,9 +1442,11 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 // the target once this job lands (JobOut gates it until then).
                 if (t.Dirty) { s_prepRequeues++; s_planDirty = true; }
                 job.SplitCount = t.PrepSplit;   // 1.2.429
+                job.SplitSig = t.PrepSplit >= 0 ? SigOf(t.PrepSig, t.PrepSplit) : 0UL;   // 1.2.463
                 t.JobOut = true; t.WaitingSource = waiting;
                 FarBuildingMerge.Queue(job);
                 s_prepQueue.RemoveAt(qi); qi--;
+                } finally { if (t.FreshNear) t.BuildTicks += Stopwatch.GetTimestamp() - tPrep; }   // 1.2.463 measure
             }
         }
 
@@ -963,9 +1506,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
 
             if (c.Snow > 0) s_snowChunks++;
             var pooledGo = TakeChunkObject(mesh, job.Mats[c.MatIdx], c, t);   // [Optimize] FarMergePooled: a kept chunk object, set up like a new one
-            if (pooledGo != null) { pooledGo.name = c.Snow > 0 ? CapChunkName : "FarBuildings chunk"; return pooledGo; }   // 1.2.428: the name marks cap chunks for LiveSnow
+            if (pooledGo != null) { pooledGo.name = ChunkName(c); return pooledGo; }   // 1.2.428: the name marks cap chunks for LiveSnow
             if (FarCapPool.PooledOn) FarCapPool.GoNew++;
-            var go = new GameObject(c.Snow > 0 ? CapChunkName : "FarBuildings chunk") { hideFlags = HideFlags.HideAndDontSave, layer = Layer() };   // 1.2.428: cap chunks keep their own block (LiveSnow skips them)
+            var go = new GameObject(ChunkName(c)) { hideFlags = HideFlags.HideAndDontSave, layer = Layer() };   // 1.2.428: cap chunks keep their own block (LiveSnow skips them)
             go.transform.SetParent(s_root.transform, false);
             go.transform.position = t.Origin;
             go.AddComponent<MeshFilter>().sharedMesh = mesh;
@@ -973,7 +1516,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             r.sharedMaterial = job.Mats[c.MatIdx];
             r.shadowCastingMode = ShadowCastingMode.Off; r.receiveShadows = false;
             r.lightProbeUsage = LightProbeUsage.BlendProbes; r.reflectionProbeUsage = ReflectionProbeUsage.Off;
-            if (c.Snow > 0) { s_mpb.Clear(); s_mpb.SetFloat(FarSnow.SnowCoverId, c.Snow / 4f); s_mpb.SetFloat(FarSnow.LegacySnowCoverId, c.Snow / 4f); s_mpb.SetFloat(SnowLevelId, c.Snow / 4f); r.SetPropertyBlock(s_mpb); }   /* 1.2.262: _SnowLevel = a cap chunk's height (vanilla MaterialMan sets it on the whole piece too) */
+            ChunkBlock(r, c);   // 1.2.262 cap chunk block / 1.2.468 layer chunk block
             return go;
         }
 
@@ -983,6 +1526,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (!s_targets.TryGetValue(job.TargetKey, out var t)) { FarCapPool.ReturnRange(job.Result, 0); return; }
             t.JobOut = false;
             if (job.Generation != t.Generation || t.Evicted) { FarCapPool.ReturnRange(job.Result, 0); return; }   // stale: a newer prep is coming (pooled arrays go back)
+            long tUp = Stopwatch.GetTimestamp();   // 1.2.463 measure
 
             EnsureRoot();
             DestroyChunks(t);
@@ -1001,12 +1545,20 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             }
             t.Verts = verts; t.Bytes = bytes; t.Drawn = true; FillTracker.NoteFarDrawn();   // 1.2.219: "Far first drawn at T+"
             t.SplitBuilt = job.SplitCount;   // 1.2.429
+            t.SplitSigBuilt = job.SplitSig; t.InKeys = job.InKeys;   // 1.2.463
             s_intPieces += job.InteriorPieces; s_intTris += job.InteriorTris;   // 1.2.431
             t.CacheState = 0;   // 1.2.425: the next build of this target asks the merged cache first again
+            long tRt = Stopwatch.GetTimestamp();   // 1.2.463 measure: range table build (hand-off copies) + the hand-off check
             t.Runs = meshes != null ? FarIndexRanges.Build(job, meshes) : null;
-            SetVisible(t, !RealDrawing(t) || t.HoldUntil >= 0f);   // 1.2.428: hidden only while real pieces of a loaded zone still draw
+            if (!job.HandRuns) tRt = Stopwatch.GetTimestamp();   // a key-only table (FarIndexRanges key) is not the hand-off's cost
+            s_inHandTimer = true;
+            HandOffTarget(t);   // 1.2.463: a piece that became real while this copy was gathered / merged is hidden before the copy is ever seen
+            s_inHandTimer = false;
+            NoteRangeTicks(Stopwatch.GetTimestamp() - tRt);
+            SetVisible(t, !RealDrawing(t) || t.HoldUntil >= 0f);   // 1.2.428: hidden only while real pieces of a loaded zone still draw (1.2.463: RealDrawing = waiting hidden for its rebuild)
             RecountStats();
             if (s_pending.Count > 0) ResolvePending();   // a zone target just drew: its cell can hide that zone now
+            if (t.FreshNear) { t.BuildTicks += Stopwatch.GetTimestamp() - tUp; NoteFresh(t, job.Ticks); }   // 1.2.463 measure
         }
 
         // [Optimize] FarUploadSliced ([saddles] 11-09): a job's chunks (up to 65k vertices each) are built up to the frame's budget, at least one a frame, hidden. The target's old
@@ -1035,6 +1587,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 var cur = s_cursor;
                 var list = cur.Job.Result;
                 cur.Frames++;
+                long tSlice = Stopwatch.GetTimestamp();   // 1.2.463 measure: this frame's upload slice for a fresh near copy
                 while (cur.Next < list.Count && (first || (Stopwatch.GetTimestamp() < deadline && UnderByteCap())))   // UnderByteCap: [Optimize] FarUploadByteCap
                 {
                     first = false;
@@ -1048,6 +1601,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     cur.Verts += c.VertCount; cur.Bytes += c.VertCount * 24L + c.IdxCount * 2L;
                     FarCapPool.ReturnChunk(c);   // [Optimize] FarMergePooled: uploaded, the arrays go back
                 }
+                if (cur.T.FreshNear) cur.T.BuildTicks += Stopwatch.GetTimestamp() - tSlice;   // 1.2.463 measure
                 if (cur.Next < list.Count) return uploaded;
                 FinishCursor();
                 uploaded++;
@@ -1062,18 +1616,27 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             var t = cur.T;
             t.JobOut = false;
             if (!s_targets.TryGetValue(t.Key, out var live) || !ReferenceEquals(live, t) || cur.Job.Generation != t.Generation || t.Evicted) { DestroyBuilt(cur); return; }
+            long tFin = Stopwatch.GetTimestamp();   // 1.2.463 measure
             if (!s_saidSliced && cur.Frames > 1) { s_saidSliced = true; EasyBakeLog.Info($"{FarBuildings.Log} chunk uploads are spread over frames (FarUploadSliced): first spread job, {cur.Built.Count} chunk(s) over {cur.Frames} frame(s)."); }
             DestroyChunks(t);
             t.Chunks.AddRange(cur.Built);
             t.Verts = cur.Verts; t.Bytes = cur.Bytes; t.Drawn = true; FillTracker.NoteFarDrawn();
             t.SplitBuilt = cur.Job.SplitCount;   // 1.2.429
+            t.SplitSigBuilt = cur.Job.SplitSig; t.InKeys = cur.Job.InKeys;   // 1.2.463
             s_intPieces += cur.Job.InteriorPieces; s_intTris += cur.Job.InteriorTris;   // 1.2.431
             if (cur.Job.Boxes != null && cur.Job.Boxes.Count >= FarBuildingMerge.MinPiecesForInterior && s_intSaid < 8) { s_intSaid++; EasyBakeLog.Info($"[FarBuildings] interior cut proof #{s_intSaid}: target at ({t.Origin.x:0},{t.Origin.z:0}) {(t.IsCell ? "cell" : "zone")}: {cur.Job.Boxes.Count} piece(s), {cur.Job.InteriorPieces} enclosed and left out, {cur.Job.Boxes.Count - cur.Job.InteriorPieces} kept, {cur.Job.InteriorTris:N0} triangles saved"); }
             t.CacheState = 0;   // 1.2.425
+            long tRt = Stopwatch.GetTimestamp();   // 1.2.463 measure: as Upload
             t.Runs = cur.Meshes != null ? FarIndexRanges.Build(cur.Job, cur.Meshes) : null;   // [Optimize] FarIndexRanges
-            SetVisible(t, !RealDrawing(t) || t.HoldUntil >= 0f);   // 1.2.428: hidden only while real pieces of a loaded zone still draw
+            if (!cur.Job.HandRuns) tRt = Stopwatch.GetTimestamp();
+            s_inHandTimer = true;
+            HandOffTarget(t);   // 1.2.463: as Upload (the built chunks are still inactive here)
+            s_inHandTimer = false;
+            NoteRangeTicks(Stopwatch.GetTimestamp() - tRt);
+            SetVisible(t, !RealDrawing(t) || t.HoldUntil >= 0f);   // 1.2.428: hidden only while real pieces of a loaded zone still draw (1.2.463: RealDrawing = waiting hidden for its rebuild)
             RecountStats();
             if (s_pending.Count > 0) ResolvePending();   // a zone target just drew: its cell can hide that zone now
+            if (t.FreshNear) { t.BuildTicks += Stopwatch.GetTimestamp() - tFin; NoteFresh(t, cur.Job.Ticks); }   // 1.2.463 measure
         }
 
         private static void DestroyBuilt(UploadCursor cur)
@@ -1112,6 +1675,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 if (!t.Drawn) continue;
                 bool loaded = RealDrawing(t);   // 1.2.428 root fix: "loaded" = a loaded zone of it still draws its real pieces (not merely loaded)
                 if (TickRetained(t, loaded, ref expire)) continue;   // [Optimize] FarKeepHandedOff: a kept copy shows again at once when its zone unloads
+                if (loaded) continue;   // 1.2.463: hidden whole for its rebuild (HandOffTarget): stays hidden, no 10 s hold / destroy; the rebuilt copy shows on upload
                 if (!loaded) { if (t.HoldUntil >= 0f) t.HoldUntil = -1f; SetVisible(t, true); continue; }
                 if (t.HoldUntil < 0f) t.HoldUntil = Time.unscaledTime + HoldSeconds;
                 bool proven = AllInstanced(t);
@@ -1175,6 +1739,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             foreach (var go in t.Chunks) RetireChunk(go);   // destroyed now (as before), or hidden at once + destroyed under the budget ([Optimize] FarRetireSliced)
             t.Chunks.Clear(); t.Verts = 0; t.Bytes = 0; t.Drawn = false; t.ShownKnown = false; t.Runs = null; t.Retained = false;
             t.SnowSent = -1f;   // 1.2.428: the next chunks get the live snow at the next LiveSnow pass
+            EndWait(t); t.InKeys = null;   // 1.2.463: the hidden copy is gone (its rebuild landed, or it was evicted / dropped)
             NoteRetireTicks(Stopwatch.GetTimestamp() - t0);
         }
 
@@ -1221,6 +1786,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (Time.unscaledTime < s_nextInfoCensus) return;
             s_nextInfoCensus = Time.unscaledTime + 60f;
+            // next EBM ([lead] GO 11-22): Info the first time, Debug after (the repeating-line rule); when neither would be written, the walks below are skipped
+            // too (the counters these two lines report are zeroed as the lines would have)
+            if (!EasyBakeLog.InfoFirstWouldWrite("far-census") && !EasyBakeLog.InfoFirstWouldWrite("far-cap-use")) { p_splitRebuilds = 0; s_snowBumps = 0; s_liveSnowSets = 0; return; }
             var cam = Camera.main; var p = Player.m_localPlayer;
             if (cam == null || p == null) return;
             int built = 0, shown = 0, rendered = 0, retained = 0, hiddenLoaded = 0, shownInLoaded = 0; long verts = 0; float farR = 0f, farShown = 0f; string farName = "";
@@ -1243,7 +1811,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     break;
                 }
             }
-            EasyBakeLog.Info($"[FarBuildings] census at ({me.x:0},{me.z:0}) y {me.y:0}: {built} target(s) built ({verts:N0} vertices, cap {FarBuildings.MaxVertices:N0}), {shown} shown, {rendered} rendered by a camera last frame (farthest rendered {farR:0} m, shader '{farName}'; farthest shown {farShown:0} m), {hiddenLoaded} hidden because real pieces still draw there, {shownInLoaded} shown inside the loaded area (real pieces past their LOD cull: the 1.2.428 fix), {retained} kept hidden; layer '{LayerMask.LayerToName(Layer())}', far clip {cam.farClipPlane:0} m, fog {(RenderSettings.fog ? $"{RenderSettings.fogMode} {RenderSettings.fogDensity:0.#####}" : "off")}; {s_targets.Count} target(s) in reach {FarBuildings.Reach:0} m; far snow revision bumps last 60 s {s_snowBumps} (no rebuilds from them since 1.2.428: 0 targets marked dirty), live snow sets {s_liveSnowSets}; split copies (loaded zones, LOD-culled pieces only) {CountSplitTargets()}, split rebuilds {p_splitRebuilds}");
+            EasyBakeLog.InfoFirst("far-census", $"[FarBuildings] census at ({me.x:0},{me.z:0}) y {me.y:0}: {built} target(s) built ({verts:N0} vertices, cap {FarBuildings.MaxVertices:N0}), {shown} shown, {rendered} rendered by a camera last frame (farthest rendered {farR:0} m, shader '{farName}'; farthest shown {farShown:0} m), {hiddenLoaded} hidden because real pieces still draw there, {shownInLoaded} shown inside the loaded area (real pieces past their LOD cull: the 1.2.428 fix), {retained} kept hidden; layer '{LayerMask.LayerToName(Layer())}', far clip {cam.farClipPlane:0} m, fog {(RenderSettings.fog ? $"{RenderSettings.fogMode} {RenderSettings.fogDensity:0.#####}" : "off")}; {s_targets.Count} target(s) in reach {FarBuildings.Reach:0} m; far snow revision bumps last 60 s {s_snowBumps} (no rebuilds from them since 1.2.428: 0 targets marked dirty), live snow sets {s_liveSnowSets}; split copies (loaded zones, LOD-culled pieces only) {CountSplitTargets()}, split rebuilds {p_splitRebuilds}");
             p_splitRebuilds = 0;
             // 1.2.430 ([lead]; Fire: "imposter vegetation is eating up all our vert budget"): what fills the cap, by prefab (drawn targets' pieces x the far mesh's
             // vertices: before a cell's ~1 m clustering, so an upper bound for cells), and what the cap left out
@@ -1268,7 +1836,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             var top = new List<KeyValuePair<int, long>>(byPrefab); top.Sort((a, b) => b.Value.CompareTo(a.Value));
             var sbTop = new System.Text.StringBuilder();
             for (int i = 0; i < top.Count && i < 15; i++) { var src = FarBuildingSources.Get(top[i].Key); sbTop.Append($"{(src != null ? src.Name : top[i].Key.ToString())} {countBy[top[i].Key]} pc / {top[i].Value:N0} v; "); }
-            EasyBakeLog.Info($"[FarBuildings] cap use at ({me.x:0},{me.z:0}): top prefabs by far vertices: {sbTop}evicted by the vertex cap {evicted} target(s){(evicted > 0 ? $" (nearest {nearestEvicted:0} m)" : "")}; unbuilt estimates x {s_estRatio:0.000} (built real / raw), admitted over their estimate while nothing else pending {s_capForced} (session); by creator (piece far-mesh vertices before simplification): player-built {playerPc} pc / {playerV:N0} v, world-generated (locations) {worldPc} pc / {worldV:N0} v, unknown (cached before 1.2.432, until rescanned) {unkPc} pc / {unkV:N0} v; zones simplified from {FarBuildings.SimplifyFrom:0} m; cached pieces dropped as not a build piece (no WearNTear) this session {FarBuildingDigest.s_cacheDropped}; interior cut {(FarBuildings.InteriorOn ? "on" : "off")}: {s_intPieces} enclosed piece(s), {s_intTris:N0} triangles saved; size cut {(FarBuildings.SizeCutOn ? $"on (to {FarBuildings.SizeCutMax:0.#} m at the reach)" : "off")}: {s_sizeCutPieces} piece(s), ~{s_sizeCutVerts:N0} vertices saved (session totals)");
+            EasyBakeLog.InfoFirst("far-cap-use", $"[FarBuildings] cap use at ({me.x:0},{me.z:0}): top prefabs by far vertices: {sbTop}evicted by the vertex cap {evicted} target(s){(evicted > 0 ? $" (nearest {nearestEvicted:0} m)" : "")}; unbuilt estimates x {s_estRatio:0.000} (built real / raw), admitted over their estimate while nothing else pending {s_capForced} (session); by creator (piece far-mesh vertices before simplification): player-built {playerPc} pc / {playerV:N0} v, world-generated (locations) {worldPc} pc / {worldV:N0} v, unknown (cached before 1.2.432, until rescanned) {unkPc} pc / {unkV:N0} v; zones simplified from {FarBuildings.SimplifyFrom:0} m; cached pieces dropped as not a build piece (no WearNTear) this session {FarBuildingDigest.s_cacheDropped}; interior cut {(FarBuildings.InteriorOn ? "on" : "off")}: {s_intPieces} enclosed piece(s), {s_intTris:N0} triangles saved; size cut {(FarBuildings.SizeCutOn ? $"on (to {FarBuildings.SizeCutMax:0.#} m at the reach)" : "off")}: {s_sizeCutPieces} piece(s), ~{s_sizeCutVerts:N0} vertices saved (session totals)");
             s_snowBumps = 0; s_liveSnowSets = 0;
         }
 
@@ -1284,6 +1852,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (s_cursor != null) { DestroyBuilt(s_cursor); FarCapPool.ReturnRange(s_cursor.Job.Result, s_cursor.Next); s_cursor = null; }
             foreach (var t in s_targets.Values) DestroyChunks(t);
             s_targets.Clear(); s_prepQueue.Clear(); s_pending.Clear();
+            s_stand.Clear(); s_handDirty = true; s_nearReach = 0f;   // 1.2.463
+            s_handZones.Clear();   // 1.2.472
+            s_shelter.Clear();   // 1.2.468
             RetireAllNow();   // E18: nothing queued outlives the world
             ClearChunkObjectPool();   // [Optimize] FarMergePooled: the pooled objects die with the root below
             s_planDirty = true; s_planCenter = new Vector3(float.MaxValue, 0, 0);

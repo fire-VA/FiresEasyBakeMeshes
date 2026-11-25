@@ -57,6 +57,9 @@ namespace FiresEasyBakeMeshes
         // 1.2.313 ([ghost], lead 11-11): true while EBM draws the given VANILLA shader's materials with its own shader, so another mod's swap of the same
         // materials stands down. Today: "Custom/Heightmap" while [Optimize] TerrainShader is on and EBM/Heightmap is loaded (EBM takes the non-snow chunks;
         // snow chunks stay Vedr's / FTS's snow swap / vanilla). Live (follows the key); false on a dedicated server, for any other name, or on an empty name.
+        // 1.2.460 ([visual], lead 11-18, Fire: "we will do A for now"): "Custom/Heightmap" now means ALL terrain chunks, snow included (EBM/Heightmap is Vedr's
+        // terrain shader ported in). True exactly while [40 - Shaders] TerrainShader is on and EBM/Heightmap is loaded (EbmTerrainShader.Active); Vedr 0.8.278 stands
+        // down on it and releases its chunks to Custom/Heightmap. A flip bumps ShaderOwnershipRevision and raises ShaderOwnershipChanged (RecheckShaderOwnership).
         // 1.2.314 ([seasons] water STEP 1, merged as ONE method): also "Custom/Water" while [Optimize] WaterShader is on and EBM/Water is loaded (zone water only).
         // 1.2.318 (Fire 11-11 shader priority EBM > Vedr > FTS, Tools\DESIGN_shader_priority_ebm_vedr_fts_20261111.md): also "Custom/FlowOpaque" while
         // [Optimize] IndirectLavaVariant + IndirectRenderer are on (EBM's lava variant takes covered lava), and "Custom/Piece" while PieceShaderActive.
@@ -122,7 +125,7 @@ namespace FiresEasyBakeMeshes
             if (first && m == 0) return;   // nothing handled at start: no line, no event (the lower mods' first read already says false)
             ShaderOwnershipRevision++;
             EasyBakeLog.Info("[EbmApi] shader ownership (" + why + "): EBM draws " + (m == 0 ? "none (other mods / the game draw them)" :
-                ((m & M_Terrain) != 0 ? "Custom/Heightmap (non-snow) " : "") + ((m & M_Water) != 0 ? "Custom/Water " : "")
+                ((m & M_Terrain) != 0 ? "Custom/Heightmap (all chunks, snow included) " : "") + ((m & M_Water) != 0 ? "Custom/Water " : "")
                 + ((m & M_Lava) != 0 ? "Custom/FlowOpaque (covered lava) " : "") + ((m & M_Piece) != 0 ? "Custom/Piece " : "") + ((m & M_Mist) != 0 ? "Lux Lit Particles/ Tess Bumped (the mist)" : "")).TrimEnd() + "; revision " + ShaderOwnershipRevision);
             Action ev = ShaderOwnershipChanged;
             if (ev == null) return;
@@ -185,8 +188,85 @@ namespace FiresEasyBakeMeshes
         // (negative / NaN = no answer: the piece keeps the SetPieceSnow path). Null withdraws. Re-registering replaces; every announced group re-asks.
         public static void RegisterPieceSnowShapeSource(Func<Vector3, float> shapeAt) { if (!Inert) EasyBake.EbmSnowStore.RegisterShapeSource(shapeAt); }
 
-        // Snow-cap values for a piece: stored only, EBM does not draw caps yet. False for a piece EBM does not draw.
-        public static bool SetCapSnow(ZDOID id, float level, Vector4 edges, Vector4 neighbours) => !Inert && EasyBake.EbmSnowStore.SetCap(id, level, edges, neighbours);
+        // Snow-cap values for a piece. False for a piece EBM does not draw. 1.2.505: edges / neighbours go to that piece's drawn cap (PieceCaps, below) as
+        // the instanced _VedrCapEdges / _VedrCapNbr; level is stored only (the cap's amount is the piece's snow shape).
+        public static bool SetCapSnow(ZDOID id, float level, Vector4 edges, Vector4 neighbours)
+        {
+            if (Inert) return false;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.509: timed (the [Caps] line's cap API counts)
+            bool r = EasyBake.EbmSnowStore.SetCap(id, level, edges, neighbours);
+            EasyBake.PieceCaps.NoteApi(EasyBake.PieceCaps.ApiCapSnow, t0);
+            return r;
+        }
+
+        // ── 1.2.505 ([visual], piece snow caps v1; agreed [seasons], approved [2ic] + [lead] 11-23): the season mod owns one cap mesh + material per piece
+        // prefab; EBM only draws it, once per baked piece of that prefab, matrix = piece root x capToRoot, on the instanced path, culled with the piece's
+        // zone cells, gone with the piece. Per instance: _SnowLevel = the piece's snow shape (SetPieceSnowShape / the shape source; none yet = no cap),
+        // _VedrCapEdges / _VedrCapNbr = SetCapSnow's edges / neighbours (0 / 0 until set). Key [08 - Snow And Seasons] Draw Snow Caps On Baked Pieces
+        // (default off). Main thread. Add-only. ──
+        public const int PieceCapApiVersion = 1;
+        // Registers / replaces the cap of one prefab (name; matched by its stable hash). mesh in the cap's own frame, capToRoot = translation + rotation (1.2.511: any rotation; no scale / shear / mirror)
+        // (else refused). The mesh and material stay the owner's: EBM never edits, destroys or reads them back; keep them alive until replaced / removed /
+        // cleared. mesh null = remove. False: EBM inert, bad arguments, a bad capToRoot, or another owner holds that prefab.
+        public static bool SetPieceCapMesh(string owner, string prefab, Mesh mesh, Matrix4x4 capToRoot, Material material, bool castShadows)
+            => !Inert && EasyBake.PieceCaps.Set(owner, prefab, mesh, capToRoot, material, castShadows);
+        // Removes every cap this owner registered (key off / logout); their live pieces get their own cap renderers back.
+        public static void ClearPieceCaps(string owner) { if (!Inert) EasyBake.PieceCaps.Clear(owner); }
+        // Live: true while EBM will draw registered caps (key on, not inert, instancing on).
+        public static bool PieceCapsActive => !Inert && EasyBake.PieceCaps.PieceCapsActive;
+        // Cap instances EBM drew in the last frame.
+        public static int PieceCapsDrawn => Inert ? 0 : EasyBake.PieceCaps.PieceCapsDrawn;
+        // True while EBM draws this live piece's cap and has switched its own cap renderers (m_snow / m_snowWorn / m_snowBroken) off: the owner must
+        // not write renderer.enabled on them then (SetActive is free). PieceLeftBake follows the moment it turns false on a hand-back.
+        public static bool DrawsPieceCap(GameObject piece)
+        {
+            if (Inert) return false;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.509: timed
+            bool r = EasyBake.PieceCaps.DrawsCap(piece);
+            EasyBake.PieceCaps.NoteApi(EasyBake.PieceCaps.ApiDraws, t0);
+            return r;
+        }
+
+        // ── 1.2.508 ([visual] + [seasons] .41 tilted caps, add-only; PieceCapApiVersion stays 1, bind by HasMember) ──
+        // A variant of a prefab's cap: variant 1..32, mesh in the cap's frame, capToRoot translation + rotation (1.2.511: any rotation; no scale / shear / mirror); the prefab's base cap must already be registered by
+        // the same owner (its material / shadows are used). mesh null removes the variant. Variants stay with a replaced base and go with ClearPieceCaps.
+        public static bool SetPieceCapVariant(string owner, string prefab, int variant, Mesh mesh, Matrix4x4 capToRoot)
+        {
+            if (Inert) return false;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.509: timed
+            bool r = EasyBake.PieceCaps.SetVariant(owner, prefab, variant, mesh, capToRoot);
+            EasyBake.PieceCaps.NoteApi(EasyBake.PieceCaps.ApiVariant, t0);
+            return r;
+        }
+        // Which cap one baked piece draws: 0 = the base cap (default), 1..32 = that variant, -1 = no cap (its live cap stays unclaimed). A variant not registered
+        // yet draws nothing until it is. False = not a piece EBM holds. Kept across a re-announce, dropped with the zone (re-send on ZoneBaked). Main thread.
+        // 1.2.510 ([seasons] .46, add-only): the CAP's own snow level for one baked piece, encoded as SetPieceSnowShape (0..1 winter ground x shelter, 2..3 snow
+        // base + shelter); it feeds only that cap's _SnowLevel (the body keeps the shape value). encoded < 0 clears it (the cap draws from the shape again). False =
+        // not a piece EBM holds, or caps are off (a clear is always taken). Kept across a re-announce, dropped with the zone (re-send on ZoneBaked). A change shows within 0.5 s. Main thread.
+        public static bool SetPieceCapLevel(ZDOID id, float encoded)
+        {
+            bool clear = float.IsNaN(encoded) || encoded < 0f;
+            if (Inert || (!EasyBake.PieceCaps.Active && !clear)) return false;   // [2ic] SHOULD: a clear always goes through (no stale group level when caps come back)
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool r = EasyBake.EbmSnowStore.SetCapLevel(id, encoded);
+            EasyBake.PieceCaps.NoteApi(EasyBake.PieceCaps.ApiCapLevel, t0);
+            return r;
+        }
+
+        // 1.2.512 (add-only; the name Vedr .52 binds, [seasons]): true = EBM keeps each baked piece's cap values (SetCapSnow edges / neighbours, SetPieceCapLevel,
+        // SetPieceCapOverride) when the piece goes live and comes back baked, across a zone re-announce, AND across its zone leaving / re-entering the loaded area
+        // (restored for the same piece at the same place); the owner need not re-send them when the same piece comes back. Dropped after 10 min away (its zone
+        // unloaded or the piece not baked), on InvalidateSnow or a reset.
+        public static bool PieceCapValuesKeptAcrossSwaps => !Inert;
+
+        public static bool SetPieceCapOverride(ZDOID id, int variant)
+        {
+            if (Inert) return false;
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();   // 1.2.509: timed
+            bool r = EasyBake.EbmSnowStore.SetCapVariant(id, variant);
+            EasyBake.PieceCaps.NoteApi(EasyBake.PieceCaps.ApiOverride, t0);
+            return r;
+        }
 
         internal static void RaiseZoneBaked(Vector2s zone, ZDOID[] ids)
         {
@@ -200,6 +280,18 @@ namespace FiresEasyBakeMeshes
             var h = ZoneUnloaded;
             if (h == null) return;
             try { h(new Vector2i(zone.x, zone.y)); } catch (Exception e) { EasyBakeLog.Warn("[EbmApi] a ZoneUnloaded listener threw: " + e.Message); }
+        }
+
+        // ── 1.2.483 ([visual], Fire 11-21 far sync; design Tools\DESIGN_far_zone_set_20261121.md 3.5; for FAT's [Far Terrain] ExtendedReach ring, [saddles]) ──
+        // True while EBM's own far ground (FarTerrainTiles, [03 - Far Rendering] Far Terrain + Far Rendering) covers the view and the game's distant
+        // terrain (every TerrainLod) is switched off by EBM. A mod that draws its own distant TerrainLod builds none while this is true (and removes a live
+        // one); false again when EBM's far ground stops (key off, world end, failure): build it again then. Main thread; read by name is fine.
+        public static bool FarGroundOwned => !Inert && EasyBake.Far.FarTerrainTiles.GroundOwned;
+        // Raised (main thread) when FarGroundOwned changes; read FarGroundOwned in the handler.
+        public static event Action FarGroundOwnedChanged;
+        internal static void RaiseFarGroundOwnedChanged()
+        {
+            try { FarGroundOwnedChanged?.Invoke(); } catch (Exception e) { EasyBakeLog.Warn("[EbmApi] a FarGroundOwnedChanged listener threw: " + e.Message); }
         }
 
         // ── 1.2.208: what Core (or any mod) may plug INTO EBM. EBM never looks anyone up; nothing registered = EBM's own defaults. Main thread. ──
@@ -268,6 +360,39 @@ namespace FiresEasyBakeMeshes
         public static void RegisterFarSnow(Func<bool> active, Func<Vector3, float> coverAt, Func<Vector3, float> exposureAt, Func<int> revision, Func<float> worldSnow01)
         { if (!Inert) EasyBake.Far.FarSnow.Register(active, coverAt, exposureAt, revision, worldSnow01); }
 
+        // 1.2.468 ([visual], Fire 11-19: "bakes have no use for snow layers that are meant to change constantly"): far-building snow as a LAYER, not baked caps.
+        // The snow owner registers classAt(pos) for pieces EBM draws far away (no loaded chunk there): the piece's snow CLASS at full openness, in the near
+        // shape encoding (EbmApi.SetPieceSnowShape): 0 = never snows here, 1 = winter ground, 3 = snow base (Mountain / Deep North); negative = no answer.
+        // It must not depend on the season or the weather (the owner's live amount does that): EBM bakes it once per far copy. EBM multiplies in its own
+        // shelter (from the copy's geometry) and draws the result through the owner's piece shader; vanilla's snow cap meshes are no longer merged.
+        // Null withdraws (far copies go back to the vanilla caps). Re-registering replaces and rebuilds the far copies once. Main thread.
+        public const int FarPieceSnowShapeVersion = 1;
+        public static void RegisterFarPieceSnowShapeSource(Func<Vector3, float> classAt)
+        { if (!Inert) EasyBake.Far.FarSnow.RegisterFarShape(classAt); }
+
+        // ── 1.2.501 ([visual]/[seasons], Fire 256 "distant terrain should show the proper texture for the area and for the season"): EBM's FAR TERRAIN tiles,
+        // pushed by the snow owner (EBM looks nobody up; these replace 1.2.470's reflection into VedrApi). Game / Unity types only. All MAIN thread. ──
+        public const int FarTerrainSeasonVersion = 1;
+        // The FINAL paint-mask G for a far-terrain vertex on HD-look tiles ([03] Far Terrain HD Look; HD's shader reads no EBM per-pixel winter):
+        // finalG(x, z, biome, baseHeight, baseG), baseHeight = the height the far tile draws before terrain edits (WorldGenerator.GetBiomeHeight, or FAT's near-blend height when FAT is loaded), baseG = its world-gen mask G.
+        // EBM writes the return as is (negative / NaN = keep baseG) into an upload copy, never the cache. Up to 4225 calls per tile. Null withdraws.
+        public static void RegisterFarTerrainSnowSource(Func<float, float, Heightmap.Biome, float, float, float> finalG) { if (!Inert) EasyBake.Far.FarTerrainTiles.VedrFar.RegisterSnow(finalG); }
+        // The owner's far snow changed (fill step, paint flip, class or key change): shown HD-look tiles re-upload, a few per frame. A repeat restarts the pass.
+        public static void RaiseFarTerrainSnowChanged() { if (!Inert) EasyBake.Far.FarTerrainTiles.VedrFar.Reupload("snow owner changed"); }
+        // The winter-free ("true") ground colour of a biome for far vertex colours. EBM keeps vanilla's sector rule (the first alt-biome texture override). Null withdraws.
+        public static void RegisterFarTrueBiomeColour(Func<Heightmap.Biome, Color32> trueColour) { if (!Inert) EasyBake.Far.FarTerrainTiles.VedrFar.RegisterTrueColour(trueColour); }
+        // The biomes (Heightmap.Biome bits) whose far ground takes the owner's winter snow class (EBM/Heightmap's per-pixel far snow). Push on every change.
+        public static void SetFarWinterSnowClass(int biomeMask) { if (!Inert) EasyBake.Far.FarTerrainTiles.VedrFar.SetClassMask(biomeMask); }
+        // A season texture for the far material: allow-list only ("_DiffuseArrayTex", the fall / spring tinted array). Null = the material's own back.
+        // HD-look far material always; EBM/Heightmap only without HD Terrain. Push null (or the original) BEFORE destroying a pushed texture. False = refused.
+        public static bool SetFarTerrainTexture(string property, Texture tex) => !Inert && EasyBake.Far.FarTerrainTiles.VedrFar.SetTexture(property, tex);
+
+        // ── 1.2.502 ([visual]/[seasons], unified snow layer): the snow owner's ONE snow layer over builds draws the snow tops (cast against EBM's stand-in
+        // colliders). drawsTops = true as soon as the owner's layer key is on and the layer CAN run (before its first field: EBM decides at create, and
+        // login creates come first); false only on key off / logout / a layer error, never on a transient "field not live yet". Main thread; only flips act.
+        // With [08 - Snow And Seasons] Baked Pieces Under Snow Layer on, winter snow keeps no piece real while true.
+        public static void SetPieceSnowLayerOwner(string owner, bool drawsTops) { if (!Inert) VedrLink.SetSnowLayerOwner(owner, drawsTops); }
+
         // VA distant skip (FAP): a prefab FAP's own distant method already shows out to maxDistance metres is not drawn by EBM's far buildings
         // inside that distance (no double draw). maxDistance <= 0 removes it. Re-register freely (last value wins).
         public static void RegisterFarSkip(string prefabName, float maxDistance)
@@ -291,7 +416,7 @@ namespace FiresEasyBakeMeshes
         // FAP: a bake landed, was restored, changed or was removed (main thread); EBM reads that name again.
         public static void RaiseFarBakeReady(string cacheName) { if (!Inert) EasyBake.Far.FarBakeSources.Ready(cacheName); }
 
-        // True while EBM's impostor engine draws (this is a client and [Far Impostors] Enabled is on). Cells a feeder sends while it is false are kept
+        // True while EBM's impostor engine draws (this is a client and [03 - Far Rendering] Far Rendering and Far Trees are on). Cells a feeder sends while it is false are kept
         // (as Core did) and draw once it turns on; a feeder may read this to skip building cells nobody can see.
         public static bool FarForestLive => EasyBake.Far.FarRunner.Client && EasyBake.Far.ImpostorEngine.Enabled;
         // A mod that draws far buildings itself asks EBM's far buildings to step aside (why = the reason logged); null / empty why withdraws it.

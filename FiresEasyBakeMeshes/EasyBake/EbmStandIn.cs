@@ -25,6 +25,24 @@ namespace FiresEasyBakeMeshes
 
         // True when the collider is any EBM stand-in.
         public static bool IsStandIn(Collider collider) => collider != null && collider.GetComponentInParent<EbmStandIn>() != null;
+
+        // 1.2.482 ([visual], [lead] 11-21; the contract Vedr's BakedPieceSnow has bound by reflection since 0.3.x and that never existed here): add-only.
+        // True when the collider is an EBM stand-in of a piece EBM is skipping right now; id = that piece's ZDO. Main thread only.
+        public static bool StandsInFor(Collider collider, out ZDOID id)
+        {
+            id = ZDOID.None;
+            var mark = collider != null ? collider.GetComponentInParent<EbmStandIn>() : null;
+            if (mark == null) return false;
+            var zdo = EasyBake.ZoneTracker.SkippedAt(mark.PrefabHash, mark.Position);
+            if (zdo == null) return false;
+            id = zdo.m_uid;
+            return true;
+        }
+
+        // 1.2.482: add-only. Makes the piece real (a skipped piece is handed back to the game, its stand-in kept until the real piece stands) and keeps it
+        // real for the rest of the session. True = real now or being created; false = EBM does not hold that piece (or its keep list is full). why = a
+        // short reason for the log, e.g. "Vedr: shovel hit". Main thread only.
+        public static bool MakeReal(ZDOID id, string why) => EasyBake.ZoneTracker.MakeRealFor(id, why);
     }
 }
 

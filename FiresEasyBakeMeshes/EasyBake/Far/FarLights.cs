@@ -39,6 +39,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             public bool Burning, Live; public float Phase; public int Sweep;
             public Quaternion Rot = Quaternion.identity;   // 1.2.427: the piece's rotation (anchor = Pos + Rot * Kind.LightLocal); identity for cache-only records
             public float Show; public GameObject Inst; public Renderer[] Rends;   // 1.2.427: glow fade 0..1; the live instance and its renderers (is the real lantern drawn?)
+            public Light[] Lights; public Vector3 LiveAnchor; public bool HasLiveAnchor;   // 1.2.473: the live instance's own Light(s): the real light's state and its exact world spot
         }
         private static readonly Dictionary<ZDOID, Rec> s_recs = new Dictionary<ZDOID, Rec>();
 
@@ -56,23 +57,25 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static long s_scanTicks, s_drawTicks;
 
         /// <summary>True when the far lights are switched on (live key).</summary>
-        public static bool Enabled => s_enabled != null && s_enabled.Value;
+        public static bool Enabled => s_enabled != null && s_enabled.Value && FarRendering.On;   // 1.2.458: AND the Far Rendering master
 
         /// <summary>Binds [Far Lights] in the given config (EBM's own Awake calls it; once per process) and registers with FarRunner.</summary>
         internal static void Initialize(ConfigFile config)
         {
             if (s_bound || config == null) return;
             s_bound = true;
-            s_enabled = config.Bind("Far Lights", "Enabled", false,
-                "At night, distant fires, torches and lamps glow beyond where their real light reaches (fires only while they have fuel; "
-                + "workshops stay dark). Hidden by fog and by terrain or buildings in front of them.");
-            s_falloff = config.Bind("Far Lights", "Falloff", 1f,
+            // 1.2.458 (Fire 11-18): [03 - Far Rendering] Far Lights (was [07 - Far Lights] Enabled; EbmConfigMove carries a saved value), under the master switch
+            s_enabled = EbmConfigMove.Bind(config, FarRendering.Section, "Far Lights", false,
+                "At night, draws distant fires, torches and lamps as glows beyond where their real light reaches (fires only while they have fuel; "
+                + "workshops stay dark). Hidden by fog and by terrain or buildings in front of them. Needs Far Rendering on.");
+            s_falloff = EbmConfigMove.Bind(config, "07 - Far Lights", "Falloff", 1f,
                 new ConfigDescription("How fast distant glows fade with distance: higher = they fade sooner, lower = they carry further.", new AcceptableValueRange<float>(0.25f, 4f)));
-            s_maxDistance = config.Bind("Far Lights", "Max distance", 2500f,
+            s_maxDistance = EbmConfigMove.Bind(config, "07 - Far Lights", "Max distance", 2500f,
                 new ConfigDescription("The furthest a glow is drawn, in metres.", new AcceptableValueRange<float>(300f, 6000f)));
-            s_sleepByDay = config.Bind("Far Lights", "Sleep By Day", true,
+            s_sleepByDay = EbmConfigMove.Bind(config, "07 - Far Lights", "Sleep By Day", true,
                 "In full daylight (when no distant glow can be drawn) the far-light scan pauses, and resumes ahead of dusk. Same picture, less work by day.");
             s_enabled.SettingChanged += (_, __) => { if (!Enabled) Clear(false); };
+            FarRendering.Changed += () => { if (!Enabled) Clear(false); };   // 1.2.458: the same on the master switch
             EbmFarWorldEvents.WorldClosed += () => Clear(true);
             FarCache.OnWorldReady += () => s_cacheAsked = false;
             FarRunner.Register("FarLights", Tick, null);
@@ -271,10 +274,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (!r.Burning) continue;
                     float d2 = (r.Pos - eye).sqrMagnitude;
                     if (d2 > maxD2) continue;
+                    // 1.2.473 (Fire 11-19 21:3x, 1156: discs at 2-3 m under a lamp post): a hard floor whatever the record's state (a cache-only or stale record has no
+                    // live Light to ask): never a glow nearer than the distance the game itself switches this light off (its LightLod, 40 m default)
+                    float floor = r.Kind.LodDistance;
+                    if (d2 < floor * floor) { r.Show = 0f; p_floorHidden++; continue; }
                     // 1.2.427 (Fire: the near lanterns show their own glow; the round glow only where the real lantern is NOT drawn): per light, the target is 0 while its
                     // live instance has a renderer the camera draws (LOD not culled, in view), else 1; it eases 0.25 a draw (10 Hz: ~0.4 s) so the hand-off never pops.
                     // Replaces the old distance hand-off (0.6-1.2 x the light's range), which overlapped the real lantern far beyond its range.
-                    float want = RealDrawn(r) ? 0f : 1f;
+                    // 1.2.473 (Fire 11-19 docks at night: "this baked lighting was meant to not show until farther away ... the baked circles should be sitting in the exact
+                    // spot the lanterns sit, not offset by a meter or two"): the hand-off follows the REAL LIGHT, not the lantern's renderers. A baked lantern's renderers are
+                    // switched off by EBM (EasyBakeSuppressedVisuals), so Renderer.isVisible read "not drawn" right next to a lit lantern and the glow showed beside it.
+                    // Now: hidden while the live instance's Light is on (vanilla LightLod switches it off past its m_lightDistance, 40 m default, LightLod.cs:86-102), so the
+                    // glow takes over exactly where the game stops lighting; a live instance without a Light keeps the renderer test.
+                    float want = RealLit(r) ? 0f : 1f;
                     r.Show = Mathf.MoveTowards(r.Show, want, 0.25f);
                     if (r.Show <= 0.001f) continue;
                     s_near.Add(new KeyValuePair<float, Rec>(d2, r));
@@ -295,7 +307,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     var c = r.Kind.Color;
                     s_parts[count++] = new ParticleSystem.Particle
                     {
-                        position = r.Pos + r.Rot * r.Kind.LightLocal,   // 1.2.427: at the light point (was root + 0.3 / 0.6 m up)
+                        position = r.HasLiveAnchor ? r.LiveAnchor : r.Pos + r.Rot * r.Kind.LightLocal,   // 1.2.473: the live Light's own world position when the instance exists; else the prefab's rest pose (1.2.427)
                         startSize = size, remainingLifetime = 1e5f, startLifetime = 1e5f,
                         startColor = new Color(c.r, c.g, c.b, Mathf.Clamp01(b)),
                     };
@@ -303,6 +315,32 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             }
             s_ps.SetParticles(s_parts, count);
             s_drawn = count;
+        }
+
+        // 1.2.473: is this light's REAL light on now? Its live instance's Light(s) (found once per instance, inactive ones too: LightLod toggles enabled / range).
+        // Sets the anchor to the first Light's world position whenever the instance exists, so a near glow sits on the lantern even while it fades in.
+        private static int p_litHidden, p_liveAnchored, p_noLight, p_floorHidden;
+        private static bool RealLit(Rec r)
+        {
+            r.HasLiveAnchor = false;
+            var scene = ZNetScene.instance;
+            if (scene == null || !r.Live) return false;
+            var zdo = ZDOMan.instance.GetZDO(r.Id);
+            var nv = zdo != null ? scene.FindInstance(zdo) : null;
+            var go = nv != null ? nv.gameObject : null;
+            if (go == null) { r.Inst = null; r.Rends = null; r.Lights = null; return false; }
+            if (!ReferenceEquals(go, r.Inst) || r.Lights == null) { r.Inst = go; r.Rends = null; r.Lights = go.GetComponentsInChildren<Light>(true); }
+            if (r.Lights.Length == 0) { p_noLight++; return RealDrawn(r); }   // no Light on the live piece: the 1.2.427 renderer test
+            bool lit = false;
+            foreach (var l in r.Lights)
+            {
+                if (l == null) continue;
+                if (!r.HasLiveAnchor) { r.LiveAnchor = l.transform.position; r.HasLiveAnchor = true; }
+                if (l.isActiveAndEnabled && l.intensity > 0.001f && l.range > 0.01f) { lit = true; r.LiveAnchor = l.transform.position; break; }
+            }
+            if (r.HasLiveAnchor) p_liveAnchored++;
+            if (lit) p_litHidden++;
+            return lit;
         }
 
         // 1.2.427: is this light's real piece drawn now? Its live instance (vanilla's own ZDO -> instance map) with any renderer Unity rendered last frame
@@ -415,6 +453,9 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             if (EasyBakeLog.DebugOn())
                 EasyBakeLog.Debug($"[FarLights] last 30 s: {s_recs.Count} known ({s_cacheLoaded} from the far cache), {s_burningCount} burning, {s_drawn} drawn; "
                     + $"scan {s_scanTicks * ms:0.0} ms, burn+draw {s_drawTicks * ms:0.0} ms; darkness {Darkness():0.00}; sleep by day {(SleepByDay ? "on" : "off")}, asleep {s_sleptFrames} frame(s)");
+            if (p_liveAnchored + p_litHidden + p_noLight + p_floorHidden > 0)   // 1.2.473 proof (Info the first time, Debug after): glows on the live Light's spot, hidden while the real light is on
+                EasyBakeLog.InfoFirst("farlights-reallight", $"[FarLights] hand-off 30 s (1.2.474): {s_drawn} glow(s) drawn now; checks at 10 Hz: {p_litHidden} hidden because the real light was on, {p_liveAnchored} placed on the live Light's world position, {p_noLight} on a live piece without a Light (renderer test), {p_floorHidden} inside the light's own LightLod distance (never drawn there); the glow takes over where the game switches the light off (LightLod)");
+            p_litHidden = p_liveAnchored = p_noLight = p_floorHidden = 0;
             s_scanTicks = 0; s_drawTicks = 0; s_sleptFrames = 0;
         }
 

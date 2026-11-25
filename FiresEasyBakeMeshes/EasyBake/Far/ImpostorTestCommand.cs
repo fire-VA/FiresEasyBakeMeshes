@@ -10,7 +10,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
     /// <summary>
     /// fires_impostors (dev / admin, cheat): proof of the impostor engine without an owner feeding it (lead 11-08 option (b)).
     ///   fires_impostors status            one status line
-    ///   fires_impostors on | off | cfg    session override of [Far Impostors] Enabled (never saved); cfg = back to the config value
+    ///   fires_impostors on | off | cfg    session override of [03 - Far Rendering] Far Trees (and Far Rendering) (never saved); cfg = back to the config value
     ///   fires_impostors test [radius] [per hectare]   registers vanilla trees and fills 512 m cells around you, biome by biome (built on a worker)
     ///   fires_impostors clear             removes the test trees
     /// Lines start "[FarImpostors] test:" (Info: it is a one-time command action).
@@ -66,7 +66,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             var p = Player.m_localPlayer; var wg = WorldGenerator.instance; var scene = ZNetScene.instance;
             if (p == null || wg == null || scene == null) return "test: no player / world";
-            if (!ImpostorEngine.Enabled) return "test: the engine is off ([Far Impostors] Enabled, or 'fires_impostors on' for this session)";
+            if (!ImpostorEngine.Enabled) return "test: the engine is off ([03 - Far Rendering] Far Rendering + Far Trees, or 'fires_impostors on' for this session)";
             var kinds = new Dictionary<Heightmap.Biome, int[]>(); var missing = new List<string>(); int registered = 0;
             foreach (var kv in Trees)
             {

@@ -14,9 +14,9 @@ namespace FiresEasyBakeMeshes.EasyBake
 
         internal static void Bind(ConfigFile config)
         {
-            Enabled = config.Bind("Batching", "IdleGates", true,
+            Enabled = EbmConfigMove.Bind(config, "23 - Performance - World Objects", "IdleGates", true,
                 "Skip per-frame writes of finished fades (material faders, portals, effect fades) and pause looping particles of placed pieces while off screen.");
-            InvulnerableClassifier.AllImmuneWear = config.Bind("Batching", "VanillaWearOnInvulnerablePieces", false,
+            InvulnerableClassifier.AllImmuneWear = EbmConfigMove.Bind(config, "23 - Performance - World Objects", "VanillaWearOnInvulnerablePieces", false,
                 "Run vanilla wear and support on invulnerable pieces: all-Immune pieces can then collapse, and pieces leaning on a floating negative-health piece can too. Off keeps what stands today standing. Applies to pieces loaded after the change.");
             EasyBakeLog.Debug($"[IdleGates] {(On ? "on" : "off")}");
             Enabled.SettingChanged += (_, __) => ApplyToTracked();   // 1.2.380: the particle half follows a live flip (the three Update gates read On every call)

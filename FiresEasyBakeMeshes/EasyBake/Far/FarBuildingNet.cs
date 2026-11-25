@@ -39,6 +39,19 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         private static float s_nextSend;
         private static bool s_loggedAnswering, s_loggedReceiving;
         private static string s_lastReceiveState;   // 0.2.1216
+        // 1.2.485 ([2ic] step-4 note, [lead] GO): a client of a dedicated server only gets far bases out to the SERVER's reach. Under Far Zone Sync the client's one far reach
+        // is capped at it, so far terrain / trees / rocks never reach past the last far building that can arrive ("never one without the other" at the edge).
+        // Unknown (no reply yet, or a pre-1.2.485 server) = the old far-buildings clamp maximum, 5000 m.
+        private static float s_serverReach = -1f;
+        internal const float UnknownServerReach = 5000f;
+        internal static bool CapsReach(out float cap)
+        {
+            cap = 0f;
+            if (ZNet.instance == null || ZNet.instance.IsServer() || !FarBuildings.Enabled || !FarBuildings.ClientAsks) return false;
+            cap = s_serverReach > 0f ? s_serverReach : UnknownServerReach;
+            return true;
+        }
+        internal static void ForgetServer() => s_serverReach = -1f;
 
         internal static void Update()
         {
@@ -50,6 +63,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 rpc.Register<ZPackage>(RpcAsk, OnAsk);
                 rpc.Register<ZPackage>(RpcZones, OnZones);
                 s_lastAsk.Clear(); s_outbox.Clear(); s_sentBytes.Clear();
+                s_serverReach = -1f;   // 1.2.485: a new connection: the server's reach is unknown again
             }
 
             if (ZNet.instance.IsServer()) { if (FarBuildings.ServerSends) Flush(); return; }
@@ -140,6 +154,7 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                 }
                 pkg.Write(Version); pkg.Write(entries.Count);
                 foreach (var e in entries) { pkg.Write((int)e.Key.x); pkg.Write((int)e.Key.y); pkg.Write(e.Value); }
+                pkg.Write(FarBuildings.Reach);   // 1.2.485: TRAILING field, this server's far-buildings reach. Pre-1.2.485 clients stop reading before it; 1.2.485+ clients cap their far set's reach at it.
                 ZRoutedRpc.instance.InvokeRoutedRPC(peerId, RpcZones, pkg);
                 s_sentBytes[peerId] += bytes;
             }
@@ -170,6 +185,8 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
                     if (pieces == null) { rejected++; why = FarBuildingDigest.LastReject; continue; }   // malformed: dropped
                     FarBuildingDigest.Apply(zone, pieces, fromServer: true); applied++;
                 }
+                // 1.2.485: a 1.2.485+ server appends its reach (trailing float); a pre-1.2.485 server sends none (ServerReach stays unknown)
+                if (pkg.GetPos() + 4 <= pkg.Size()) { float r = pkg.ReadSingle(); if (r > 0f && r <= 20000f && !Mathf.Approximately(r, s_serverReach)) { s_serverReach = r; EasyBakeLog.Info($"{FarBuildings.Log} the server sends far bases out to {r:0} m"); } }
                 if (!s_loggedReceiving) { s_loggedReceiving = true; EasyBakeLog.Info($"{FarBuildings.Log} receiving far bases from the server."); }
                 string line = $"{FarBuildings.Log} server sent {n} zone(s), {applied} applied" + (loaded > 0 ? $", {loaded} loaded here (our own scan has them)" : "") + (rejected > 0 ? $", {rejected} rejected (last: {why ?? "?"})" : "") + ".";
                 // 0.2.1216 ([lead]): Info once per state change (applying / rejecting + why), Debug for every receive

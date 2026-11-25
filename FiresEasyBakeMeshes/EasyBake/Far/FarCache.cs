@@ -79,15 +79,15 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
         {
             if (s_bound || config == null) return;
             s_bound = true;
-            s_enabled = config.Bind("Far Cache", "Enabled", false,
+            s_enabled = EbmConfigMove.Bind(config, "10 - Far View Disk Cache", "Enabled", false,
                 "Keeps far-view data on disk (impostor pictures, far forest, far buildings) so distant land appears at once when you come back. "
                 + "Off: everything far is rebuilt each visit and nothing is written. Stored under BepInEx/cache/FiresEasyBakeMeshes/Far.");
-            s_skipUnchangedSaves = config.Bind("Far Cache", "SkipUnchangedSaves", true, "A far zone just read from the cache is not written straight back. A zone that really changed is still saved. No visible effect; off = written back as before.");
-            s_worldMb = config.Bind("Far Cache", "Max MB per world", 256,
+            s_skipUnchangedSaves = EbmConfigMove.Bind(config, "10 - Far View Disk Cache", "SkipUnchangedSaves", true, "A far zone just read from the cache is not written straight back. A zone that really changed is still saved. No visible effect; off = written back as before.");
+            s_worldMb = EbmConfigMove.Bind(config, "10 - Far View Disk Cache", "Max MB per world", 256,
                 new ConfigDescription("Disk space one world's far data may use; the least recently used is removed first.", new AcceptableValueRange<int>(16, 4096)));
-            s_allWorldsMb = config.Bind("Far Cache", "Max MB all worlds", 1024,
+            s_allWorldsMb = EbmConfigMove.Bind(config, "10 - Far View Disk Cache", "Max MB all worlds", 1024,
                 new ConfigDescription("Disk space all worlds' far data may use together; the least recently visited world is removed first.", new AcceptableValueRange<int>(64, 16384)));
-            s_globalMb = config.Bind("Far Cache", "Max MB shared", 512,
+            s_globalMb = EbmConfigMove.Bind(config, "10 - Far View Disk Cache", "Max MB shared", 512,
                 new ConfigDescription("Disk space for far data shared by every world (impostor pictures).", new AcceptableValueRange<int>(32, 8192)));
             FarCacheWorld.Hook();
             s_enabled.SettingChanged += (_, __) => { if (Enabled && EbmFarWorldEvents.IsWorldReady) FarCacheWorld.Open(); };   // turned on mid-world: open now

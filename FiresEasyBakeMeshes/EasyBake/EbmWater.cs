@@ -32,14 +32,14 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static ConfigEntry<bool> On, Verify;
         internal static void Bind(ConfigFile config)
         {
-            On = FiresEasyBakeMeshesPlugin.BindMoved(config, "Optimize", "WaterShader", /* OFF until gate ABBA (Fire 11-11 hard rule) */ false,
+            On = EbmConfigMove.Bind(config, "40 - Shaders", "WaterShader", /* OFF until gate ABBA (Fire 11-11 hard rule) */ false,
                 "EBM draws the water. Off = EBM stands down; Vedr's or FiresTossinShade's water shader, or the game's, takes over. "
                 + "EBM draws the sea and lakes with its own water shader (a copy of our FiresWater: same look). With TossinShade installed it keeps feeding the water "
                 + "its settings; without it the water uses its built-in fallbacks (sky reflection instead of the mirror, no shore field, built-in caustics). OFF until gate ABBA.");
             EbmFtsGlobals.Bind(config);   // 1.2.428
             EbmFatWaterLook.Bind(config);   // 1.2.437: EBM as FAT's water look provider ([Water] FAT Water Look, default off)
-            Verify = config.Bind("Debugging", "WaterShaderVerify", false,
-                "Every 30 s, counts the water tiles by shader and checks EBM's water shader is never on a built piece's water (the hot tub).");
+            Verify = EbmConfigMove.Bind(config, "90 - Debugging", "WaterShaderVerify", false,
+                "Needs [40 - Shaders] WaterShader = true. Every 30 s, counts the water tiles by shader and checks EBM's water shader is never on a built piece's water (the hot tub).");
             On.SettingChanged += (_, __) => { if (!On.Value) ReleaseAll("key turned off"); EbmApi.RecheckShaderOwnership(On.Definition.Key + " key", true); };   // 1.2.318: lower mods pick the shader up live
             // 1.2.316 (Fire: "ebms water shader sliders need to live in ebms own config"): every look value EBM/Water reads is a key here, in EBM's own
             // cfg (defaults = vanilla for the 41h-41k shallow terms, FTS's defaults for the rest), pushed by EBM itself under the shader's global names
@@ -49,118 +49,128 @@ namespace FiresEasyBakeMeshes.EasyBake
             MoveOldLookSection(config);
             // 1.2.322 ([lead]: FTS stands down fully; EBM owns the cheap water looks itself): rain rings and wind drift, our own code (FTS's FiresWaterRain /
             // FiresWaterWindTravel logic), EBM's own keys. Defaults = FTS's, so the water looks as it did while FTS fed it.
-            RainOn = config.Bind(SecWaves, "Rain Rings", true, "Rings on the water while it rains. Off = the water ignores rain.");
-            RainSize = config.Bind(SecWaves, "Rain Ring Spacing", 1.2f, new ConfigDescription("How far apart the rain rings are. Higher = bigger, sparser rings. In metres. Range 0.2 to 5. Default 1.2.", new AcceptableValueRange<float>(0.2f, 5f)));
-            RainStrength = config.Bind(SecWaves, "Rain Ring Strength", 0.6f, new ConfigDescription("How strongly the rings ripple the surface. Higher = stronger rings. 0 = none. Range 0 to 2. Default 0.6.", new AcceptableValueRange<float>(0f, 2f)));
-            RainUnder = config.Bind(SecWaves, "Rain Rings From Below", 1.5f, new ConfigDescription("How much stronger the rings look from under the water. Range 0 to 4. Default 1.5.", new AcceptableValueRange<float>(0f, 4f)));
-            RainFade = config.Bind(SecWaves, "Rain Ring Distance", 90f, new ConfigDescription("Rings fade out by this distance from you. Higher = rings further out. In metres. Range 1 to 500. Default 90.", new AcceptableValueRange<float>(1f, 500f)));
-            WindDrift = config.Bind(SecWaves, "Smooth Wind Drift", true, "Foam and light patterns drift steadily with the wind instead of swinging back and forth when the wind turns. Off = the old swinging drift.");
+            RainOn = EbmConfigMove.Bind(config, SecWaves, "Rain Rings", true, "Needs [40 - Shaders] WaterShader = true. Rings on the water while it rains. Off = the water ignores rain.");
+            RainSize = EbmConfigMove.Bind(config, SecWaves, "Rain Ring Spacing", 1.2f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. How far apart the rain rings are. Higher = bigger, sparser rings. In metres. Range 0.2 to 5. Default 1.2.", new AcceptableValueRange<float>(0.2f, 5f)));
+            RainStrength = EbmConfigMove.Bind(config, SecWaves, "Rain Ring Strength", 0.6f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. How strongly the rings ripple the surface. Higher = stronger rings. 0 = none. Range 0 to 2. Default 0.6.", new AcceptableValueRange<float>(0f, 2f)));
+            RainUnder = EbmConfigMove.Bind(config, SecWaves, "Rain Rings From Below", 1.5f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. How much stronger the rings look from under the water. Range 0 to 4. Default 1.5.", new AcceptableValueRange<float>(0f, 4f)));
+            RainFade = EbmConfigMove.Bind(config, SecWaves, "Rain Ring Distance", 90f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. Rings fade out by this distance from you. Higher = rings further out. In metres. Range 1 to 500. Default 90.", new AcceptableValueRange<float>(1f, 500f)));
+            WindDrift = EbmConfigMove.Bind(config, SecWaves, "Smooth Wind Drift", true, "Needs [40 - Shaders] WaterShader = true. Foam and light patterns drift steadily with the wind instead of swinging back and forth when the wind turns. Off = the old swinging drift.");
             FiresEasyBakeMeshesPlugin_AddBasicRain();
             // 1.2.391 ([visual], [lead]; Fire: never worse than vanilla): EBM/Water tessellated every zone patch at the full factor, in view or not, near or far.
-            TessCut = config.Bind("Optimize", "WaterTessCut", false /* 1.2.392 ([lead]): OFF. Its 1.2.391 legs showed no gain (frame ms off / on: Deep North 3.440 / 3.445, Plains 4.990 / 5.017; ocean WaterTessFarEnd 0 vs 160: 4.568 / 4.565), and a key ships on only after its leg shows the win. The key never shipped, so no saved value exists */,
-                "With this on, EBM's water does less work where it cannot be seen: water outside your view is not subdivided at all, and far water can be subdivided less (WaterTessFarStart / WaterTessFarEnd). Applies live. Off (the default) = every water tile is subdivided fully.");   // 1.2.393: wording for a key that is off by default ([seasons])
-            TessFarStart = config.Bind("Optimize", "WaterTessFarStart", 80f, new ConfigDescription("With WaterTessCut: water closer than this keeps its full wave detail. In metres. Range 0 to 500. Default 80.", new AcceptableValueRange<float>(0f, 500f)));
-            TessFarEnd = config.Bind("Optimize", "WaterTessFarEnd", 0f /* 1.2.391 ([seasons] review, Fire: no look change for fps): the far falloff is OFF until its shot pair; 160 is the value to test */, new ConfigDescription("With WaterTessCut: from WaterTessFarStart to this distance the wave detail of far water falls to its lowest (try 160). 0, or anything not past WaterTessFarStart, keeps full detail at every distance. In metres. Range 0 to 1000. Default 0 (full detail everywhere).", new AcceptableValueRange<float>(0f, 1000f)));
+            TessCut = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterTessCut", false /* 1.2.392 ([lead]): OFF. Its 1.2.391 legs showed no gain (frame ms off / on: Deep North 3.440 / 3.445, Plains 4.990 / 5.017; ocean WaterTessFarEnd 0 vs 160: 4.568 / 4.565), and a key ships on only after its leg shows the win. The key never shipped, so no saved value exists */,
+                "Needs [40 - Shaders] WaterShader = true. With this on, EBM's water does less work where it cannot be seen: water outside your view is not subdivided at all, and far water can be subdivided less (WaterTessFarStart / WaterTessFarEnd). Applies live. Off (the default) = every water tile is subdivided fully.");   // 1.2.393: wording for a key that is off by default ([seasons])
+            TessFarStart = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterTessFarStart", 80f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With WaterTessCut: water closer than this keeps its full wave detail. In metres. Range 0 to 500. Default 80.", new AcceptableValueRange<float>(0f, 500f)));
+            TessFarEnd = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterTessFarEnd", 0f /* 1.2.391 ([seasons] review, Fire: no look change for fps): the far falloff is OFF until its shot pair; 160 is the value to test */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With WaterTessCut: from WaterTessFarStart to this distance the wave detail of far water falls to its lowest (try 160). 0, or anything not past WaterTessFarStart, keeps full detail at every distance. In metres. Range 0 to 1000. Default 0 (full detail everywhere).", new AcceptableValueRange<float>(0f, 1000f)));
             TessCut.SettingChanged += (_, __) => TessChanged("WaterTessCut changed");
             TessFarStart.SettingChanged += (_, __) => TessChanged("WaterTessFarStart changed");
             TessFarEnd.SettingChanged += (_, __) => TessChanged("WaterTessFarEnd changed");
             PushTessCut(null);   // the global is set before any world; the Info line comes with the first world (it counts the tiles)
+            // 1.2.475 ([visual], lead GO 11-19; Vedr-only legs 11.5M tris vs same7 3.9M): while Vedr's FFT waves drive the water, EBM/Water's zone tiles kept the full
+            // factor at every distance (EbmWater.shader hsConstantVD: "Not while Vedr's FFT waves drive the surface: they keep the uniform factor"). OFF until the A/B.
+            FftFalloff = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterFftTessFalloff", false /* 1.2.475: OFF until the Vedr-water A/B + Fire's look check (new-key rule) */,
+                "Needs [40 - Shaders] WaterShader and WaterVanillaDistanceDetail = true, and Vedr's wave physics on. Vedr's waves keep their full detail near you (WaterFftTessStart) and far water gets less, down to WaterFftTessFloor by WaterFftTessEnd, instead of full detail on every water tile at every distance. Off = full detail everywhere while Vedr's waves are on, as before. Applies live.");
+            FftStart = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterFftTessStart", 60f, new ConfigDescription("With WaterFftTessFalloff: Vedr's waves keep their full detail closer than this. In metres. Range 10 to 500. Default 60.", new AcceptableValueRange<float>(10f, 500f)));
+            FftEnd = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterFftTessEnd", 200f, new ConfigDescription("With WaterFftTessFalloff: water this far away and beyond gets the floor detail. In metres. Range 20 to 2000. Default 200.", new AcceptableValueRange<float>(20f, 2000f)));
+            FftFloor = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterFftTessFloor", 4f, new ConfigDescription("With WaterFftTessFalloff: the least wave detail far water keeps (a subdivision factor; 1 = none). Range 1 to 16. Default 4.", new AcceptableValueRange<float>(1f, 16f)));
+            FftFalloff.SettingChanged += (_, __) => PushFftFalloff(true); FftStart.SettingChanged += (_, __) => PushFftFalloff(false); FftEnd.SettingChanged += (_, __) => PushFftFalloff(false); FftFloor.SettingChanged += (_, __) => PushFftFalloff(false);
+            PushFftFalloff(false);   // the Info line comes with the first world (beside WaterTessCut's), when VanillaDetail is bound and Vedr's flag is known
             // 1.2.396 ([visual], [lead]; FIRE: a toggle, default OFF, until he has hand-checked the look)
-            VanillaDetail = config.Bind("Optimize", "WaterVanillaDistanceDetail", true /* 1.2.403: ON. DN leg 1.2.396 ((rig path)): off 3.369 / on 3.224 / off 3.365 ms, water shader off 3.252 (on = 0.028 ms under the game's water); Fire passed his water look with it on. A saved value is not changed */,
-                "EBM's water gives its surface as much wave detail as the game's own water does: full detail within about 10 m of you, fading to none by about 40 m, instead of full detail at every distance. It also shares the game's screen copy for the see-through effect instead of making its own. Faster where water is far away or hidden under ice or ground. Applies live. Not used for the wave shape while Vedr's wave physics drives the water. On by default. Off = full wave detail at every distance and its own screen copy (slower).");
+            VanillaDetail = EbmConfigMove.Bind(config, "41 - Water Performance", "WaterVanillaDistanceDetail", true /* 1.2.403: ON. DN leg 1.2.396 ((rig path)): off 3.369 / on 3.224 / off 3.365 ms, water shader off 3.252 (on = 0.028 ms under the game's water); Fire passed his water look with it on. A saved value is not changed */,
+                "Needs [40 - Shaders] WaterShader = true. EBM's water gives its surface as much wave detail as the game's own water does: full detail within about 10 m of you, fading to none by about 40 m, instead of full detail at every distance. It also shares the game's screen copy for the see-through effect instead of making its own. Faster where water is far away or hidden under ice or ground. Applies live. Not used for the wave shape while Vedr's wave physics drives the water. On by default. Off = full wave detail at every distance and its own screen copy (slower).");
             VanillaDetail.SettingChanged += (_, __) => ApplyVanillaDetail("WaterVanillaDistanceDetail changed");
             // 1.2.426 ([visual], lead approved; Fire 11-16 "mesh splitting at the seams between water lod levels where it disagrees with the waves" + a pale strip at the far plane)
-            SeamStencil = config.Bind("Water", "WaterSeamStencil", false /* 1.2.426: OFF = the game's own read-only stencil (full read: the tiles butt edge to edge, EbmWater.shader comment at the alpha block) */,
-                "On: each water pixel is drawn by the first water tile that reaches it (FiresWater's old overlap guard); a nearer wave crest over a farther tile can then be cut off, a step along the tile border. Off (default): like the game's own water, the nearer tile draws over the farther one, so crests stay whole. Flip it to compare. Applies at once.");
+            SeamStencil = EbmConfigMove.Bind(config, "44 - Water - Surface & Reflection", "WaterSeamStencil", false /* 1.2.426: OFF = the game's own read-only stencil (full read: the tiles butt edge to edge, EbmWater.shader comment at the alpha block) */,
+                "Needs [40 - Shaders] WaterShader = true. On: each water pixel is drawn by the first water tile that reaches it (FiresWater's old overlap guard); a nearer wave crest over a farther tile can then be cut off, a step along the tile border. Off (default): like the game's own water, the nearer tile draws over the farther one, so crests stay whole. Flip it to compare. Applies at once.");
             SeamStencil.SettingChanged += (_, __) => ApplySeamStencilAll("WaterSeamStencil changed");
-            EdgeBlend = config.Bind("Water", "WaterEdgeBlend", false /* 1.2.426: OFF until Fire's look check (the far plane's own look is vanilla's, not read in full) */,
-                "Where EBM's near water meets the game's distant water plane, the near waves ease to calm and take the full sea fog over the last stretch, so the two meet without a step or a pale strip. Off = the near water keeps full waves to its edge. Applies at once.");
-            EdgeBand = config.Bind("Water", "WaterEdgeBlendBand", 48f, new ConfigDescription("With WaterEdgeBlend: how many metres before the distant plane the blend starts. Range 8 to 200. Default 48.", new AcceptableValueRange<float>(8f, 200f)));
+            EdgeBlend = EbmConfigMove.Bind(config, "44 - Water - Surface & Reflection", "WaterEdgeBlend", false /* 1.2.426: OFF until Fire's look check (the far plane's own look is vanilla's, not read in full) */,
+                "Needs [40 - Shaders] WaterShader = true. Where EBM's near water meets the game's distant water plane, the near waves ease to calm and take the full sea fog over the last stretch, so the two meet without a step or a pale strip. Off = the near water keeps full waves to its edge. Applies at once.");
+            EdgeBand = EbmConfigMove.Bind(config, "44 - Water - Surface & Reflection", "WaterEdgeBlendBand", 48f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With WaterEdgeBlend: how many metres before the distant plane the blend starts. Range 8 to 200. Default 48.", new AcceptableValueRange<float>(8f, 200f)));
             EdgeBlend.SettingChanged += (_, __) => { s_edgeSent = new Vector4(-1f, 0f, 0f, 0f); PushEdge(true); };
             EdgeBand.SettingChanged += (_, __) => PushEdge(false);
             // 1.2.435 ([visual]; FIRE 11-17: a hard circle where the near water meets the game's far plane, seen from high above a bay). Default OFF until his look check.
-            XFade = config.Bind("Water", "WaterEdgeCrossFade", false,
-                "Over a wide band before the game's distant water plane begins, the distant plane starts drawing early under EBM's near water, the near waves ease to calm, and then the near water fades out onto the distant plane's own look, so at the edge the two are the same picture and the circle where they meet is gone. Centred where the game centres the distant plane's hole (the network reference point). Works on its own (WaterEdgeBlend not needed) and without FiresTossinShade. Off = as before. Applies at once.");
-            XFadeBand = config.Bind("Water", "WaterEdgeCrossFadeBand", 160f, new ConfigDescription("With WaterEdgeCrossFade: how many metres before the distant plane's edge the waves start to calm; the near water fades out over the last half. Range 16 to 360. Default 160.", new AcceptableValueRange<float>(16f, 360f)));
+            XFade = EbmConfigMove.Bind(config, "44 - Water - Surface & Reflection", "WaterEdgeCrossFade", false,
+                "Needs [40 - Shaders] WaterShader = true. Over a wide band before the game's distant water plane begins, the distant plane starts drawing early under EBM's near water, the near waves ease to calm, and then the near water fades out onto the distant plane's own look, so at the edge the two are the same picture and the circle where they meet is gone. Centred where the game centres the distant plane's hole (the network reference point). Works on its own (WaterEdgeBlend not needed) and without FiresTossinShade. Off = as before. Applies at once.");
+            XFadeBand = EbmConfigMove.Bind(config, "44 - Water - Surface & Reflection", "WaterEdgeCrossFadeBand", 160f, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With WaterEdgeCrossFade: how many metres before the distant plane's edge the waves start to calm; the near water fades out over the last half. Range 16 to 360. Default 160.", new AcceptableValueRange<float>(16f, 360f)));
             XFade.SettingChanged += (_, __) => { s_xfSay = true; };
+            EbmWaterFarRing.Bind(config);   // 1.2.469 [44] WaterFarRing (+ radius / tess / detail range)
             XFadeBand.SettingChanged += (_, __) => { s_xfSay = true; };
             // 1.2.397 ([visual], [lead]; FIRE 11-15: our near water read green / tan beside the game's blue far water in the same frame). Default OFF until his look check.
-            GameColour = config.Bind(SecColour, "Game Water Colours", false /* 1.2.397: OFF until Fire's look check; off = exactly 1.2.396's colours */,
-                "EBM's water takes its colours the way the game's own water does: the dark deep and shallow water colours everywhere, the bright top colour only on wave crests, and the sea bed seen in its own colour through the water instead of tinted by the water colour. Applies live. Off (the default) = EBM's own colour mix.");
+            GameColour = EbmConfigMove.Bind(config, SecColour, "Game Water Colours", false /* 1.2.397: OFF until Fire's look check; off = exactly 1.2.396's colours */,
+                "Needs [40 - Shaders] WaterShader = true. EBM's water takes its colours the way the game's own water does: the dark deep and shallow water colours everywhere, the bright top colour only on wave crests, and the sea bed seen in its own colour through the water instead of tinted by the water colour. Applies live. Off (the default) = EBM's own colour mix.");
             GameColour.SettingChanged += (_, __) => PushGameColour(true);
             PushGameColour(false);   // the global is set before any world
-            WaveLit = config.Bind(SecColour, "Water Lit By Waves", false /* 1.2.397: OFF until Fire's look check; off = exactly 1.2.396's lighting */,
-                "The water's colour is lit wave by wave, as the game's own water is: the side of each ripple that faces the sun is brighter, the side that faces away is darker, and it takes the sky's light from its own direction. Makes the water read as a lit surface instead of a flat sheet. Applies live. Off (the default) = one light value for the whole water surface.");
+            WaveLit = EbmConfigMove.Bind(config, SecColour, "Water Lit By Waves", false /* 1.2.397: OFF until Fire's look check; off = exactly 1.2.396's lighting */,
+                "Needs [40 - Shaders] WaterShader = true. The water's colour is lit wave by wave, as the game's own water is: the side of each ripple that faces the sun is brighter, the side that faces away is darker, and it takes the sky's light from its own direction. Makes the water read as a lit surface instead of a flat sheet. Applies live. Off (the default) = one light value for the whole water surface.");
             WaveLit.SettingChanged += (_, __) => PushWaveLit(true);
             PushWaveLit(false);
             // 1.2.399 ([visual], [lead]; FIRE 11-15: the deeper water read brown, "shouldnt realistic water get deeper blue as it gets deeper?"). Default OFF until his look check.
-            DepthHue = config.Bind(SecColour, "Depth Colour Shift", false /* 1.2.399: OFF until Fire's look check; off = exactly 1.2.398's haze */,
-                "The haze in the water changes colour with the length of your view through it the way real water does: red light is lost first, then green, then blue, so clear shallows turn green-teal and then blue with depth (how fast each colour goes is Absorption Colour Loss). The haze also keeps the hue of Murk Colour in any sunlight instead of being tinted by the sun. The amount of haze is not raised. Applies live. Off (the default) = the haze takes all colours at once and is tinted by the sun.");
+            DepthHue = EbmConfigMove.Bind(config, SecColour, "Depth Colour Shift", false /* 1.2.399: OFF until Fire's look check; off = exactly 1.2.398's haze */,
+                "Needs [40 - Shaders] WaterShader = true. The haze in the water changes colour with the length of your view through it the way real water does: red light is lost first, then green, then blue, so clear shallows turn green-teal and then blue with depth (how fast each colour goes is Absorption Colour Loss). The haze also keeps the hue of Murk Colour in any sunlight instead of being tinted by the sun. The amount of haze is not raised. Applies live. Off (the default) = the haze takes all colours at once and is tinted by the sun.");
             DepthHue.SettingChanged += (_, __) => PushDepthHue(true);
             PushDepthHue(false);
-            SkyBoost = config.Bind(SecSurface, "Sky Reflection Boost", 0f /* 1.2.399: OFF (0) until Fire's look check */, new ConfigDescription("Deep water seen at a low angle shows more of the sky in it, so far water reads sky-blue toward the horizon, as on a real lake. Uses the sky reflection the water already has: no extra cost. Does not change shallow water or water you look straight down into. 0 = off (the default). 1 = full. Range 0 to 1.", new AcceptableValueRange<float>(0f, 1f)));
+            SkyBoost = EbmConfigMove.Bind(config, SecSurface, "Sky Reflection Boost", 0f /* 1.2.399: OFF (0) until Fire's look check */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. Deep water seen at a low angle shows more of the sky in it, so far water reads sky-blue toward the horizon, as on a real lake. Uses the sky reflection the water already has: no extra cost. Does not change shallow water or water you look straight down into. 0 = off (the default). 1 = full. Range 0 to 1.", new AcceptableValueRange<float>(0f, 1f)));
             SkyBoost.SettingChanged += (_, __) => PushSkyBoost(true);
             PushSkyBoost(false);
             // 1.2.400 ([visual], [lead]; FIRE 11-15: "Our waves in our near water look like s***"). Default OFF until his look check.
-            GameRipples = config.Bind(SecSurface, "Game Ripples", true /* 1.2.402: ON (Fire 11-15 on 1.2.400: "the ripples look good and should default on"); was false since 1.2.400; off = EBM's two ripple layers */,
-                "Over deeper water the small ripples are drawn the way the game's own water draws them: the same ripple texture at the game's size (about four times finer than EBM's), layered three deep, lined up with the wind and drifting along it. Near water then carries the same ripple pattern as the far water, so the two meet without a change in pattern. Water 2 m deep or less keeps EBM's own ripples. EBM's waves, foam, glitter and rain rings stay. On by default. Off: EBM's own two ripple layers everywhere. Applies at once.");
+            GameRipples = EbmConfigMove.Bind(config, SecSurface, "Game Ripples", true /* 1.2.402: ON (Fire 11-15 on 1.2.400: "the ripples look good and should default on"); was false since 1.2.400; off = EBM's two ripple layers */,
+                "Needs [40 - Shaders] WaterShader = true. Over deeper water the small ripples are drawn the way the game's own water draws them: the same ripple texture at the game's size (about four times finer than EBM's), layered three deep, lined up with the wind and drifting along it. Near water then carries the same ripple pattern as the far water, so the two meet without a change in pattern. Water 2 m deep or less keeps EBM's own ripples. EBM's waves, foam, glitter and rain rings stay. On by default. Off: EBM's own two ripple layers everywhere. Applies at once.");
             GameRipples.SettingChanged += (_, __) => PushGameRipples(true);
             // 1.2.407 ([visual], [lead]; FIRE 11-16: "water is still completely clear if there is no wave ... ZERO color looking straight down ... FIX THE SHADER"). ON by default (Fire's order).
-            WaterBody = config.Bind(SecColour, "Water Body By Depth", true /* 1.2.407: ON (Fire's order); off = 1.2.406's water exactly */,
-                "The water gets its colour and how see-through it is from how much water you look through, at any angle, straight down included: a little water stays clear, deep water hides the bottom and shows the water's own colour. Off: the older colour terms (deep water could show the bottom and take the Murk Colour). Applies at once.");
+            WaterBody = EbmConfigMove.Bind(config, SecColour, "Water Body By Depth", true /* 1.2.407: ON (Fire's order); off = 1.2.406's water exactly */,
+                "Needs [40 - Shaders] WaterShader = true. The water gets its colour and how see-through it is from how much water you look through, at any angle, straight down included: a little water stays clear, deep water hides the bottom and shows the water's own colour. Off: the older colour terms (deep water could show the bottom and take the Murk Colour). Applies at once.");
             WaterBody.SettingChanged += (_, __) => PushWaterBody(true);
-            WaterBodyMurk = config.Bind(SecColour, "Water Body Murk Tint", 0.3f /* 1.2.407 */, new ConfigDescription("With Water Body By Depth: how far the deep water's colour leans toward the Murk Colour. 0 = the game's own water colour only. 1 = the Murk Colour only. Applies at once.", new AcceptableValueRange<float>(0f, 1f)));
+            WaterBodyMurk = EbmConfigMove.Bind(config, SecColour, "Water Body Murk Tint", 0.3f /* 1.2.407 */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With Water Body By Depth: how far the deep water's colour leans toward the Murk Colour. 0 = the game's own water colour only. 1 = the Murk Colour only. Applies at once.", new AcceptableValueRange<float>(0f, 1f)));
             WaterBodyMurk.SettingChanged += (_, __) => PushWaterBody(false);
             PushWaterBody(false);
             // 1.2.408 ([visual], [lead]; FIRE 11-16 on 1.2.407: "slightly less green", "it white washes anything it passes over", "churn ... too brown", "top color shouldnt be bright green")
-            WaterTopColour = config.Bind(SecColour, "Water Top Colour", new Color(0x61 / 255f, 0x95 / 255f, 0xA0 / 255f, 1f) /* 1.2.408: #6195A0 */,
-                "The water's main near colour (the game's own is a bright mint green). Darker = the shallows look deeper and do not lighten what is under them. Set the alpha to 0 for the game's own colour. Applies at once. Default #6195A0.");
+            WaterTopColour = EbmConfigMove.Bind(config, SecColour, "Water Top Colour", new Color(0x61 / 255f, 0x95 / 255f, 0xA0 / 255f, 1f) /* 1.2.408: #6195A0 */,
+                "Needs [40 - Shaders] WaterShader = true. The water's main near colour (the game's own is a bright mint green). Darker = the shallows look deeper and do not lighten what is under them. Set the alpha to 0 for the game's own colour. Applies at once. Default #6195A0.");
             WaterTopColour.SettingChanged += (_, __) => PushLook408();
-            GlowOnlyOnWater = config.Bind(SecColour, "Glow Only On Water", true /* 1.2.408 */,
-                "The water's glow (Glow Strength, Sun Glow) only where the water's own colour covers what is under it, so things just under the surface are not lit up. Off: the glow everywhere, as before. Applies at once.");
+            GlowOnlyOnWater = EbmConfigMove.Bind(config, SecColour, "Glow Only On Water", true /* 1.2.408 */,
+                "Needs [40 - Shaders] WaterShader = true. The water's glow (Glow Strength, Sun Glow) only where the water's own colour covers what is under it, so things just under the surface are not lit up. Off: the glow everywhere, as before. Applies at once.");
             GlowOnlyOnWater.SettingChanged += (_, __) => PushLook408();
-            ChurnFollowsWater = config.Bind(SecColour, "Churn Follows Water Colour", 0.7f /* 1.2.408 */, new ConfigDescription("How much the stirred-up silt in shallow water takes the water's own colour instead of the Murk Colour (at the same brightness). 0 = the Murk Colour, as before. Applies at once.", new AcceptableValueRange<float>(0f, 1f)));
+            ChurnFollowsWater = EbmConfigMove.Bind(config, SecColour, "Churn Follows Water Colour", 0.7f /* 1.2.408 */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. How much the stirred-up silt in shallow water takes the water's own colour instead of the Murk Colour (at the same brightness). 0 = the Murk Colour, as before. Applies at once.", new AcceptableValueRange<float>(0f, 1f)));
             ChurnFollowsWater.SettingChanged += (_, __) => PushLook408();
             PushLook408();
             // 1.2.409 ([visual], [lead]; FIRE 11-16 on 1.2.408: things under the water "should maintain something close to their original color ... just with a MINOR hue"). ON by default.
-            ClearOptics = config.Bind(SecColour, "Clear Water Optics", true /* 1.2.409: ON (Fire's words); off = 1.2.408's water exactly */,
-                "Things under the water (you, fish, build pieces, the bottom) keep their own colour and are tinted only by the water between the surface and them: just under the surface = almost their own colour, deeper = more of the water's colour, deep water hides the bottom. Clear Water Depth and Opaque Water Depth set how fast. Off: the older look (a fixed water-colour layer over anything under about 0.35 m of water). Applies at once.");
+            ClearOptics = EbmConfigMove.Bind(config, SecColour, "Clear Water Optics", true /* 1.2.409: ON (Fire's words); off = 1.2.408's water exactly */,
+                "Needs [40 - Shaders] WaterShader = true. Things under the water (you, fish, build pieces, the bottom) keep their own colour and are tinted only by the water between the surface and them: just under the surface = almost their own colour, deeper = more of the water's colour, deep water hides the bottom. Clear Water Depth and Opaque Water Depth set how fast. Off: the older look (a fixed water-colour layer over anything under about 0.35 m of water). Applies at once.");
             ClearOptics.SettingChanged += (_, __) => PushClearOptics();
             // 1.2.410 ([visual], [lead]; FIRE 11-16: "everything in the distance gets covered in blue fog?" with the camera at the waterline). ON by default.
-            SelfSubmerged = config.Bind(SecSurface, "Underwater View Follows Waves", true /* 1.2.410: ON; off = 1.2.409 exactly */,
-                "When your view dips under a wave, the water is drawn as seen from under the surface (the world stays its own colour near the surface) instead of a flat water-coloured sheet over half the screen. Off: the older behaviour. Applies at once.");
+            SelfSubmerged = EbmConfigMove.Bind(config, SecSurface, "Underwater View Follows Waves", true /* 1.2.410: ON; off = 1.2.409 exactly */,
+                "Needs [40 - Shaders] WaterShader = true. When your view dips under a wave, the water is drawn as seen from under the surface (the world stays its own colour near the surface) instead of a flat water-coloured sheet over half the screen. Off: the older behaviour. Applies at once.");
             SelfSubmerged.SettingChanged += (_, __) => PushSelfSubmerged();
             // 1.2.411 ([visual], [lead]; FIRE 11-16: "the water itself should properly be applying opacity and hue based off depth and that alone"). All ON; off = 1.2.410.
-            ClearOneBody = config.Bind(SecColour, "Clear Water One Body Colour", true /* 1.2.411 */,
-                "With Clear Water Optics: the water has one colour (its deep colour) and how much of it you see comes only from how much water you look through. Off: shallow water also changed colour by its depth (the older mix). Applies at once.");
-            ClearNoTint = config.Bind(SecColour, "Clear Water No Surface Tint", true /* 1.2.411 */,
-                "With Clear Water Optics: no flat grey tint over everything seen through the water. Off: the older tint. Applies at once.");
-            ClearFoamRaw = config.Bind(SecColour, "Clear Water Shore Foam By Real Depth", true /* 1.2.411 */,
-                "With Clear Water Optics: shore foam follows the real water depth (no foam on a dry-looking sandbar). Off: the older foam depth. Applies at once.");
-            ClearEdgeGuard = config.Bind(SecColour, "Clear Water Edge Guard", true /* 1.2.411 */,
-                "With Clear Water Optics: no bright outline on things under the water from the ripple distortion. Off: the older distortion. Applies at once.");
-            CamUnderOnce = config.Bind(SecSurface, "Underwater Check Once Per Frame", true /* 1.2.411 */,
-                "With Underwater View Follows Waves: whether your view is under a wave is decided once a frame from the game's own water level (cheaper). Off: checked per pixel on the screen. Applies at once.");
+            ClearOneBody = EbmConfigMove.Bind(config, SecColour, "Clear Water One Body Colour", true /* 1.2.411 */,
+                "Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: the water has one colour (its deep colour) and how much of it you see comes only from how much water you look through. Off: shallow water also changed colour by its depth (the older mix). Applies at once.");
+            ClearNoTint = EbmConfigMove.Bind(config, SecColour, "Clear Water No Surface Tint", true /* 1.2.411 */,
+                "Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: no flat grey tint over everything seen through the water. Off: the older tint. Applies at once.");
+            ClearFoamRaw = EbmConfigMove.Bind(config, SecColour, "Clear Water Shore Foam By Real Depth", true /* 1.2.411 */,
+                "Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: shore foam follows the real water depth (no foam on a dry-looking sandbar). Off: the older foam depth. Applies at once.");
+            ClearEdgeGuard = EbmConfigMove.Bind(config, SecColour, "Clear Water Edge Guard", true /* 1.2.411 */,
+                "Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: no bright outline on things under the water from the ripple distortion. Off: the older distortion. Applies at once.");
+            CamUnderOnce = EbmConfigMove.Bind(config, SecSurface, "Underwater Check Once Per Frame", true /* 1.2.411 */,
+                "Needs [40 - Shaders] WaterShader = true. With Underwater View Follows Waves: whether your view is under a wave is decided once a frame from the game's own water level (cheaper). Off: checked per pixel on the screen. Applies at once.");
             ClearOneBody.SettingChanged += (_, __) => PushLook411();
             ClearNoTint.SettingChanged += (_, __) => PushLook411();
             ClearFoamRaw.SettingChanged += (_, __) => PushLook411();
             ClearEdgeGuard.SettingChanged += (_, __) => PushLook411();
             CamUnderOnce.SettingChanged += (_, __) => PushLook411();
             // 1.2.412 ([visual], [lead]; FIRE 11-16: "our color should have stayed nearly identical to vanilla" / "not change the entire color of the water"). ON.
-            VanillaColour = config.Bind(SecColour, "Vanilla Water Colour", true /* 1.2.412: ON (Fire's order); off = 1.2.411's colour keys apply */,
-                "The water keeps the game's own colour, near and far, so it matches the game's distant water. Our extras stay (ripples, clearer shallows by depth, foam and churn, reflections, the underwater view). While this is on, these keys do nothing: Game Water Colours, Water Top Colour, Clear Water One Body Colour, Water Body Murk Tint, Murk (its tint), Water Body Light Limit, the Glow keys, Absorption Colour Loss (its hue), Minimum Water Depth For Colour, Reflection Strength, Physical Reflection Mix, Sea Fog On Water. Applies at once.");
+            VanillaColour = EbmConfigMove.Bind(config, SecColour, "Vanilla Water Colour", true /* 1.2.412: ON (Fire's order); off = 1.2.411's colour keys apply */,
+                "Needs [40 - Shaders] WaterShader = true. The water keeps the game's own colour, near and far, so it matches the game's distant water. Our extras stay (ripples, clearer shallows by depth, foam and churn, reflections, the underwater view). While this is on, these keys do nothing: Game Water Colours, Water Top Colour, Clear Water One Body Colour, Water Body Murk Tint, Murk (its tint), Water Body Light Limit, the Glow keys, Absorption Colour Loss (its hue), Minimum Water Depth For Colour, Reflection Strength, Physical Reflection Mix, Sea Fog On Water. Applies at once.");
             VanillaColour.SettingChanged += (_, __) => PushVanillaColour();
             // 1.2.413 ([visual], [lead]: the water lit as the game lights its water). ON; acts with Vanilla Water Colour + Clear Water Optics.
-            GameLighting = config.Bind(SecColour, "Game Lighting", true /* 1.2.413: ON; off = 1.2.412 exactly */,
-                "With Vanilla Water Colour: the water is lit the way the game lights its own water (the sun and sky on every wave, the game's reflections and sun highlight), so near water and the game's distant water look the same. Applies at once.");
+            GameLighting = EbmConfigMove.Bind(config, SecColour, "Game Lighting", true /* 1.2.413: ON; off = 1.2.412 exactly */,
+                "Needs [40 - Shaders] WaterShader = true. With Vanilla Water Colour: the water is lit the way the game lights its own water (the sun and sky on every wave, the game's reflections and sun highlight), so near water and the game's distant water look the same. Applies at once.");
             GameLighting.SettingChanged += (_, __) => PushGameLighting();
             PushGameLighting();
             PushVanillaColour();
             PushLook411();
             PushSelfSubmerged();
-            ClearDepth = config.Bind(SecColour, "Clear Water Depth", 2.5f /* 1.2.409 */, new ConfigDescription("With Clear Water Optics: about this much water (along your view) stays nearly clear; past it the water's colour builds up. Higher = clearer shallows. 0 = the colour builds up from the first centimetre. In metres. Applies at once.", new AcceptableValueRange<float>(0f, 10f)));
+            ClearDepth = EbmConfigMove.Bind(config, SecColour, "Clear Water Depth", 2.5f /* 1.2.409 */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: about this much water (along your view) stays nearly clear; past it the water's colour builds up. Higher = clearer shallows. 0 = the colour builds up from the first centimetre. In metres. Applies at once.", new AcceptableValueRange<float>(0f, 10f)));
             ClearDepth.SettingChanged += (_, __) => PushClearOptics();
-            OpaqueDepth = config.Bind(SecColour, "Opaque Water Depth", 6f /* 1.2.409 */, new ConfigDescription("With Clear Water Optics: by this much water (along your view) the water hides what is under it (about 95 %). Lower = deep water turns solid sooner. In metres. Applies at once.", new AcceptableValueRange<float>(0.5f, 60f)));
+            OpaqueDepth = EbmConfigMove.Bind(config, SecColour, "Opaque Water Depth", 6f /* 1.2.409 */, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. With Clear Water Optics: by this much water (along your view) the water hides what is under it (about 95 %). Lower = deep water turns solid sooner. In metres. Applies at once.", new AcceptableValueRange<float>(0.5f, 60f)));
             OpaqueDepth.SettingChanged += (_, __) => PushClearOptics();
             PushClearOptics();
             PushGameRipples(false);
@@ -200,7 +210,7 @@ namespace FiresEasyBakeMeshes.EasyBake
         {
             float r = 0f;
             if (ZNet.instance != null && ZoneSystem.instance != null) r = ZNet.instance.GetSyncedSimulationDistance().NearSimulationDistance * ZoneSystem.instance.m_zoneSize;
-            bool on = EdgeBlend != null && EdgeBlend.Value && r > 1f;
+            bool on = EdgeBlend != null && EdgeBlend.Value && r > 1f && !EbmWaterFarRing.Drawing;   // 1.2.469: no plane edge to ease into while the far ring draws
             var v = on ? new Vector4(r, EdgeBand != null ? Mathf.Clamp(EdgeBand.Value, 8f, 200f) : 48f, 1f, 0f) : Vector4.zero;
             if (v == s_edgeSent) return;
             s_edgeSent = v;
@@ -219,16 +229,17 @@ namespace FiresEasyBakeMeshes.EasyBake
         internal static ConfigEntry<float> XFadeBand;
         private static readonly int IdXFade = Shader.PropertyToID("_EbmWaterXFade"), IdVisMax = Shader.PropertyToID("_VisibleMaxDistance");
         private static Vector4 s_xfSent = new Vector4(-1f, 0f, 0f, 0f);
-        private static bool s_xfSay = true;
+        private static bool s_xfSay = true, s_xfGateSaid;
         private static string s_xfState;
         private static float s_xfPlaneAt, s_xfPlaneHole = -1f;
         private static MaterialPropertyBlock s_xfMpb;
         private static void PushXFade()
         {
             float r = 0f;
-            bool want = XFade != null && XFade.Value;
+            bool want = XFade != null && XFade.Value && Wanted;   // 1.2.444 (Fire rule 11-18: a feature that needs EBM's own shader is gated by that shader's key): needs [Optimize] WaterShader = true
             if (want && ZNet.instance != null && ZoneSystem.instance != null) r = ZNet.instance.GetSyncedSimulationDistance().NearSimulationDistance * ZoneSystem.instance.m_zoneSize;
-            bool on = want && r > 1f;
+            bool on = want && r > 1f && !EbmWaterFarRing.Drawing;   // 1.2.469: stands down while the far ring draws (the plane is hidden)
+            if (XFade != null && XFade.Value && !Wanted && !s_xfGateSaid) { s_xfGateSaid = true; EasyBakeLog.Info("[Water] WaterEdgeCrossFade stands down: it needs [40 - Shaders] WaterShader = true (the game's own water is left as it is)"); }
             float band = XFadeBand != null ? Mathf.Clamp(XFadeBand.Value, 16f, 360f) : 160f;
             Vector4 v = Vector4.zero;
             if (on) { Vector3 c = ZNet.instance.GetReferencePosition(); v = new Vector4(c.x, c.z, band, r); }
@@ -445,6 +456,21 @@ namespace FiresEasyBakeMeshes.EasyBake
         // ── 1.2.391 WaterTessCut ──
         internal static ConfigEntry<bool> TessCut;
         internal static ConfigEntry<float> TessFarStart, TessFarEnd;
+
+        // ── 1.2.475 WaterFftTessFalloff: the global EbmWater.shader's hsConstantVD reads (_EbmFftTessFar = on, start m, end m, floor) ──
+        internal static ConfigEntry<bool> FftFalloff;
+        internal static ConfigEntry<float> FftStart, FftEnd, FftFloor;
+        private static readonly int IdFftTessFar = Shader.PropertyToID("_EbmFftTessFar");
+        private static void PushFftFalloff(bool say)
+        {
+            if (FftFalloff == null || FftStart == null || FftEnd == null || FftFloor == null) return;
+            bool on = FftFalloff.Value;
+            float s = Mathf.Max(0f, FftStart.Value), e = Mathf.Max(s + 1f, FftEnd.Value), fl = Mathf.Clamp(FftFloor.Value, 1f, 16f);
+            Shader.SetGlobalVector(IdFftTessFar, on ? new Vector4(1f, s, e, fl) : Vector4.zero);
+            if (say) EasyBakeLog.Info(on
+                ? $"[Water] WaterFftTessFalloff on (1.2.475): while Vedr's waves drive the water, zone tiles keep the full detail within {s:0} m and fall to factor {fl:0} by {e:0} m (needs WaterVanillaDistanceDetail on: {(VanillaDetail != null && VanillaDetail.Value ? "yes" : "NO, no effect")}); Vedr's waves {(Shader.GetGlobalFloat(IdVedrFftOn) > 0.5f ? "on now" : "off now")}"
+                : "[Water] WaterFftTessFalloff off: while Vedr's waves drive the water, every zone tile keeps the full detail at every distance (as before 1.2.475)");
+        }
         private static readonly int IdTessCut = Shader.PropertyToID("_EbmWaterTessCut");
         // How far the domain stage can move a vertex ([seasons] review): BuildOutput adds CalcWave x _WaveAmplitude (shader Range 0..2, default 1; the vanilla crest is at
         // most CrestPerDepth = 18.64 m), the tide and whirl offsets (0 / downward without their feeders) and, with Vedr's water physics, an FFT displacement that also
@@ -564,8 +590,9 @@ namespace FiresEasyBakeMeshes.EasyBake
         // order a player tunes them, each with a plain description (what you see going up / down, range, default), no internal numbers. The ~10 that
         // matter are Basic (PlayerFacingConfig.AddBasic); the rest are Advanced. Values the shader needs but nobody should tune (switches with one right
         // answer, and the underwater-caustic values only FTS's caustics pass reads) are pushed as constants (K) and are not in the cfg at all.
-        private const string SecColour = "Water - Colour & Depth", SecSurface = "Water - Surface & Reflection", SecWaves = "Water - Waves",
-            SecFoam = "Water - Foam & Shore", SecUnder = "Water - Underwater & Caustics", SecDebug = "Water - Debug";
+        // 1.2.444: the six sections were "Water - Colour & Depth" ... "Water - Debug" (EbmConfigMove carries saved values; Water - Debug joined 90 - Debugging)
+        private const string SecColour = "42 - Water - Colour & Depth", SecSurface = "44 - Water - Surface & Reflection", SecWaves = "46 - Water - Waves",
+            SecFoam = "43 - Water - Foam & Shore", SecUnder = "45 - Water - Underwater & Caustics", SecDebug = "90 - Debugging";
         private static ConfigFile s_cfg;
         private static readonly Dictionary<string, ConfigEntry<float>> s_lookF = new Dictionary<string, ConfigEntry<float>>();
         private static readonly Dictionary<string, ConfigEntry<Color>> s_lookC = new Dictionary<string, ConfigEntry<Color>>();
@@ -578,7 +605,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (!s_lookF.TryGetValue(global, out var e))
             {
                 string inv(float v) => v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-                e = s_cfg.Bind(section, key, def, new ConfigDescription(text + " Range " + inv(min) + " to " + inv(max) + ". Default " + inv(def) + ".", new AcceptableValueRange<float>(min, max)));
+                e = EbmConfigMove.Bind(s_cfg, section, key, def, new ConfigDescription("Needs [40 - Shaders] WaterShader = true. " + text + " Range " + inv(min) + " to " + inv(max) + ". Default " + inv(def) + ".", new AcceptableValueRange<float>(min, max)));
                 var entry = e; string name = global;
                 e.SettingChanged += (_, __) => Shader.SetGlobalFloat(name, entry.Value);
                 s_lookF[global] = e;
@@ -591,7 +618,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_cfg == null) return;
             if (!s_lookC.TryGetValue(global, out var e))
             {
-                e = s_cfg.Bind(section, key, def, text + " Default #" + ColorUtility.ToHtmlStringRGB(def) + ".");
+                e = EbmConfigMove.Bind(s_cfg, section, key, def, "Needs [40 - Shaders] WaterShader = true. " + text + " Default #" + ColorUtility.ToHtmlStringRGB(def) + ".");
                 var entry = e; string name = global;
                 e.SettingChanged += (_, __) => Shader.SetGlobalColor(name, entry.Value);
                 s_lookC[global] = e;
@@ -723,6 +750,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             PushViewDepth();
             PushXFade();   // 1.2.435/436: WaterEdgeCrossFade centre (sent only when it changes) + the far plane hole (once a second)
             if (Time.unscaledTime >= s_fatLookAt) { s_fatLookAt = Time.unscaledTime + 1f; EbmFatWaterLook.Tick(); }   // 1.2.437: bind / register / tell FAT of drawing changes, once a second (before the key gate: FAT must hear EBM stop)
+            EbmWaterFarRing.Tick(Wanted && Indirect.EbmIndirectAssets.WaterShader != null);   // 1.2.469: before the key gate (a key off gives the game's plane back)
             PushCamUnder();   // 1.2.411: once a frame (sent only when it changes)   // 1.2.408: _FiresWaterViewDepth for Core's caustics (sent only when it changes)
             if (!Wanted) { if (s_swapped.Count > 0) ReleaseAll("key off"); return; }
             if (s_owner == null && s_defaultsFor != null)
@@ -745,7 +773,7 @@ namespace FiresEasyBakeMeshes.EasyBake
             if (s_owner == null && !ReferenceEquals(s_defaultsFor, ZNetScene.instance)) { Look(push: true); s_defaultsFor = ZNetScene.instance; s_tessSayAt = Time.unscaledTime + 5f; s_tessSayWhy = null; }
             PushEdge(false);   // 1.2.426: the far plane's hole radius follows the synced near distance (sent only when it changes)
             ApplyVanillaDetail("applied");   // 1.2.396: once a second, so a shader that loads late (or a new shader object) gets the key's state, and the LOD-limit guard looks again; a compare and two int reads when nothing changed
-            if (s_tessSayAt > 0f && Time.unscaledTime >= s_tessSayAt) { s_tessSayAt = 0f; PushTessCut(s_tessSayWhy ?? "world loaded"); s_tessSayWhy = null; }   // 1.2.391: once per world (5 s in, so the tiles around the player are counted) and once per key change (1 s after the last step)
+            if (s_tessSayAt > 0f && Time.unscaledTime >= s_tessSayAt) { s_tessSayAt = 0f; PushTessCut(s_tessSayWhy ?? "world loaded"); if (s_tessSayWhy == null) PushFftFalloff(true); s_tessSayWhy = null; }   // 1.2.391: once per world (5 s in, so the tiles around the player are counted) and once per key change (1 s after the last step)
 
             var list = WaterVolume.Instances;
             if (list != null)

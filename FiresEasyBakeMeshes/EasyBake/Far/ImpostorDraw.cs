@@ -159,10 +159,12 @@ namespace FiresEasyBakeMeshes.EasyBake.Far
             foreach (var k in ImpostorKinds.All)
             {
                 if (!mid || k.Mid.Count == 0 || k.Id >= ImpostorPool.KindCounts.Length) continue;
+                int live = 0; foreach (var p in k.Mid) if (!p.Off) live++;   // 1.2.488: a kind with no live mid part takes no mid segment (its band draws the impostor card)
+                if (live == 0) continue;
                 uint n = (uint)Math.Max(0, ImpostorPool.KindCounts[k.Id]);
                 if (n == 0) continue;
                 bases[k.Id] = total; caps[k.Id] = n; total += n;
-                foreach (var p in k.Mid) s_midList.Add((k, p));
+                foreach (var p in k.Mid) if (!p.Off) s_midList.Add((k, p));   // 1.2.488: a part with no live source texture is not drawn (never white)
             }
             Realloc(ref s_midVisible, (int)Math.Max(1, total), 4, ComputeBufferType.Default, "FiresEBM_FarMidVisible");
             Realloc(ref s_midCount, kinds, 4, ComputeBufferType.Default, "FiresEBM_FarMidCount");
